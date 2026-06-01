@@ -1,0 +1,57 @@
+services:
+  analyst-brain:
+    build:
+      context: ./analyst
+    container_name: openclaw_analyst
+    restart: unless-stopped
+    environment:
+      - TZ=America/New_York
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - default
+
+  execution-engine:
+    build:
+      context: ./execution
+    container_name: openclaw_execution
+    restart: unless-stopped
+    environment:
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
+    networks:
+      - default
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.openclaw-prod.rule=Host(`api.vanhellsing.tech`) && PathPrefix(`/webhook`)"
+      - "traefik.http.routers.openclaw-prod.entrypoints=websecure"
+      - "traefik.http.routers.openclaw-prod.tls=true"
+      - "traefik.http.routers.openclaw-prod.tls.certresolver=myresolver"
+      - "traefik.http.services.openclaw-prod.loadbalancer.server.port=8080"
+
+  heartbeat-monitor:
+    build:
+      context: ./heartbeat
+    container_name: openclaw_heartbeat
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+    volumes:
+      - ./data:/app/data
+    networks:
+      - default
+      - traefik
+
+networks:
+  default:
+    name: openclaw_net
+  traefik:
+    external: true
