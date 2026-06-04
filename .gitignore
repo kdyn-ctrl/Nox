@@ -33,3 +33,4 @@ logs/
 .idea/
 *.suo
 *.ntvs*
+data/memory_bank.db
