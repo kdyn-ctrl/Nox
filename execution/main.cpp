@@ -10,22 +10,37 @@ using json = nlohmann::json;
 // --- 1. TELEGRAM NOTIFIER ---
 class TelegramNotifier {
 public:
-    static void sendMessage(std::string message) {
+static void sendMessage(std::string message) {
         std::string token = std::getenv("TELEGRAM_BOT_TOKEN") ? std::getenv("TELEGRAM_BOT_TOKEN") : "";
         std::string chatId = std::getenv("TELEGRAM_CHAT_ID") ? std::getenv("TELEGRAM_CHAT_ID") : "";
-
-        if (token.empty() || chatId.empty()) return;
+        if (token.empty() || chatId.empty()) {
+            std::cerr << "❌ [TELEGRAM] Missing Bot Token or Chat ID env variables." << std::endl;
+            return;
+        }
 
         httplib::Client cli("https://api.telegram.org");
         std::string path = "/bot" + token + "/sendMessage";
-        
-        json body = {
-            {"chat_id", chatId},
-            {"text", message},
-            {"parse_mode", "Markdown"}
-        };
 
-        cli.Post(path.c_str(), body.dump(), "application/json");
+        // Telegram's max limit is 4096; 4000 gives us a safe buffer for formatting tags
+        const size_t MAX_LIMIT = 4000; 
+        size_t offset = 0;
+
+        // Loop and slice the report into multiple sequential messages if it's too long
+        while (offset < message.length()) {
+            std::string chunk = message.substr(offset, MAX_LIMIT);
+            offset += MAX_LIMIT;
+
+            json body = {
+                {"chat_id", chatId},
+                {"text", chunk}
+            };
+
+            auto res = cli.Post(path.c_str(), body.dump(), "application/json");
+            if (!res || res->status != 200) {
+                std::cerr << "❌ [TELEGRAM ERROR] Failed to deliver report chunk. Status: " 
+                          << (res ? std::to_string(res->status) : "No Response") << std::endl;
+            }
+        }
     }
 };
 
@@ -172,47 +187,75 @@ public:
     void run() {
         httplib::Server svr;
 
-        svr.Post("/webhook", [this](const httplib::Request& req, httplib::Response& res) {
-            try {
-                json data = json::parse(req.body);
-                if (data.value("secret_key", "") != secret) {
-                    res.status = 401;
-                    res.set_content("Unauthorized", "text/plain");
-                    return;
+svr.Post("/webhook", [this](const httplib::Request& req, httplib::Response& res) {
+            std::string body = req.body;
+            size_t i = 0;
+            int success_count = 0;
+
+            // Smart Splitter: Scan the continuous network stream for standalone JSON blocks
+            while (i < body.length()) {
+                size_t start = body.find('{', i);
+                if (start == std::string::npos) break;
+
+                int brace_count = 0;
+                size_t end = std::string::npos;
+
+                // Scan forward to find the matching closing brace for this specific object
+                for (size_t j = start; j < body.length(); ++j) {
+                    if (body[j] == '{') brace_count++;
+                    else if (body[j] == '}') brace_count--;
+
+                    if (brace_count == 0) {
+                        end = j;
+                        break;
+                    }
                 }
 
-                TradeSignal signal;
-                signal.ticker = data.value("ticker", "UNKNOWN");
-                signal.action = data.value("action", "HOLD");
-                signal.price = data.value("price", 0.0);
-                signal.rsi = data.value("rsi", 50.0);
-                signal.vol = data.value("vol", 0.0);
-                signal.atr = data.value("atr", 0.0);
-                signal.risk_tier = data.value("risk_tier", 1);
+                // Handle truncated or cut-off network frames safely
+                if (end == std::string::npos) {
+                    std::cerr << "⚠️ [SMART SPLIT] Incomplete trailing chunk detected." << std::endl;
+                    break;
+                }
 
-                std::cout << "📥 Signal Received: " << signal.action << " " << signal.ticker << std::endl;
-                
-                // Route signal to state machine or notifier
-                TelegramNotifier::sendMessage("🚀 Signal Parsed: " + signal.action + " " + signal.ticker);
+                // Extract and advance past this standalone JSON chunk
+                std::string json_chunk = body.substr(start, end - start + 1);
+                i = end + 1; 
 
+                try {
+                    json data = json::parse(json_chunk);
+                    if (data.value("secret_key", "") != secret) {
+                        std::cerr << "🔒 [SECURITY] Unauthorized signal dropped." << std::endl;
+                        continue; 
+                    }
+
+                    TradeSignal signal;
+                    signal.ticker = data.value("ticker", "UNKNOWN");
+                    signal.action = data.value("action", "HOLD");
+                    signal.price = data.value("price", 0.0);
+                    signal.rsi = data.value("rsi", 50.0);
+                    signal.vol = data.value("vol", 0.0);
+                    signal.atr = data.value("atr", 0.0);
+                    signal.risk_tier = data.value("risk_tier", 1);
+
+                    std::cout << "📥 Signal Parsed via Smart Split: " << signal.action << " " << signal.ticker << std::endl;
+                    
+                    TelegramNotifier::sendMessage("🚀 Signal Parsed: " + signal.action + " " + signal.ticker);
+                    success_count++;
+
+                } catch (const json::parse_error& e) {
+                    std::cerr << "💥 [PARSING ERROR] Internal chunk failed to parse: " << e.what() << std::endl;
+                } catch (const json::type_error& e) {
+                    std::cerr << "💥 [TYPE ERROR] Data type mismatch within chunk: " << e.what() << std::endl;
+                }
+            }
+
+            // Global Webhook Router Responses & Safety Nets
+            if (success_count > 0) {
                 res.status = 200;
-                res.set_content("Signal processed successfully", "text/plain");
-
-            } catch (const json::parse_error& e) {
-                std::cerr << "💥 [PARSING ERROR] Malformed JSON payload: " << e.what() << std::endl;
-                std::cerr << "Raw Body: " << req.body << std::endl;
+                res.set_content("Processed " + std::to_string(success_count) + " signal(s)", "text/plain");
+            } else {
                 res.status = 400;
-                res.set_content("Malformed JSON Structure", "text/plain");
-            } catch (const json::type_error& e) {
-                std::cerr << "💥 [TYPE ERROR] Data type mismatch in signal fields: " << e.what() << std::endl;
-                res.status = 400;
-                res.set_content("Data Type Mismatch", "text/plain");
-            } catch (const std::exception& e) {
-                std::cerr << "💥 [SERVER ERROR] Standard exception: " << e.what() << std::endl;
-                res.status = 500;
-            } catch (...) {
-                std::cerr << "💥 [CRITICAL] Unknown error occurred in webhook router." << std::endl;
-                res.status = 500;
+                res.set_content("No valid signals processed", "text/plain");
             }
         });
 
