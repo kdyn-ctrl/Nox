@@ -171,37 +171,55 @@ public:
 
     void run() {
         httplib::Server svr;
+
         svr.Post("/webhook", [this](const httplib::Request& req, httplib::Response& res) {
             try {
                 json data = json::parse(req.body);
                 if (data.value("secret_key", "") != secret) {
                     res.status = 401;
+                    res.set_content("Unauthorized", "text/plain");
                     return;
                 }
 
-                TradeSignal sig;
-                sig.ticker = data.value("ticker", "UNKNOWN");
-                sig.action = data.value("action", "BUY");
-                sig.price = data.value("price", 0.0);
-                sig.rsi = data.value("rsi", 50.0);
-                sig.vol = data.value("volume_status", "normal");
-                sig.atr = data.value("atr", 1.0);
-                sig.risk_tier = data.value("risk_tier", 1);
+                TradeSignal signal;
+                signal.ticker = data.value("ticker", "UNKNOWN");
+                signal.action = data.value("action", "HOLD");
+                signal.price = data.value("price", 0.0);
+                signal.rsi = data.value("rsi", 50.0);
+                signal.vol = data.value("vol", 0.0);
+                signal.atr = data.value("atr", 0.0);
+                signal.risk_tier = data.value("risk_tier", 1);
 
-                process(sig);
+                std::cout << "📥 Signal Received: " << signal.action << " " << signal.ticker << std::endl;
+                
+                // Route signal to state machine or notifier
+                TelegramNotifier::sendMessage("🚀 Signal Parsed: " + signal.action + " " + signal.ticker);
 
                 res.status = 200;
-                res.set_content("Signal Received", "text/plain");
-            } catch (...) { 
-                res.status = 400; 
-                Logger::log("ERROR", "Failed to parse webhook payload");
+                res.set_content("Signal processed successfully", "text/plain");
+
+            } catch (const json::parse_error& e) {
+                std::cerr << "💥 [PARSING ERROR] Malformed JSON payload: " << e.what() << std::endl;
+                std::cerr << "Raw Body: " << req.body << std::endl;
+                res.status = 400;
+                res.set_content("Malformed JSON Structure", "text/plain");
+            } catch (const json::type_error& e) {
+                std::cerr << "💥 [TYPE ERROR] Data type mismatch in signal fields: " << e.what() << std::endl;
+                res.status = 400;
+                res.set_content("Data Type Mismatch", "text/plain");
+            } catch (const std::exception& e) {
+                std::cerr << "💥 [SERVER ERROR] Standard exception: " << e.what() << std::endl;
+                res.status = 500;
+            } catch (...) {
+                std::cerr << "💥 [CRITICAL] Unknown error occurred in webhook router." << std::endl;
+                res.status = 500;
             }
         });
 
-        Logger::log("INFO", "OpenClaw Swarm: Active on Port 8080");
+        std::cout << "⚡ OpenClaw Execution Engine listening on 0.0.0.0:8080..." << std::endl;
         svr.listen("0.0.0.0", 8080);
     }
-};
+}; // Closes class OpenClawEngine
 
 int main() {
     OpenClawEngine engine;
