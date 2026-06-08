@@ -53,13 +53,13 @@ public:
 };
 
 struct TradeSignal {
-    std::string ticker;
-    std::string action;
-    double price;
-    double rsi;
-    std::string vol;
-    double atr;
-    int risk_tier;
+    std::string ticker = "UNKNOWN";
+    std::string action = "HOLD";
+    double price = 0.0;
+    double rsi = 50.0;
+    long long vol = 0.0;
+    double atr = 0.0;
+    int risk_tier = 1;
 };
 
 // --- 3. KELLY CALCULATOR ---
@@ -106,7 +106,7 @@ public:
     bool placeOrder(TradeSignal sig, int quantity, std::string apiKey, std::string apiSec) {
         if (quantity <= 0) return false;
 
-        std::string msg = "🚀 *OPENCLAW TRADE*\n"
+        std::string msg = " *OPENCLAW TRADE*\n"
                          "*Ticker:* " + sig.ticker + "\n"
                          "*Action:* " + sig.action + "\n"
                          "*Kelly Qty:* " + std::to_string(quantity) + " Shares\n"
@@ -162,7 +162,7 @@ private:
 
         if (res && res->status == 200) {
             json response_data = json::parse(res->body);
-            std::cout << "🎯 [ORDER EXECUTED] Alpaca Order ID: " 
+            std::cout << " [ORDER EXECUTED] Alpaca Order ID: " 
                       << response_data.value("id", "UNKNOWN") << " | Status: " 
                       << response_data.value("status", "pending") << std::endl;
         } else {
@@ -187,7 +187,7 @@ public:
     void run() {
         httplib::Server svr;
 
-svr.Post("/webhook", [this](const httplib::Request& req, httplib::Response& res) {
+        svr.Post("/webhook", [this](const httplib::Request& req, httplib::Response& res) {
             std::string body = req.body;
             size_t i = 0;
             int success_count = 0;
@@ -213,7 +213,7 @@ svr.Post("/webhook", [this](const httplib::Request& req, httplib::Response& res)
 
                 // Handle truncated or cut-off network frames safely
                 if (end == std::string::npos) {
-                    std::cerr << "⚠️ [SMART SPLIT] Incomplete trailing chunk detected." << std::endl;
+                    Logger::log("WARN", "Smart Splitter detected an incomplete trailing chunk.");
                     break;
                 }
 
@@ -224,7 +224,7 @@ svr.Post("/webhook", [this](const httplib::Request& req, httplib::Response& res)
                 try {
                     json data = json::parse(json_chunk);
                     if (data.value("secret_key", "") != secret) {
-                        std::cerr << "🔒 [SECURITY] Unauthorized signal dropped." << std::endl;
+                        Logger::log("WARN", "Unauthorized signal dropped by security shield.");
                         continue; 
                     }
 
@@ -233,36 +233,44 @@ svr.Post("/webhook", [this](const httplib::Request& req, httplib::Response& res)
                     signal.action = data.value("action", "HOLD");
                     signal.price = data.value("price", 0.0);
                     signal.rsi = data.value("rsi", 50.0);
-                    signal.vol = data.value("vol", 0.0);
+                    signal.vol = data.value("vol", 0LL);
                     signal.atr = data.value("atr", 0.0);
                     signal.risk_tier = data.value("risk_tier", 1);
 
-                    std::cout << "📥 Signal Parsed via Smart Split: " << signal.action << " " << signal.ticker << std::endl;
+                    Logger::log("INFO", "Signal Parsed via Smart Split: " + signal.action + " " + signal.ticker);
                     
                     TelegramNotifier::sendMessage("🚀 Signal Parsed: " + signal.action + " " + signal.ticker);
                     success_count++;
 
                 } catch (const json::parse_error& e) {
-                    std::cerr << "💥 [PARSING ERROR] Internal chunk failed to parse: " << e.what() << std::endl;
+                    Logger::log("ERROR", "Internal chunk failed to parse: " + std::string(e.what()));
                 } catch (const json::type_error& e) {
-                    std::cerr << "💥 [TYPE ERROR] Data type mismatch within chunk: " << e.what() << std::endl;
+                    Logger::log("ERROR", "Data type mismatch within chunk: " + std::string(e.what()));
                 }
             }
 
             // Global Webhook Router Responses & Safety Nets
-            if (success_count > 0) {
-                res.status = 200;
-                res.set_content("Processed " + std::to_string(success_count) + " signal(s)", "text/plain");
-            } else {
-                res.status = 400;
-                res.set_content("No valid signals processed", "text/plain");
+            try {
+                if (success_count > 0) {
+                    res.status = 200;
+                    res.set_content("Processed " + std::to_string(success_count) + " signal(s)", "text/plain");
+                } else {
+                    res.status = 400;
+                    res.set_content("No valid signals processed", "text/plain");
+                }
+            } catch (const std::exception& e) {
+                Logger::log("ERROR", "Standard exception: " + std::string(e.what()));
+                res.status = 500;
+            } catch (...) {
+                Logger::log("ERROR", "Unknown error occurred in webhook router.");
+                res.status = 500;
             }
-        });
+        }); // This perfectly closes the svr.Post router lambda
 
-        std::cout << "⚡ OpenClaw Execution Engine listening on 0.0.0.0:8080..." << std::endl;
+        Logger::log("INFO", "OpenClaw Execution Engine listening on 0.0.0.0:8080...");
         svr.listen("0.0.0.0", 8080);
-    }
-}; // Closes class OpenClawEngine
+    } // This closes void run()
+}; // This closes class OpenClawEngine
 
 int main() {
     OpenClawEngine engine;
