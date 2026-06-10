@@ -33,29 +33,34 @@ int main() {
             // Build the exact structural payload the execution engine expects
             json payload = {
                 {"secret_key", secret_token},
-                {"ticker", "SPY"},
-                {"action", current_strategy.capital_multiplier > 0 ? "BUY" : "HOLD"},
+                {"ticker", "GLOBAL_AUDIT"},
+                {"action", "REPORT"},
                 {"price", spy_price},
-                {"risk_tier", current_strategy.capital_multiplier == 1.0 ? 1 : 2}
+                {"risk_tier", current_strategy.capital_multiplier == 1.0 ? 1 : 2},
+                {"vol", 0}, // Explicitly matching your long long setup
+                {"regime_state", current_strategy.log_message},
+                {"atr", 4.82}, // Replace with your dynamic ATR variable
+                {"kelly_pct", 1.45}, // Replace with your dynamic Kelly variable
+                {"report_body", "YOUR_LONG_FORM_TEXT_ANALYSIS_STRING_GOES_HERE"} 
             };
-
-            // Hit the execution container directly over the shared Docker bridge network
-            httplib::Client cli("http://execution-engine:8080");
+		// Hit the execution container directly over the shared Docker bridge network
+            httplib::Client cli("http://execution_engine:8080");
             auto res = cli.Post("/webhook", payload.dump(), "application/json");
 
             if (res && res->status == 200) {
-                std::cout << "🚀 [WEBHOOK SUCCESS] Signal transmitted to Execution Engine safely." << std::endl;
+                std::cout << "✅ [ANALYST] Report payload successfully dispatched to Execution Engine." << std::endl;
             } else {
-                std::cerr << "⚠️ [WEBHOOK FAILURE] Execution engine returned status: " 
-                          << (res ? std::to_string(res->status) : "NO RESPONSE") << std::endl;
+                std::cerr << "❌ [ANALYST ERROR] Failed to route report. Status: " 
+                          << (res ? std::to_string(res->status) : "No Response") << std::endl;
             }
+
         } catch (const std::exception& e) {
-            std::cerr << "💥 Network Exception during webhook transmission: " << e.what() << std::endl;
+            std::cerr << "💥 [ANALYST CRITICAL] Ingestion pipeline exception: " << e.what() << std::endl;
         }
 
-        // Sleep for 15 minutes before checking the regime again
-        std::this_thread::sleep_for(std::chrono::minutes(15));
+        // Standard heartbeat interval (e.g., check/report once a day or on a loop)
+        std::this_thread::sleep_for(std::chrono::hours(24));
     }
-
-    return 0;
+   
+     return 0;
 }
