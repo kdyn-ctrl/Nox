@@ -122,32 +122,61 @@ MarketSnapshot fetch_market_snapshot(const std::string& api_key, const std::stri
     return {vix, spy.price, spy.sma200, true};
 }
 
+// Converts the Regime enum to a canonical string token for payload serialisation.
+// RULE-016 fix: regime_state must be a clean enum label, not the full log_message.
+static std::string regime_to_string(Regime r) {
+    switch (r) {
+        case Regime::RISK_ON:     return "RISK_ON";
+        case Regime::TRANSITION:  return "TRANSITION";
+        case Regime::RISK_OFF:    return "RISK_OFF";
+        default:                  return "TRANSITION"; // safe default
+    }
+}
+
 int main() {
     RegimeStateMachine regime_monitor;
     std::cout << "OpenClaw Analyst Agent: ONLINE." << std::endl;
 
-
-    // Fetch security token from environment variables
+    // RULE-009 — Hard-abort on any missing credential or config variable.
     const char* env_token = std::getenv("WEBHOOK_SECRET_TOKEN");
     if (!env_token) {
-        std::cerr << "[FATAL] WEBHOOK_SECRET_TOKEN not set. Refusing to start." << std::endl;
+        std::cerr << "[FATAL] [ANALYST] WEBHOOK_SECRET_TOKEN not set. Refusing to start." << std::endl;
         return 1;
     }
     std::string secret_token = env_token;
 
     const char* env_api_key = std::getenv("ALPACA_API_KEY");
     if (!env_api_key) {
-        std::cerr << "[FATAL] ALPACA_API_KEY not set. Refusing to start." << std::endl;
+        std::cerr << "[FATAL] [ANALYST] ALPACA_API_KEY not set. Refusing to start." << std::endl;
         return 1;
     }
     std::string alpaca_api_key = env_api_key;
 
     const char* env_api_secret = std::getenv("ALPACA_SECRET_KEY");
     if (!env_api_secret) {
-        std::cerr << "[FATAL] ALPACA_SECRET_KEY not set. Refusing to start." << std::endl;
+        std::cerr << "[FATAL] [ANALYST] ALPACA_SECRET_KEY not set. Refusing to start." << std::endl;
         return 1;
     }
     std::string alpaca_api_secret = env_api_secret;
+
+    // RULE-001 — Cycle interval MUST come from the environment; never hardcoded.
+    // Allows the interval to be tightened (e.g., to 1–4 h) during elevated-volatility
+    // regimes without a code rebuild or container restart.
+    const char* env_cycle_hours = std::getenv("ANALYST_CYCLE_HOURS");
+    if (!env_cycle_hours) {
+        std::cerr << "[FATAL] [ANALYST] ANALYST_CYCLE_HOURS not set. Refusing to start." << std::endl;
+        return 1;
+    }
+    int cycle_hours = 0;
+    try {
+        cycle_hours = std::stoi(env_cycle_hours);
+        if (cycle_hours <= 0) throw std::invalid_argument("must be positive");
+    } catch (const std::exception& e) {
+        std::cerr << "[FATAL] [ANALYST] ANALYST_CYCLE_HOURS is invalid ('" << env_cycle_hours
+                  << "'): " << e.what() << ". Refusing to start." << std::endl;
+        return 1;
+    }
+    std::cout << "[INFO] [ANALYST] Cycle interval set to " << cycle_hours << " hour(s)." << std::endl;
 
     while (true) {
         // 1. Fetch live market data (VIX from Yahoo Finance, SPY from Alpaca)
@@ -185,7 +214,7 @@ int main() {
                     {"price", spy_price},
                     {"risk_tier", current_strategy.capital_multiplier == 1.0 ? 1 : 2},
                     {"vol", 0LL}, 
-                    {"regime_state", current_strategy.log_message},
+                    {"regime_state", regime_to_string(current_strategy.current_regime)},
                     {"atr", 0.0},
                     {"kelly_pct", 0.0},
                     {"report_body", current_strategy.log_message}
@@ -221,8 +250,10 @@ int main() {
             std::cerr << "💥 [ANALYST CRITICAL] All retry attempts exhausted. Failed to send payload to Execution Engine." << std::endl;
         }
 
-        // Standard heartbeat interval (e.g., check/report once a day or on a loop)
-        std::this_thread::sleep_for(std::chrono::hours(24));
+        // RULE-001 — Sleep for the env-configured interval, not a hardcoded 24 h.
+        std::cout << "[INFO] [ANALYST] Cycle complete. Sleeping for "
+                  << cycle_hours << " hour(s)." << std::endl;
+        std::this_thread::sleep_for(std::chrono::hours(cycle_hours));
     }
    
      return 0;

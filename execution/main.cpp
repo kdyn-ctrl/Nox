@@ -5,6 +5,8 @@
 #include <iostream>
 #include <string>
 #include <cmath>
+#include <thread>
+#include <chrono>
 
 using json = nlohmann::json;
 
@@ -67,29 +69,37 @@ struct TradeSignal {
 };
 
 // --- 3. KELLY CALCULATOR ---
-int calculate_kelly_size(double equity, double current_price) {
-    if (current_price <= 0) return 1; 
+// Returns -1 to signal that sizing is not possible (negative Kelly = no edge).
+// RULE-005: Negative Kelly must halt the trade, not be silently promoted to 1%.
+// RULE-009: Kelly parameters are validated at startup (see OpenClawEngine ctor).
+int calculate_kelly_size(double equity, double current_price,
+                         double win_rate, double win_loss_ratio) {
+    if (current_price <= 0) {
+        Logger::log("ERROR", "[KELLY] current_price is zero or negative — cannot size position.");
+        return -1;
+    }
 
-    const char* wr_env  = std::getenv("KELLY_WIN_RATE");
-    const char* wlr_env = std::getenv("KELLY_WIN_LOSS_RATIO");
-    double win_rate      = wr_env  ? std::stod(wr_env)  : 0.55;
-    double win_loss_ratio = wlr_env ? std::stod(wlr_env) : 2.0;
-    
     // The Kelly Formula: K% = W - ((1 - W) / R)
     double kelly_pct = win_rate - ((1.0 - win_rate) / win_loss_ratio);
-    
-    // Apply Half-Kelly for safety (0.5 multiplier)
+
+    // RULE-005: A negative Kelly means the strategy has no mathematical edge.
+    // Promoting it to 1% masks a broken strategy and risks real capital.
+    if (kelly_pct <= 0.0) {
+        Logger::log("CRITICAL", "[KELLY] Raw Kelly output is non-positive (" +
+                    std::to_string(kelly_pct) + ") — no statistical edge. Trade halted.");
+        return -1;
+    }
+
+    // Apply Half-Kelly safety multiplier (0.5) to reduce variance.
     double adjusted_risk = kelly_pct * 0.5;
-    
-    // SAFETY RAILS:
-    // Cap at 10% per trade, and minimum 1% if strategy is active
+
+    // Hard cap: 10% max risk per trade (RULE-005)
     if (adjusted_risk > 0.10) adjusted_risk = 0.10;
-    if (adjusted_risk < 0) adjusted_risk = 0.01; 
 
     double dollar_amount = equity * adjusted_risk;
     int shares = static_cast<int>(std::floor(dollar_amount / current_price));
-    
-    return (shares > 0) ? shares : 1; 
+
+    return (shares > 0) ? shares : 1;
 }
 
 // --- 4. THE ENGINE ---
@@ -98,30 +108,60 @@ private:
     std::string secret;
     std::string apiKey;
     std::string apiSec;
+    std::string alpacaBaseUrl;
+    double      kellyWinRate;
+    double      kellyWinLossRatio;
 
+    // RULE-005: Fetch live equity with exponential-backoff retry (2s -> 4s -> 8s).
+    // Returns -1.0 on total failure — callers MUST NOT proceed with any fallback.
     double fetch_account_equity() {
-        try {
-            httplib::Client alpaca_cli("https://paper-api.alpaca.markets");
-            alpaca_cli.set_connection_timeout(std::chrono::seconds(5));
-            alpaca_cli.set_read_timeout(std::chrono::seconds(10));
+        const int    MAX_RETRIES   = 3;
+        unsigned int delay_seconds = 2;
 
-            httplib::Headers headers = {
-                {"APCA-API-KEY-ID", apiKey},
-                {"APCA-API-SECRET-KEY", apiSec}
-            };
+        for (int attempt = 1; attempt <= MAX_RETRIES; ++attempt) {
+            try {
+                httplib::Client alpaca_cli(alpacaBaseUrl);
+                alpaca_cli.set_connection_timeout(std::chrono::seconds(5));
+                alpaca_cli.set_read_timeout(std::chrono::seconds(10));
 
-            auto res = alpaca_cli.Get("/v2/account", headers);
-            if (res && res->status == 200) {
-                json account_data = json::parse(res->body);
-                return std::stod(account_data.value("portfolio_value", "10000.0"));
-            } else {
-                Logger::log("WARN", "Failed to fetch account equity from Alpaca. Status: " +
-                            (res ? std::to_string(res->status) : "TIMEOUT") + ". Falling back to $10,000.");
+                httplib::Headers headers = {
+                    {"APCA-API-KEY-ID",     apiKey},
+                    {"APCA-API-SECRET-KEY", apiSec}
+                };
+
+                auto res = alpaca_cli.Get("/v2/account", headers);
+                if (res && res->status == 200) {
+                    json account_data = json::parse(res->body);
+                    double equity = std::stod(account_data.value("portfolio_value", "-1.0"));
+                    if (equity > 0.0) return equity;
+                    Logger::log("WARN", "[EXECUTION] Alpaca returned non-positive portfolio_value.");
+                } else {
+                    Logger::log("WARN", "[EXECUTION] Equity fetch attempt " + std::to_string(attempt) +
+                                "/" + std::to_string(MAX_RETRIES) + " failed. Status: " +
+                                (res ? std::to_string(res->status) : "TIMEOUT"));
+                }
+            } catch (const std::exception& e) {
+                Logger::log("WARN", "[EXECUTION] Equity fetch exception on attempt " +
+                            std::to_string(attempt) + ": " + std::string(e.what()));
             }
-        } catch (const std::exception& e) {
-            Logger::log("WARN", "Exception fetching account equity: " + std::string(e.what()) + ". Falling back to $10,000.");
+
+            if (attempt < MAX_RETRIES) {
+                std::this_thread::sleep_for(std::chrono::seconds(delay_seconds));
+                delay_seconds *= 2; // exponential backoff: 2s -> 4s -> 8s
+            }
         }
-        return 10000.0;
+
+        // All retries exhausted — RULE-005: halt and alert, never fall back.
+        Logger::log("CRITICAL", "[EXECUTION] All equity fetch retries exhausted. "
+                    "Halting order entry for this cycle.");
+        TelegramNotifier::sendMessage(
+            "🚨 *CRITICAL: Equity Fetch Failed*\n"
+            "────────────────────────\n"
+            "All 3 Alpaca equity fetch attempts failed.\n"
+            "⛔ New order entries halted for this cycle.\n"
+            "Manual review required."
+        );
+        return -1.0; // sentinel: caller must abort the trade
     }
 
     void process(TradeSignal sig) {
@@ -159,21 +199,40 @@ private:
             return;
         }
 
-        // Fetch live equity, then size the position with Kelly
+        // RULE-005: Fetch live equity — abort if unavailable (no silent fallback).
         double live_equity = fetch_account_equity();
-        int qty = calculate_kelly_size(live_equity, sig.price);
+        if (live_equity < 0.0) {
+            Logger::log("CRITICAL", "[EXECUTION] Aborting order for " + sig.ticker +
+                        " — could not obtain live equity.");
+            return;
+        }
 
-        // TRANSMIT LIVE ORDER TO ALPACA PAPER TRADING API
+        // RULE-005: Size position via Kelly — abort if no mathematical edge.
+        int qty = calculate_kelly_size(live_equity, sig.price, kellyWinRate, kellyWinLossRatio);
+        if (qty < 0) {
+            Logger::log("CRITICAL", "[EXECUTION] Aborting order for " + sig.ticker +
+                        " — Kelly sizing returned no-edge signal.");
+            TelegramNotifier::sendMessage(
+                "🚨 *CRITICAL: Kelly No-Edge*\n"
+                "────────────────────────\n"
+                "• *Ticker:* " + sig.ticker + "\n"
+                "⛔ Raw Kelly ≤ 0 — strategy has no statistical edge.\n"
+                "Order halted. Review KELLY_WIN_RATE / KELLY_WIN_LOSS_RATIO."
+            );
+            return;
+        }
+
+        // RULE-014: alpacaBaseUrl is injected at runtime (paper vs. live)
+        // and was validated at startup — never hardcoded here.
         try {
-            httplib::Client alpaca_cli("https://paper-api.alpaca.markets");
+            httplib::Client alpaca_cli(alpacaBaseUrl);
             alpaca_cli.set_connection_timeout(std::chrono::seconds(5));
             alpaca_cli.set_read_timeout(std::chrono::seconds(10));
-            
-            // Inject your secure environment variables into the request headers
+
             httplib::Headers headers = {
-                {"APCA-API-KEY-ID", apiKey},
+                {"APCA-API-KEY-ID",     apiKey},
                 {"APCA-API-SECRET-KEY", apiSec},
-                {"Content-Type", "application/json"}
+                {"Content-Type",        "application/json"}
             };
 
             // Structure the exact JSON payload Alpaca requires, using your dynamic Kelly qty
@@ -232,26 +291,42 @@ private:
 
 public:
     OpenClawEngine() {
-        const char* env_secret = std::getenv("WEBHOOK_SECRET_TOKEN");
-        const char* env_key    = std::getenv("ALPACA_API_KEY");
-        const char* env_sec    = std::getenv("ALPACA_SECRET_KEY");
+        // RULE-009 / RULE-014: All credentials and config values come exclusively
+        // from env vars. Any missing value is a hard-abort — no silent defaults.
+        auto require_env = [](const char* name) -> std::string {
+            const char* val = std::getenv(name);
+            if (!val || std::string(val).empty()) {
+                std::cerr << "[FATAL] [EXECUTION] Required env var '" << name
+                          << "' is not set. Refusing to start." << std::endl;
+                std::exit(1);
+            }
+            return std::string(val);
+        };
 
-        if (!env_secret) {
-            std::cerr << "[FATAL] WEBHOOK_SECRET_TOKEN env variable is not set. Exiting." << std::endl;
-            std::exit(1);
-        }
-        if (!env_key) {
-            std::cerr << "[FATAL] ALPACA_API_KEY env variable is not set. Exiting." << std::endl;
-            std::exit(1);
-        }
-        if (!env_sec) {
-            std::cerr << "[FATAL] ALPACA_SECRET_KEY env variable is not set. Exiting." << std::endl;
+        secret       = require_env("WEBHOOK_SECRET_TOKEN");
+        apiKey       = require_env("ALPACA_API_KEY");
+        apiSec       = require_env("ALPACA_SECRET_KEY");
+        alpacaBaseUrl = require_env("ALPACA_BASE_URL");  // RULE-014: never hardcode live/paper URL
+
+        // RULE-009: Kelly parameters must be present at startup — no silent defaults.
+        std::string wr_str  = require_env("KELLY_WIN_RATE");
+        std::string wlr_str = require_env("KELLY_WIN_LOSS_RATIO");
+        try {
+            kellyWinRate      = std::stod(wr_str);
+            kellyWinLossRatio = std::stod(wlr_str);
+        } catch (const std::exception& e) {
+            std::cerr << "[FATAL] [EXECUTION] Invalid Kelly parameter value: " << e.what()
+                      << ". Refusing to start." << std::endl;
             std::exit(1);
         }
 
-        secret = env_secret;
-        apiKey = env_key;
-        apiSec = env_sec;
+        // RULE-007 / RULE-013: Telegram vars are required for dual-channel
+        // observability. Missing credentials are a fatal startup error, not a
+        // silent no-op — a system that can act without alerting violates RULE-013.
+        require_env("TELEGRAM_BOT_TOKEN");
+        require_env("TELEGRAM_CHAT_ID");
+
+        Logger::log("INFO", "[EXECUTION] All required environment variables validated.");
     }
 
     void run() {
@@ -266,8 +341,12 @@ public:
                 json root_payload = json::parse(body);
 
                 auto process_single_chunk = [this, &success_count](const json& data) {
+                    // RULE-004 Auth Gate: secret mismatch must be a SILENT DROP.
+                    // Returning HTTP 400 here would fingerprint the auth boundary
+                    // to a caller, leaking that the secret was wrong vs. malformed.
+                    // The outer handler returns 400 only for schema/parse failures.
                     if (data.value("secret_key", "") != secret) {
-                        Logger::log("WARN", "Unauthorized signal dropped by security shield.");
+                        Logger::log("WARN", "[EXECUTION] Unauthorized signal silently dropped (auth gate).");
                         return;
                     }
 
@@ -330,29 +409,29 @@ public:
                 }
 
             } catch (const json::parse_error& e) {
-                Logger::log("ERROR", "JSON parse error: " + std::string(e.what()));
+                // RULE-004 Schema Gate: malformed JSON is rejected with HTTP 400
+                // before any field access or business logic executes.
+                Logger::log("ERROR", "[EXECUTION] JSON parse error (schema gate): " + std::string(e.what()));
+                res.status = 400;
+                res.set_content("Bad Request: malformed JSON", "text/plain");
+                return;
             } catch (const json::type_error& e) {
-                Logger::log("ERROR", "Type mismatch in payload: " + std::string(e.what()));
+                Logger::log("ERROR", "[EXECUTION] Type mismatch in payload: " + std::string(e.what()));
+                res.status = 400;
+                res.set_content("Bad Request: type error", "text/plain");
+                return;
             } catch (const std::exception& e) {
-                Logger::log("ERROR", "Exception processing signals: " + std::string(e.what()));
+                Logger::log("ERROR", "[EXECUTION] Exception processing signals: " + std::string(e.what()));
+                res.status = 500;
+                res.set_content("Internal Server Error", "text/plain");
+                return;
             }
 
-            // Global Webhook Router Responses & Safety Nets
-            try {
-                if (success_count > 0) {
-                    res.status = 200;
-                    res.set_content("Processed " + std::to_string(success_count) + " signal(s)", "text/plain");
-                } else {
-                    res.status = 400;
-                    res.set_content("No valid signals processed", "text/plain");
-                }
-            } catch (const std::exception& e) {
-                Logger::log("ERROR", "Standard exception: " + std::string(e.what()));
-                res.status = 500;
-            } catch (...) {
-                Logger::log("ERROR", "Unknown error occurred in webhook router.");
-                res.status = 500;
-            }
+            // RULE-004: Auth failures leave success_count == 0 but the payload
+            // itself was valid JSON. Return 200 to avoid fingerprinting the auth
+            // boundary — the drop has already been logged internally as WARN.
+            res.status = 200;
+            res.set_content("Processed " + std::to_string(success_count) + " signal(s)", "text/plain");
         }); // This perfectly closes the svr.Post router lambda
 
         Logger::log("INFO", "OpenClaw Execution Engine listening on 0.0.0.0:8080...");

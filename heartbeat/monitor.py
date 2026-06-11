@@ -1,4 +1,5 @@
 import os
+import sys
 import telebot
 import requests
 import anthropic
@@ -8,15 +9,29 @@ import threading
 import xml.etree.ElementTree as ET
 import sqlite3
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from telebot.util import smart_split
 from bs4 import BeautifulSoup
 
 # --- 1. CONFIGURATION ---
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-ANTHROPIC_KEY = os.getenv('ANTHROPIC_API_KEY')
-ALPACA_API = os.getenv('ALPACA_API_KEY')
-ALPACA_SEC = os.getenv('ALPACA_SECRET_KEY')
+# RULE-009: Validate all required credentials at startup.
+# Any missing variable is a hard-abort — no silent runtime failures.
+def require_env(name: str) -> str:
+    """Return the value of an env var or exit immediately with [FATAL]."""
+    val = os.getenv(name)
+    if not val:
+        print(f"[FATAL] [HEARTBEAT] Required env var '{name}' is not set. Refusing to start.",
+              flush=True)
+        sys.exit(1)
+    return val
+
+TELEGRAM_TOKEN = require_env('TELEGRAM_BOT_TOKEN')
+CHAT_ID        = require_env('TELEGRAM_CHAT_ID')
+ANTHROPIC_KEY  = require_env('ANTHROPIC_API_KEY')
+ALPACA_API     = require_env('ALPACA_API_KEY')
+ALPACA_SEC     = require_env('ALPACA_SECRET_KEY')
+
+print("[INFO] [HEARTBEAT] All required environment variables validated.", flush=True)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
@@ -61,11 +76,18 @@ def init_db():
         print(f"Database initialization error: {e}")
 
 # --- 2. DATA EXTRACTION ---
+# RULE-008: All HTTP calls use a (connect_timeout, read_timeout) tuple.
+# A scalar timeout=10 only sets the read timeout — the connection can still
+# block indefinitely. The tuple form enforces both independently.
+HTTP_TIMEOUT = (5, 10)  # (connect seconds, read seconds)
+
 def get_alpaca_portfolio():
     headers = {'APCA-API-KEY-ID': ALPACA_API, 'APCA-API-SECRET-KEY': ALPACA_SEC}
     try:
-        acc_resp = requests.get('https://paper-api.alpaca.markets/v2/account', headers=headers, timeout=10)
-        pos_resp = requests.get('https://paper-api.alpaca.markets/v2/positions', headers=headers, timeout=10)
+        acc_resp = requests.get('https://paper-api.alpaca.markets/v2/account',
+                                headers=headers, timeout=HTTP_TIMEOUT)
+        pos_resp = requests.get('https://paper-api.alpaca.markets/v2/positions',
+                                headers=headers, timeout=HTTP_TIMEOUT)
         
         if acc_resp.status_code != 200 or pos_resp.status_code != 200:
             return f"Failed to pull Alpaca data. Account status: {acc_resp.status_code}, Positions status: {pos_resp.status_code}"
@@ -91,7 +113,7 @@ def get_sec_8k(ticker):
     url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type=8-K&output=atom"
     headers = {'User-Agent': 'OpenClaw Swarm openclaw@vanhellsing.tech'}
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
         root = ET.fromstring(resp.content)
         ns = {'atom': 'http://www.w3.org/2005/Atom'}
         entries = root.findall('atom:entry', ns)
@@ -108,7 +130,10 @@ def get_sec_8k(ticker):
 def run_scout_protocol():
     try:
         headers = {'APCA-API-KEY-ID': ALPACA_API, 'APCA-API-SECRET-KEY': ALPACA_SEC}
-        news_req = requests.get('https://data.alpaca.markets/v1beta1/news?symbols=NVDA,XOM,BTCUSD&limit=5', headers=headers, timeout=10).json()
+        news_req = requests.get(
+            'https://data.alpaca.markets/v1beta1/news?symbols=NVDA,XOM,BTCUSD&limit=5',
+            headers=headers, timeout=HTTP_TIMEOUT
+        ).json()
         news_context = "\n".join([f"- {n['headline']}" for n in news_req.get('news', [])])
         
         sec_context = "\n".join([get_sec_8k(ticker) for ticker in ["NVDA", "XOM"]])
@@ -139,10 +164,71 @@ def run_scout_protocol():
         print(f"Scout Error: {e}")
 
 def schedule_checker():
-    schedule.every().day.at("11:30").do(run_scout_protocol) 
+    # RULE-006: Daily Scout MUST fire at 11:30 AM Eastern Time (ET), not UTC.
+    #
+    # Why this approach:
+    #   • `schedule` library has no native timezone awareness — `.at("HH:MM")`
+    #     always interprets the time as the system clock (UTC inside Docker).
+    #   • The tz-argument form `.at("HH:MM", "America/New_York")` was introduced
+    #     in schedule 1.2.0. Pinning that version in the Dockerfile is required
+    #     (see Dockerfile); this code depends on it.
+    #   • DST transitions mean the UTC equivalent of 11:30 ET changes twice a
+    #     year (UTC-5 in winter → UTC-4 in summer). We recompute at midnight UTC
+    #     each day so the offset is always correct.
+    #
+    # Design:
+    #   _reschedule_scout() is called once at startup and then once per day at
+    #   00:01 UTC. It clears the previous 'scout' job, computes today's correct
+    #   UTC wall-clock equivalent of 11:30 ET, and registers a fresh job.
+    #   A `_scout_fired_today` flag prevents a double-fire if reschedule happens
+    #   to run on the same tick as the job (edge case on slow startup).
+
+    ET  = ZoneInfo("America/New_York")
+    UTC = ZoneInfo("UTC")
+
+    _scout_fired_today: dict = {"date": None}   # mutable container for closure
+
+    def _guarded_scout():
+        """Wrapper that prevents double-fires within the same calendar day (ET)."""
+        today_et = datetime.now(tz=ET).date()
+        if _scout_fired_today["date"] == today_et:
+            print("[WARN] [HEARTBEAT] Scout double-fire suppressed.", flush=True)
+            return
+        _scout_fired_today["date"] = today_et
+        run_scout_protocol()
+
+    def _reschedule_scout():
+        """
+        Clear any existing 'scout' job, compute the UTC wall-clock time that
+        corresponds to 11:30 AM ET *today*, and register a new daily job.
+        Called once at startup and then nightly at 00:01 UTC.
+        """
+        schedule.clear("scout")
+
+        now_et     = datetime.now(tz=ET)
+        # Build a timezone-aware 11:30 ET for today, then express it in UTC.
+        target_et  = now_et.replace(hour=11, minute=30, second=0, microsecond=0)
+        target_utc = target_et.astimezone(UTC)
+        utc_hhmm   = target_utc.strftime("%H:%M")
+
+        schedule.every().day.at(utc_hhmm).do(_guarded_scout).tag("scout")
+        print(
+            f"[INFO] [HEARTBEAT] Daily Scout (re)scheduled: "
+            f"11:30 ET = {utc_hhmm} UTC "
+            f"({'EDT UTC-4' if target_et.utcoffset().seconds == 72000 else 'EST UTC-5'}).",
+            flush=True,
+        )
+
+    # --- Initial registration at startup ---
+    _reschedule_scout()
+
+    # Recompute the UTC equivalent each night so DST transitions are handled
+    # automatically without any container restart.
+    schedule.every().day.at("00:01").do(_reschedule_scout)
+
     while True:
         schedule.run_pending()
-        time.sleep(60)
+        time.sleep(30)   # 30-second tick — tight enough not to miss the window
 
 # --- 4. CONVERSATIONAL AGENT HANDLERS ---
 @bot.message_handler(commands=['status'])
@@ -195,13 +281,13 @@ def mark_filing_processed(filing_id):
         conn.commit()
 
 def poll_sec_edgar():
-    print("Nox Automated SEC Radar engaged...")
+    print("[INFO] [HEARTBEAT] Nox Automated SEC Radar engaged...", flush=True)
     sec_url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"
     headers = {"User-Agent": "OpenClawSwarm/1.0 openclaw@vanhellsing.tech"}
 
     while True:
         try:
-            response = requests.get(sec_url, headers=headers, timeout=10)
+            response = requests.get(sec_url, headers=headers, timeout=HTTP_TIMEOUT)
             if response.status_code == 200:
                 root = ET.fromstring(response.content)
                 ns = {'atom': 'http://www.w3.org/2005/Atom'}
@@ -225,7 +311,7 @@ def poll_sec_edgar():
 def process_automated_filing(ticker, filing_url):
     headers = {"User-Agent": "OpenClawSwarm/1.0 openclaw@vanhellsing.tech"}
     try:
-        doc_res = requests.get(filing_url, headers=headers, timeout=10)
+        doc_res = requests.get(filing_url, headers=headers, timeout=HTTP_TIMEOUT)
         if doc_res.status_code != 200:
             return
 
