@@ -34,3 +34,4 @@ logs/
 *.suo
 *.ntvs*
 data/memory_bank.db
+.continue/agents/new-config.yaml

@@ -9,14 +9,23 @@
 ════════════════════════════════════════════════════════════
 
 [RULE-001] The Analyst Heartbeat Loop
-  The analyst-brain container SHALL execute a 24-hour regime evaluation cycle. On each cycle,
-  it must fetch two primary macro inputs: the SPY closing price relative to its 200-day Simple
-  Moving Average (sourced from Alpaca Data API), and the current VIX level (sourced from Yahoo
-  Finance). These two inputs feed directly into the RegimeStateMachine. If either data source
-  fails, the cycle must be flagged as invalid — the machine must never evaluate on stale or
-  partial data. Future data sources (options flow, yield curve, sector rotation) may be added
-  as supplemental inputs but may NOT replace SPY/SMA and VIX as the primary regime triggers.
+  The analyst-brain container SHALL execute a regime evaluation cycle at a minimum frequency
+  of once per 24 hours. The cycle interval MUST be controlled by the ANALYST_CYCLE_HOURS
+  environment variable, injected at runtime. If the variable is absent at startup, the
+  container MUST log a [FATAL] error and exit immediately — it must not silently default
+  to any hardcoded value (see RULE-009). A hard-coded sleep_for(hours(24)) is not a valid
+  implementation; the interval must be read from the environment so it can be tightened
+  (e.g., to 1–4 hours during elevated volatility regimes) without requiring a code rebuild
+  or container restart.
 
+  On each cycle, the analyst must fetch two primary macro inputs: the SPY closing price
+  relative to its 200-day Simple Moving Average (sourced from Alpaca Data API), and the
+  current VIX level (sourced from Yahoo Finance). These two inputs feed directly into the
+  RegimeStateMachine. If either data source fails, the cycle must be flagged as invalid —
+  the machine must never evaluate on stale or partial data. Future data sources (options
+  flow, yield curve, sector rotation) may be added as supplemental inputs but may NOT
+  replace SPY/SMA and VIX as the primary regime triggers.
+  
 [RULE-002] Regime State Classification
   The RegimeStateMachine SHALL classify macro market conditions into exactly one of three
   operational states at all times:
@@ -58,16 +67,24 @@
 [RULE-005] Position Sizing via the Kelly Calculator
   All position sizes SHALL be computed by the Kelly Calculator using the formula:
     K% = W - ((1 - W) / R)
-  Where W = win rate and R = win/loss ratio, both injected at runtime via environment variables
-  (KELLY_WIN_RATE, KELLY_WIN_LOSS_RATIO). The raw Kelly output is then scaled by a fixed
-  Half-Kelly safety multiplier of 0.5 to reduce variance. Hard caps are enforced:
+  Where W = win rate and R = win/loss ratio, both injected at runtime via environment
+  variables (KELLY_WIN_RATE, KELLY_WIN_LOSS_RATIO). The raw Kelly output is then scaled
+  by a fixed Half-Kelly safety multiplier of 0.5 to reduce variance. Hard caps are enforced:
     • Maximum risk per trade: 10% of portfolio equity
     • Minimum risk per trade: 1% of portfolio equity (if strategy is active)
-  Equity is fetched live from the Alpaca account before every order. On fetch failure, the
-  engine falls back to a $10,000 baseline. Future asset classes (options contracts, futures
-  lots) must implement their own sizing adapters but must call and respect the same Kelly
-  percentage output — they may never override or bypass the 10% hard cap.
 
+  Equity is fetched live from the Alpaca account before every order. On fetch failure, the
+  engine MUST NOT proceed with any fallback or estimated equity value. It must instead:
+    1. Attempt the equity fetch up to 3 times with exponential backoff: 2s → 4s → 8s
+       (consistent with RULE-007).
+    2. If all retries are exhausted, immediately halt all new order entries for the cycle.
+    3. Log the failure as [CRITICAL] to container stdout.
+    4. Fire a Telegram alert via the heartbeat monitor's notification channel (see RULE-006).
+  A silent degradation fallback is not permitted — it masks a live infrastructure failure
+  and directly violates the dual-channel observability mandate of RULE-013.
+  Future asset classes (options contracts, futures lots) must implement their own sizing
+  adapters but must call and respect the same Kelly percentage output — they may never
+  override or bypass the 10% hard cap.
 [RULE-006] The Heartbeat Monitor (Nox)
   The heartbeat-monitor container SHALL serve three persistent roles:
     1. SEC Radar       — Poll EDGAR every 30 seconds for new 8-K filings matching the

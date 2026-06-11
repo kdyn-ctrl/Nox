@@ -13,7 +13,7 @@ struct AllocationStrategy {
     Regime current_regime;
     double capital_multiplier;       // 1.0 = Full $65, 0.5 = $32.50, 0.0 = $0
     double stop_loss_atr_multiplier; // How wide the stop loss should be
-    std::string log_message;         // For your Discord heartbeat webhook
+    std::string log_message;         // For your Telegram heartbeat notification
 };
 
 // 3. The State Machine Class

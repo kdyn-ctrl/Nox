@@ -4,7 +4,8 @@ RUN apk add --no-cache g++ make cmake openssl-dev build-base
 WORKDIR /app
 # Download the single-header libraries
 ADD https://raw.githubusercontent.com/yhirose/cpp-httplib/master/httplib.h .
-ADD https://github.com/nlohmann/json/releases/download/v3.11.2/json.hpp .
+RUN mkdir -p nlohmann
+ADD https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp ./nlohmann/json.hpp
 
 COPY . .
 # Compile the engine

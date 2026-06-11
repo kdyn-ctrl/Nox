@@ -27,43 +27,65 @@ WATCHLIST = ["AAPL", "TSLA", "NVDA", "MSFT"]
 # --- 1.5 THE MEMORY BANK ---
 def init_db():
     """Creates the database and tables if they don't exist"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS daily_audits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            tickers_scanned TEXT,
-            claude_analysis TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS trade_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            ticker TEXT,
-            action TEXT,
-            price REAL,
-            rsi_value REAL,
-            sizing_kelly_ratio REAL,
-            pnl REAL
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS daily_audits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    tickers_scanned TEXT,
+                    claude_analysis TEXT
+                )
+            ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS processed_filings (
+                    filing_id TEXT PRIMARY KEY,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS trade_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    ticker TEXT,
+                    action TEXT,
+                    price REAL,
+                    rsi_value REAL,
+                    sizing_kelly_ratio REAL,
+                    pnl REAL
+                )
+            ''')
+            conn.commit()
+    except Exception as e:
+        print(f"Database initialization error: {e}")
 
 # --- 2. DATA EXTRACTION ---
 def get_alpaca_portfolio():
     headers = {'APCA-API-KEY-ID': ALPACA_API, 'APCA-API-SECRET-KEY': ALPACA_SEC}
     try:
-        acc = requests.get('https://paper-api.alpaca.markets/v2/account', headers=headers).json()
-        pos = requests.get('https://paper-api.alpaca.markets/v2/positions', headers=headers).json()
+        acc_resp = requests.get('https://paper-api.alpaca.markets/v2/account', headers=headers, timeout=10)
+        pos_resp = requests.get('https://paper-api.alpaca.markets/v2/positions', headers=headers, timeout=10)
+        
+        if acc_resp.status_code != 200 or pos_resp.status_code != 200:
+            return f"Failed to pull Alpaca data. Account status: {acc_resp.status_code}, Positions status: {pos_resp.status_code}"
+
+        acc = acc_resp.json()
+        pos = pos_resp.json()
+        
+        if not isinstance(acc, dict) or not isinstance(pos, list):
+            return "Alpaca API returned unexpected data formats."
+
         balance = acc.get('portfolio_value', 'Unknown')
-        positions = [f"{p['qty']} shares of {p['symbol']} (P&L: ${p['unrealized_pl']})" for p in pos]
+        positions = []
+        for p in pos:
+            if isinstance(p, dict):
+                positions.append(f"{p.get('qty', 0)} shares of {p.get('symbol', 'UNKNOWN')} (P&L: ${p.get('unrealized_pl', 0.0)})")
+        
         pos_str = "\n".join(positions) if positions else "No open positions."
         return f"Portfolio: ${balance}\nPositions:\n{pos_str}"
-    except:
-        return "Failed to pull Alpaca data."
+    except Exception as e:
+        return f"Failed to pull Alpaca data due to exception: {str(e)}"
 
 def get_sec_8k(ticker):
     url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type=8-K&output=atom"
@@ -86,7 +108,7 @@ def get_sec_8k(ticker):
 def run_scout_protocol():
     try:
         headers = {'APCA-API-KEY-ID': ALPACA_API, 'APCA-API-SECRET-KEY': ALPACA_SEC}
-        news_req = requests.get('https://data.alpaca.markets/v1beta1/news?symbols=NVDA,XOM,BTCUSD&limit=5', headers=headers).json()
+        news_req = requests.get('https://data.alpaca.markets/v1beta1/news?symbols=NVDA,XOM,BTCUSD&limit=5', headers=headers, timeout=10).json()
         news_context = "\n".join([f"- {n['headline']}" for n in news_req.get('news', [])])
         
         sec_context = "\n".join([get_sec_8k(ticker) for ticker in ["NVDA", "XOM"]])
@@ -108,12 +130,11 @@ def run_scout_protocol():
         bot.send_message(CHAT_ID, f"🦅 *Nox Daily Audit Report*\n\n{analysis_text}", parse_mode='Markdown')
         
         # Log to DB safely inside the successful try block
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT INTO daily_audits (tickers_scanned, claude_analysis) VALUES (?, ?)", 
-                  ("NVDA, XOM, BTCUSD", analysis_text))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO daily_audits (tickers_scanned, claude_analysis) VALUES (?, ?)", 
+                      ("NVDA, XOM, BTCUSD", analysis_text))
+            conn.commit()
     except Exception as e:
         print(f"Scout Error: {e}")
 
@@ -126,19 +147,21 @@ def schedule_checker():
 # --- 4. CONVERSATIONAL AGENT HANDLERS ---
 @bot.message_handler(commands=['status'])
 def send_status(message):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM daily_audits")
-    audit_count = c.fetchone()[0]
-    conn.close()
-    
-    status_msg = (
-        "🦅 *Nox Systems Status*\n"
-        f"✅ Brain: Online\n"
-        f"✅ Memory Bank: {audit_count} audits saved\n"
-        f"✅ Kelly Engine: Ready"
-    )
-    bot.reply_to(message, status_msg, parse_mode='Markdown')
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM daily_audits")
+            audit_count = c.fetchone()[0]
+        
+        status_msg = (
+            "🦅 *Nox Systems Status*\n"
+            f"✅ Brain: Online\n"
+            f"✅ Memory Bank: {audit_count} audits saved\n"
+            f"✅ Kelly Engine: Ready"
+        )
+        bot.reply_to(message, status_msg, parse_mode='Markdown')
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Failed to retrieve status: {str(e)}")
 
 @bot.message_handler(func=lambda message: True)
 def chat_with_nox(message):
@@ -159,9 +182,20 @@ def chat_with_nox(message):
         bot.reply_to(message, f"⚠️ Brain Error: {str(e)}")
 
 # --- 5. REAL-TIME SEC POLING PIPELINE ---
+def is_filing_processed(filing_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM processed_filings WHERE filing_id = ?", (filing_id,))
+        return c.fetchone() is not None
+
+def mark_filing_processed(filing_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO processed_filings (filing_id) VALUES (?)", (filing_id,))
+        conn.commit()
+
 def poll_sec_edgar():
     print("Nox Automated SEC Radar engaged...")
-    processed_filings = set() 
     sec_url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"
     headers = {"User-Agent": "OpenClawSwarm/1.0 openclaw@vanhellsing.tech"}
 
@@ -176,14 +210,14 @@ def poll_sec_edgar():
                     link = entry.find('atom:link', ns).attrib['href']
                     filing_id = entry.find('atom:id', ns).text
 
-                    if filing_id in processed_filings:
+                    if is_filing_processed(filing_id):
                         continue
 
                     for ticker in WATCHLIST:
                         if f"({ticker})" in title or ticker in title.upper():
                             print(f"🚨 [SEC RADAR] New 8-K found for {ticker}!")
                             process_automated_filing(ticker, link)
-                            processed_filings.add(filing_id)
+                            mark_filing_processed(filing_id)
         except Exception as e:
             print(f"⚠️ SEC Radar Error: {e}")
         time.sleep(30)

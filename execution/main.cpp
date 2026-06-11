@@ -1,5 +1,6 @@
+#define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
-#include "json.hpp"
+#include "nlohmann/json.hpp"
 #include "RegimeStateMachine.hpp"
 #include <iostream>
 #include <string>
@@ -19,6 +20,8 @@ static void sendMessage(std::string message) {
         }
 
         httplib::Client cli("https://api.telegram.org");
+        cli.set_connection_timeout(std::chrono::seconds(5));
+        cli.set_read_timeout(std::chrono::seconds(10));
         std::string path = "/bot" + token + "/sendMessage";
 
         // Telegram's max limit is 4096; 4000 gives us a safe buffer for formatting tags
@@ -32,7 +35,8 @@ static void sendMessage(std::string message) {
 
             json body = {
                 {"chat_id", chatId},
-                {"text", chunk}
+                {"text", chunk},
+                {"parse_mode", "Markdown"}
             };
 
             auto res = cli.Post(path.c_str(), body.dump(), "application/json");
@@ -57,7 +61,7 @@ struct TradeSignal {
     std::string action = "HOLD";
     double price = 0.0;
     double rsi = 50.0;
-    long long vol = 0.0;
+    long long vol = 0;
     double atr = 0.0;
     int risk_tier = 1;
 };
@@ -66,8 +70,10 @@ struct TradeSignal {
 int calculate_kelly_size(double equity, double current_price) {
     if (current_price <= 0) return 1; 
 
-    double win_rate = 0.55;  
-    double win_loss_ratio = 2.0; 
+    const char* wr_env  = std::getenv("KELLY_WIN_RATE");
+    const char* wlr_env = std::getenv("KELLY_WIN_LOSS_RATIO");
+    double win_rate      = wr_env  ? std::stod(wr_env)  : 0.55;
+    double win_loss_ratio = wlr_env ? std::stod(wlr_env) : 2.0;
     
     // The Kelly Formula: K% = W - ((1 - W) / R)
     double kelly_pct = win_rate - ((1.0 - win_rate) / win_loss_ratio);
@@ -86,102 +92,166 @@ int calculate_kelly_size(double equity, double current_price) {
     return (shares > 0) ? shares : 1; 
 }
 
-// --- 3.5 RISK AGENT (Legacy ATR Logic) ---
-class RiskAgent {
-public:
-    static double calculatePositionSize(double equity, double atr, int tier) {
-        if (atr <= 0) return 0;
-        double riskPercent = (tier == 3) ? 0.05 : 0.01; 
-        double stopMultiplier = (tier == 3) ? 3.5 : 2.0;
-        double dollarRisk = equity * riskPercent;
-        double stopDistance = atr * stopMultiplier;
-        return dollarRisk / stopDistance;
-    }
-};
-
-// --- 4. EXECUTION AGENT ---
-class ExecutionAgent {
-public:
-    // Updated to accept 'int' for mathematically precise share counts
-    bool placeOrder(TradeSignal sig, int quantity, std::string apiKey, std::string apiSec) {
-        if (quantity <= 0) return false;
-
-        std::string msg = " *OPENCLAW TRADE*\n"
-                         "*Ticker:* " + sig.ticker + "\n"
-                         "*Action:* " + sig.action + "\n"
-                         "*Kelly Qty:* " + std::to_string(quantity) + " Shares\n"
-                         "*Price:* $" + std::to_string(sig.price) + "\n"
-                         "*Risk Tier:* " + std::to_string(sig.risk_tier);
-
-        Logger::log("EXEC", "Firing " + sig.action + " for " + std::to_string(quantity) + " shares of " + sig.ticker);
-        TelegramNotifier::sendMessage(msg); 
-        return true;
-    }
-};
-
-// --- 5. THE ENGINE ---
+// --- 4. THE ENGINE ---
 class OpenClawEngine {
 private:
     std::string secret;
     std::string apiKey;
     std::string apiSec;
-    double accountEquity = 100000.0; // Updated to your $100k Paper Balance
 
-    void process(TradeSignal sig) {
-        // Now using the Kelly Calculator for position sizing
-        int qty = calculate_kelly_size(accountEquity, sig.price);
-        // Skip processing if the action is to just HOLD position
-    if (sig.action == "HOLD") {
-        std::cout << "[EXECUTION] Strategy indicates HOLD. No orders routed." << std::endl;
-        return;
+    double fetch_account_equity() {
+        try {
+            httplib::Client alpaca_cli("https://paper-api.alpaca.markets");
+            alpaca_cli.set_connection_timeout(std::chrono::seconds(5));
+            alpaca_cli.set_read_timeout(std::chrono::seconds(10));
+
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID", apiKey},
+                {"APCA-API-SECRET-KEY", apiSec}
+            };
+
+            auto res = alpaca_cli.Get("/v2/account", headers);
+            if (res && res->status == 200) {
+                json account_data = json::parse(res->body);
+                return std::stod(account_data.value("portfolio_value", "10000.0"));
+            } else {
+                Logger::log("WARN", "Failed to fetch account equity from Alpaca. Status: " +
+                            (res ? std::to_string(res->status) : "TIMEOUT") + ". Falling back to $10,000.");
+            }
+        } catch (const std::exception& e) {
+            Logger::log("WARN", "Exception fetching account equity: " + std::string(e.what()) + ". Falling back to $10,000.");
+        }
+        return 10000.0;
     }
 
-    // TRANSMIT LIVE ORDER TO ALPACA PAPER TRADING API
-    try {
-        httplib::Client alpaca_cli("https://paper-api.alpaca.markets");
-        
-        // Inject your secure environment variables into the request headers
-        httplib::Headers headers = {
-            {"APCA-API-KEY-ID", apiKey},
-            {"APCA-API-SECRET-KEY", apiSec},
-            {"Content-Type", "application/json"}
-        };
+    void process(TradeSignal sig) {
+        // Skip processing if the action is HOLD or a REPORT audit payload
+        if (sig.action == "HOLD" || sig.action == "REPORT") {
+            std::cout << "[EXECUTION] Strategy indicates HOLD/REPORT. No orders routed." << std::endl;
+            return;
+        }
 
-        // Structure the exact JSON payload Alpaca requires, using your dynamic Kelly qty
-        json order_payload = {
-            {"symbol", sig.ticker},
-            {"qty", std::to_string(qty)}, // Uses your Kelly size!
-            {"side", sig.action == "BUY" ? "buy" : "sell"},
-            {"type", "market"},
-            {"time_in_force", "day"}
-        };
+        // RSI overbought/oversold gate — block trades that contradict momentum
+        if (sig.action == "BUY" && sig.rsi > 70.0) {
+            Logger::log("WARN", "RSI gate blocked BUY for " + sig.ticker + " — RSI overbought at " + std::to_string(sig.rsi));
+            TelegramNotifier::sendMessage(
+                "🚧 *RSI GATE BLOCK*\n"
+                "────────────────────────\n"
+                "• *Ticker:* " + sig.ticker + "\n"
+                "• *Action:* BUY\n"
+                "• *RSI:* " + std::to_string(sig.rsi) + " (Overbought > 70)\n"
+                "────────────────────────\n"
+                "⚠️ _Order canceled to protect buying power._"
+            );
+            return;
+        }
+        if (sig.action == "SELL" && sig.rsi < 30.0) {
+            Logger::log("WARN", "RSI gate blocked SELL for " + sig.ticker + " — RSI oversold at " + std::to_string(sig.rsi));
+            TelegramNotifier::sendMessage(
+                "🚧 *RSI GATE BLOCK*\n"
+                "────────────────────────\n"
+                "• *Ticker:* " + sig.ticker + "\n"
+                "• *Action:* SELL\n"
+                "• *RSI:* " + std::to_string(sig.rsi) + " (Oversold < 30)\n"
+                "────────────────────────\n"
+                "⚠️ _Order canceled to prevent selling into low liquidity._"
+            );
+            return;
+        }
+
+        // Fetch live equity, then size the position with Kelly
+        double live_equity = fetch_account_equity();
+        int qty = calculate_kelly_size(live_equity, sig.price);
+
+        // TRANSMIT LIVE ORDER TO ALPACA PAPER TRADING API
+        try {
+            httplib::Client alpaca_cli("https://paper-api.alpaca.markets");
+            alpaca_cli.set_connection_timeout(std::chrono::seconds(5));
+            alpaca_cli.set_read_timeout(std::chrono::seconds(10));
+            
+            // Inject your secure environment variables into the request headers
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID", apiKey},
+                {"APCA-API-SECRET-KEY", apiSec},
+                {"Content-Type", "application/json"}
+            };
+
+            // Structure the exact JSON payload Alpaca requires, using your dynamic Kelly qty
+            json order_payload = {
+                {"symbol", sig.ticker},
+                {"qty", qty}, // Uses your Kelly size!
+                {"side", sig.action == "BUY" ? "buy" : "sell"},
+                {"type", "market"},
+                {"time_in_force", "day"}
+            };
 
         std::cout << "[EXECUTION] Routing order to Alpaca: " << qty << " shares of " << sig.ticker << "..." << std::endl;
 
         auto res = alpaca_cli.Post("/v2/orders", headers, order_payload.dump(), "application/json");
 
-        if (res && res->status == 200) {
-            json response_data = json::parse(res->body);
-            std::cout << " [ORDER EXECUTED] Alpaca Order ID: " 
-                      << response_data.value("id", "UNKNOWN") << " | Status: " 
-                      << response_data.value("status", "pending") << std::endl;
-        } else {
-            std::cerr << "⚠️ [ALPACA REJECTION] Exchange returned status code: " 
-                      << (res ? std::to_string(res->status) : "TIMEOUT") << std::endl;
-            if (res) {
-                std::cerr << "Details: " << res->body << std::endl;
+            if (res && res->status == 200) {
+                json response_data = json::parse(res->body);
+                std::string order_id = response_data.value("id", "UNKNOWN");
+                std::string order_status = response_data.value("status", "pending");
+                std::cout << " [ORDER EXECUTED] Alpaca Order ID: "
+                          << order_id << " | Status: "
+                          << order_status << std::endl;
+                TelegramNotifier::sendMessage(
+                    "🟢 *ORDER EXECUTED*\n"
+                    "────────────────────────\n"
+                    "• *Ticker:* " + sig.ticker + "\n"
+                    "• *Side:* " + sig.action + "\n"
+                    "• *Quantity:* " + std::to_string(qty) + " Shares (Kelly)\n"
+                    "• *Status:* " + order_status + "\n"
+                    "• *Order ID:* `" + order_id + "`\n"
+                    "────────────────────────"
+                );
+            } else {
+                std::string status_code = res ? std::to_string(res->status) : "TIMEOUT";
+                std::string details     = res ? res->body : "No response received.";
+                std::cerr << "⚠️ [ALPACA REJECTION] Exchange returned status code: "
+                          << status_code << std::endl;
+                if (res) {
+                    std::cerr << "Details: " << details << std::endl;
+                }
+                TelegramNotifier::sendMessage(
+                    "🚨 *ALPACA REJECTION*\n"
+                    "────────────────────────\n"
+                    "• *Ticker:* " + sig.ticker + "\n"
+                    "• *Side:* " + sig.action + "\n"
+                    "• *Quantity:* " + std::to_string(qty) + " Shares\n"
+                    "• *Status Code:* " + status_code + "\n"
+                    "• *Details:* `" + details + "`\n"
+                    "────────────────────────"
+                );
             }
+        } catch (const std::exception& e) {
+            std::cerr << "💥 Runtime Exception routing order to Alpaca: " << e.what() << std::endl;
         }
-    } catch (const std::exception& e) {
-        std::cerr << "💥 Runtime Exception routing order to Alpaca: " << e.what() << std::endl;
-    }
     }
 
 public:
     OpenClawEngine() {
-        secret = std::getenv("WEBHOOK_SECRET_TOKEN") ? std::getenv("WEBHOOK_SECRET_TOKEN") : "openclaw_alpha_777";
-        apiKey = std::getenv("ALPACA_API_KEY") ? std::getenv("ALPACA_API_KEY") : "";
-        apiSec = std::getenv("ALPACA_SECRET_KEY") ? std::getenv("ALPACA_SECRET_KEY") : "";
+        const char* env_secret = std::getenv("WEBHOOK_SECRET_TOKEN");
+        const char* env_key    = std::getenv("ALPACA_API_KEY");
+        const char* env_sec    = std::getenv("ALPACA_SECRET_KEY");
+
+        if (!env_secret) {
+            std::cerr << "[FATAL] WEBHOOK_SECRET_TOKEN env variable is not set. Exiting." << std::endl;
+            std::exit(1);
+        }
+        if (!env_key) {
+            std::cerr << "[FATAL] ALPACA_API_KEY env variable is not set. Exiting." << std::endl;
+            std::exit(1);
+        }
+        if (!env_sec) {
+            std::cerr << "[FATAL] ALPACA_SECRET_KEY env variable is not set. Exiting." << std::endl;
+            std::exit(1);
+        }
+
+        secret = env_secret;
+        apiKey = env_key;
+        apiSec = env_sec;
     }
 
     void run() {
@@ -189,64 +259,82 @@ public:
 
         svr.Post("/webhook", [this](const httplib::Request& req, httplib::Response& res) {
             std::string body = req.body;
-            size_t i = 0;
             int success_count = 0;
 
-            // Smart Splitter: Scan the continuous network stream for standalone JSON blocks
-            while (i < body.length()) {
-                size_t start = body.find('{', i);
-                if (start == std::string::npos) break;
+            try {
+                // Parse cleaner using standard json parser instead of hand-rolled brace split logic
+                json root_payload = json::parse(body);
 
-                int brace_count = 0;
-                size_t end = std::string::npos;
-
-                // Scan forward to find the matching closing brace for this specific object
-                for (size_t j = start; j < body.length(); ++j) {
-                    if (body[j] == '{') brace_count++;
-                    else if (body[j] == '}') brace_count--;
-
-                    if (brace_count == 0) {
-                        end = j;
-                        break;
-                    }
-                }
-
-                // Handle truncated or cut-off network frames safely
-                if (end == std::string::npos) {
-                    Logger::log("WARN", "Smart Splitter detected an incomplete trailing chunk.");
-                    break;
-                }
-
-                // Extract and advance past this standalone JSON chunk
-                std::string json_chunk = body.substr(start, end - start + 1);
-                i = end + 1; 
-
-                try {
-                    json data = json::parse(json_chunk);
+                auto process_single_chunk = [this, &success_count](const json& data) {
                     if (data.value("secret_key", "") != secret) {
                         Logger::log("WARN", "Unauthorized signal dropped by security shield.");
-                        continue; 
+                        return;
                     }
 
                     TradeSignal signal;
                     signal.ticker = data.value("ticker", "UNKNOWN");
                     signal.action = data.value("action", "HOLD");
-                    signal.price = data.value("price", 0.0);
-                    signal.rsi = data.value("rsi", 50.0);
-                    signal.vol = data.value("vol", 0LL);
-                    signal.atr = data.value("atr", 0.0);
-                    signal.risk_tier = data.value("risk_tier", 1);
 
-                    Logger::log("INFO", "Signal Parsed via Smart Split: " + signal.action + " " + signal.ticker);
-                    
+                    // Fallbacks for potential mismatched data types in inputs
+                    if (data.contains("price")) {
+                        if (data["price"].is_number()) {
+                            signal.price = data["price"].get<double>();
+                        } else if (data["price"].is_string()) {
+                            signal.price = std::stod(data["price"].get<std::string>());
+                        }
+                    }
+                    if (data.contains("rsi")) {
+                        if (data["rsi"].is_number()) {
+                            signal.rsi = data["rsi"].get<double>();
+                        } else if (data["rsi"].is_string()) {
+                            signal.rsi = std::stod(data["rsi"].get<std::string>());
+                        }
+                    }
+                    if (data.contains("vol")) {
+                        if (data["vol"].is_number_integer()) {
+                            signal.vol = data["vol"].get<long long>();
+                        } else if (data["vol"].is_string()) {
+                            signal.vol = std::stoll(data["vol"].get<std::string>());
+                        }
+                    }
+                    if (data.contains("atr")) {
+                        if (data["atr"].is_number()) {
+                            signal.atr = data["atr"].get<double>();
+                        } else if (data["atr"].is_string()) {
+                            signal.atr = std::stod(data["atr"].get<std::string>());
+                        }
+                    }
+                    if (data.contains("risk_tier")) {
+                        if (data["risk_tier"].is_number_integer()) {
+                            signal.risk_tier = data["risk_tier"].get<int>();
+                        } else if (data["risk_tier"].is_string()) {
+                            signal.risk_tier = std::stoi(data["risk_tier"].get<std::string>());
+                        }
+                    }
+
+                    Logger::log("INFO", "Signal Parsed successfully: " + signal.action + " " + signal.ticker);
                     TelegramNotifier::sendMessage("🚀 Signal Parsed: " + signal.action + " " + signal.ticker);
+                    
+                    process(signal);
                     success_count++;
+                };
 
-                } catch (const json::parse_error& e) {
-                    Logger::log("ERROR", "Internal chunk failed to parse: " + std::string(e.what()));
-                } catch (const json::type_error& e) {
-                    Logger::log("ERROR", "Data type mismatch within chunk: " + std::string(e.what()));
+                if (root_payload.is_array()) {
+                    for (const auto& item : root_payload) {
+                        process_single_chunk(item);
+                    }
+                } else if (root_payload.is_object()) {
+                    process_single_chunk(root_payload);
+                } else {
+                    Logger::log("WARN", "Payload is neither an object nor an array.");
                 }
+
+            } catch (const json::parse_error& e) {
+                Logger::log("ERROR", "JSON parse error: " + std::string(e.what()));
+            } catch (const json::type_error& e) {
+                Logger::log("ERROR", "Type mismatch in payload: " + std::string(e.what()));
+            } catch (const std::exception& e) {
+                Logger::log("ERROR", "Exception processing signals: " + std::string(e.what()));
             }
 
             // Global Webhook Router Responses & Safety Nets
