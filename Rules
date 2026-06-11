@@ -1,0 +1,163 @@
+# OpenClaw Trading System — Architectural Rules & Design Contract
+# Version 1.0 | Author: Van Hellsing
+# Scope: Governs all current containers (analyst, execution, heartbeat) and all future modules.
+# This document is the single source of truth for system behavior, boundaries, and expansion standards.
+
+
+════════════════════════════════════════════════════════════
+ SECTION I — CORE SYSTEM ARCHITECTURE (What the Bot MUST Do)
+════════════════════════════════════════════════════════════
+
+[RULE-001] The Analyst Heartbeat Loop
+  The analyst-brain container SHALL execute a 24-hour regime evaluation cycle. On each cycle,
+  it must fetch two primary macro inputs: the SPY closing price relative to its 200-day Simple
+  Moving Average (sourced from Alpaca Data API), and the current VIX level (sourced from Yahoo
+  Finance). These two inputs feed directly into the RegimeStateMachine. If either data source
+  fails, the cycle must be flagged as invalid — the machine must never evaluate on stale or
+  partial data. Future data sources (options flow, yield curve, sector rotation) may be added
+  as supplemental inputs but may NOT replace SPY/SMA and VIX as the primary regime triggers.
+
+[RULE-002] Regime State Classification
+  The RegimeStateMachine SHALL classify macro market conditions into exactly one of three
+  operational states at all times:
+
+    • RISK_ON     — VIX < 20 AND SPY price is above its 200-day SMA.
+                    Full capital deployment. Kelly multiplier = 1.0.
+
+    • TRANSITION  — VIX between 20–30 OR SPY is choppy around the SMA band.
+                    Reduced deployment. Kelly multiplier = 0.5.
+
+    • RISK_OFF    — VIX >= 30 OR SPY price is more than 2% below its 200-day SMA.
+                    All new entries halted. Kelly multiplier = 0.0.
+
+  The machine defaults to TRANSITION on startup until live data resolves a valid state.
+  Future strategies (options, futures, sector ETFs) must read and respect the current regime
+  state before sizing or routing any order.
+
+[RULE-003] Payload Serialization & Internal Routing
+  After each evaluation, the analyst SHALL serialize the full regime result into a validated
+  JSON payload and transmit it via HTTP POST to the execution engine at:
+  http://execution_engine:8080/webhook over the shared openclaw_net Docker bridge network.
+  The payload must include: secret_key, ticker, action, price, risk_tier, vol, regime_state,
+  atr, kelly_pct, and report_body. No field may be omitted. Future payload fields for new
+  asset classes (options Greeks, futures basis, etc.) must be added as optional extension
+  fields and must not break backward compatibility.
+
+[RULE-004] The Execution Engine Server
+  The execution-engine container SHALL maintain a persistent, multi-threaded HTTP listener on
+  port 0.0.0.0:8080. Every incoming request must pass through three sequential gates before
+  any logic executes:
+    1. Schema Gate     — Payload is parsed strictly using nlohmann/json. Any malformed input
+                         is rejected with HTTP 400 before memory allocation occurs.
+    2. Auth Gate       — secret_key field must match the WEBHOOK_SECRET_TOKEN environment
+                         variable. Any mismatch is silently dropped and logged as WARN.
+    3. Logic Gate      — RSI momentum filter: BUY orders above RSI 70 are blocked (overbought).
+                         SELL orders below RSI 30 are blocked (oversold).
+  Only payloads that clear all three gates proceed to Kelly sizing and order routing.
+
+[RULE-005] Position Sizing via the Kelly Calculator
+  All position sizes SHALL be computed by the Kelly Calculator using the formula:
+    K% = W - ((1 - W) / R)
+  Where W = win rate and R = win/loss ratio, both injected at runtime via environment variables
+  (KELLY_WIN_RATE, KELLY_WIN_LOSS_RATIO). The raw Kelly output is then scaled by a fixed
+  Half-Kelly safety multiplier of 0.5 to reduce variance. Hard caps are enforced:
+    • Maximum risk per trade: 10% of portfolio equity
+    • Minimum risk per trade: 1% of portfolio equity (if strategy is active)
+  Equity is fetched live from the Alpaca account before every order. On fetch failure, the
+  engine falls back to a $10,000 baseline. Future asset classes (options contracts, futures
+  lots) must implement their own sizing adapters but must call and respect the same Kelly
+  percentage output — they may never override or bypass the 10% hard cap.
+
+[RULE-006] The Heartbeat Monitor (Nox)
+  The heartbeat-monitor container SHALL serve three persistent roles:
+    1. SEC Radar       — Poll EDGAR every 30 seconds for new 8-K filings matching the
+                         active watchlist. On match, route filing text through the Claude
+                         AI risk analysis pipeline and push a structured alert to Telegram.
+    2. Daily Scout     — At 11:30 AM ET each trading day, aggregate macro news headlines
+                         (Alpaca News API) and targeted SEC filings into a Claude-generated
+                         daily intelligence report, delivered to the Telegram channel.
+    3. Conversational Agent — Maintain a persistent Telegram bot interface that allows
+                         live queries against portfolio state, audit history, and system
+                         status via the /status command or free-form text.
+  All audit reports and trade history must be persisted to the SQLite memory bank at
+  /app/data/memory_bank.db. The memory bank is the system's institutional knowledge base
+  and must be mounted as a persistent Docker volume.
+
+
+════════════════════════════════════════════════════════════
+ SECTION II — SAFETY & ARCHITECTURAL BOUNDARIES (What the Bot MUST NOT Do)
+════════════════════════════════════════════════════════════
+
+[RULE-007] No Silent Cycle Failures (No Data Dropping)
+  If the analyst fails to deliver its payload to the execution engine for any reason
+  (container unreachable, network timeout, non-200 response), it MUST NOT silently skip
+  the cycle and sleep for 24 hours. It must immediately enter an exponential-backoff retry
+  loop: up to 5 attempts with delays of 2s → 4s → 8s → 16s → 32s. If all attempts are
+  exhausted, the failure must be logged as CRITICAL and flagged for manual review. This rule
+  applies to all future inter-container communication, not just the analyst-to-execution path.
+
+[RULE-008] No Unguarded External Network Calls
+  Every synchronous HTTP call to an external API (Alpaca, Telegram, Yahoo Finance, SEC EDGAR,
+  Anthropic, or any future integration) MUST define explicit connection and read timeout
+  thresholds at the point of client construction. Minimum enforced thresholds:
+    • Connection timeout: 5 seconds
+    • Read/response timeout: 10–15 seconds
+  No network call may block indefinitely. This rule applies across all languages in the stack
+  (C++ httplib, Python requests). Timeouts are not optional configuration — they are
+  non-negotiable safety rails.
+
+[RULE-009] No Hardcoded Secrets or Credentials
+  No API keys, webhook tokens, bot tokens, secret keys, or any sensitive credential shall
+  ever appear as a raw string literal in any source code file across any container. All such
+  values must be injected at runtime via environment variables, loaded from a .env file that
+  is explicitly listed in .gitignore and never committed to version control. If a required
+  environment variable is missing at startup, the container must log a [FATAL] error and
+  exit immediately rather than attempt to run in a degraded state. This rule applies to all
+  future modules, scripts, and integrations added to this system.
+
+[RULE-010] No Manual Payload Parsing
+  No component in this system may parse incoming JSON payloads using manual string scanning,
+  character offset indexing, substring splitting, or custom tokenization logic. All payload
+  deserialization must use the designated native validation library for that container:
+    • C++ containers  → nlohmann/json with structured exception handling
+    • Python containers → the standard json module or pydantic for schema validation
+  Malformed inputs must be rejected at the parser boundary before any field access or business
+  logic executes. Parser exceptions must be caught at the handler level and return HTTP 400.
+
+
+════════════════════════════════════════════════════════════
+ SECTION III — EXPANSION STANDARDS (Rules for Future Features)
+════════════════════════════════════════════════════════════
+
+[RULE-011] Options & Futures Module Integration
+  When options or futures trading modules are added, they must conform to the following:
+    • Regime gate: Read current regime state before any order is sized or routed. RISK_OFF
+      state must halt all new entries, including short-premium strategies.
+    • Kelly adapter: Implement an asset-class-specific sizing adapter (e.g., contract multiplier
+      normalization for futures, delta-adjusted notional for options) that outputs a Kelly
+      percentage, which is then subject to the same 10% hard cap defined in RULE-005.
+    • Payload contract: New signal fields (e.g., strike, expiry, delta, theta, IV_rank) must
+      be added as optional, clearly named extension fields to the existing payload schema.
+      They must not rename or repurpose existing required fields.
+
+[RULE-012] New Container & Service Standards
+  Any new service added to docker-compose.yml must:
+    • Belong to the openclaw_net internal network for inter-service communication.
+    • Define a restart: unless-stopped policy.
+    • Inject all credentials exclusively through the environment block using .env references.
+    • Include a clearly scoped responsibility comment in docker-compose.yml.
+    • Follow the same three-gate validation model (schema, auth, logic) if it exposes any
+      HTTP endpoint, whether internal or external.
+
+[RULE-013] Observability & Auditability
+  Every order executed, every regime state transition, and every SEC radar alert must produce
+  a structured log entry (container stdout) AND a Telegram notification. Silent execution —
+  where the system acts without a corresponding user-visible record — is not permitted.
+  Future features must maintain this dual-channel observability standard. Structured log
+  format: [LEVEL] [COMPONENT] Message. Acceptable levels: INFO, WARN, ERROR, FATAL, CRITICAL.
+
+[RULE-014] Paper Trading First Policy
+  All new trading strategies, asset class integrations, and execution modifications must be
+  validated against the Alpaca Paper Trading environment before any live capital deployment.
+  API base URLs must be managed via environment variables to allow clean promotion from paper
+  to live without source code changes. No hardcoded live trading URLs are permitted.
