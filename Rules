@@ -178,3 +178,78 @@
   validated against the Alpaca Paper Trading environment before any live capital deployment.
   API base URLs must be managed via environment variables to allow clean promotion from paper
   to live without source code changes. No hardcoded live trading URLs are permitted.
+
+
+════════════════════════════════════════════════════════════
+ SECTION IV — LIVE CAPITAL AI GUARDRAILS (Strict Mode)
+════════════════════════════════════════════════════════════
+
+[RULE-015] No AI-Controlled Order Sizing or Execution
+  Under no circumstances shall an LLM or generative AI model (Anthropic, OpenAI, or any
+  future provider) directly determine trade size, order side, limit price, or execution
+  routing. The AI layer's role is strictly limited to:
+    • Text summarisation of SEC filings and macro news headlines.
+    • Sentiment ranking and qualitative risk commentary.
+    • Audit trail alerts delivered via Telegram.
+  All quantitative execution boundaries — including but not limited to position sizing,
+  price verification, momentum filters, and stop-loss placement — MUST be evaluated
+  exclusively by compile-time, deterministic C++ mathematical algorithms inside the
+  execution engine. An LLM output must never be used as a direct numeric input to an
+  order payload without first passing through a validated, deterministic parsing and
+  bounds-checking layer.
+
+[RULE-016] AI Output Schema Verification & Fallbacks
+  Any response returned by an external generative model that feeds into system state
+  (e.g., the Claude 8-K risk analysis in process_automated_filing()) must be parsed
+  against a strict, pre-defined schema before its values influence any downstream logic.
+    • The model MUST be prompted to respond in a structured format. The current required
+      format for SEC filing analysis is:
+        RISK_FACTOR: [0.1–1.0] | SUMMARY: [one sentence]
+      Future integrations must define and document their own schema in this Rules file
+      before any code is written.
+    • The parsing logic must catch all validation failures: truncated output, missing
+      keys, out-of-range values, and non-numeric RISK_FACTOR strings.
+    • If the parser fails to decode the AI output for any reason, the system MUST
+      default to the most conservative safe state (e.g., RISK_FACTOR = 1.0 / High Risk)
+      rather than crashing, logging silently, or using a partially parsed string.
+    • A failed parse must be logged as [WARN] and reported to the Telegram channel so
+      the operator is aware the AI response was unusable.
+
+[RULE-017] External API Isolation & Rate-Limit Resiliency
+  Failure of any AI-associated or notification service must never block or degrade the
+  primary trading loops (the Analyst evaluation cycle or the Execution engine webhook).
+    • All AI operations (Anthropic calls in heartbeat/monitor.py) must execute inside
+      isolated, non-blocking daemon threads or microservices that are fully decoupled
+      from the execution engine's request path.
+    • Every thread or coroutine that interacts with an LLM API must enforce a dedicated
+      timeout cap of 15 seconds — independent of the exchange API timeout defined in
+      RULE-008 — to prevent a hung Anthropic call from stalling a Telegram notification
+      loop or a scheduled task.
+    • HTTP 429 (rate limit) responses from any AI provider must be caught explicitly,
+      logged as [WARN], and handled with a linear back-off (e.g., 5 s → 10 s → 15 s)
+      before the thread retries. They must never propagate as unhandled exceptions that
+      terminate the calling thread (see also RULE-007 and the schedule_checker guard
+      added in Patch C).
+    • The Execution engine (C++) must have zero import or runtime dependency on any
+      AI library. The boundary is enforced at the container level.
+
+[RULE-018] Dynamic Sizing Hard Gate
+  The Execution engine must enforce a two-condition physical gate on every calculated
+  share quantity before an order payload is constructed or transmitted to Alpaca:
+
+    Condition 1 — Zero-share block:
+      If the Kelly calculator returns a share quantity of 0 (dollar allocation is smaller
+      than the price of one share), the order MUST be aborted and logged as [CRITICAL].
+      The engine is strictly prohibited from promoting a zero-share result to a minimum
+      1-share purchase if that single share's value exceeds the 10 % maximum risk
+      allowance for the current account equity.
+
+    Condition 2 — Notional value ceiling:
+      Before routing any order, the engine MUST verify:
+        (Qty × CurrentPrice) ≤ (LiveAccountEquity × 0.10)
+      If this condition is violated for any reason (e.g., a price spike between the
+      sizing calculation and the order submission), the order must be instantly blocked
+      and a [CRITICAL] alert fired to Telegram.
+
+  Both conditions are non-negotiable and apply to all asset classes. No override flag,
+  environment variable, or runtime parameter may disable either condition in production.

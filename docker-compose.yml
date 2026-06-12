@@ -4,6 +4,8 @@ services:
       context: ./analyst
     container_name: openclaw_analyst
     restart: unless-stopped
+    depends_on:
+      - execution-engine
     environment:
       - TZ=America/New_York
       - ALPACA_API_KEY=${ALPACA_API_KEY}
@@ -23,16 +25,15 @@ services:
       - ALPACA_API_KEY=${ALPACA_API_KEY}
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
+      - ALPACA_BASE_URL=${ALPACA_BASE_URL}
+      - KELLY_WIN_RATE=${KELLY_WIN_RATE}
+      - KELLY_WIN_LOSS_RATIO=${KELLY_WIN_LOSS_RATIO}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+    ports:
+      - "8080:8080"
     networks:
       - default
-      - traefik
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.openclaw-prod.rule=Host(`api.vanhellsing.tech`) && PathPrefix(`/webhook`)"
-      - "traefik.http.routers.openclaw-prod.entrypoints=websecure"
-      - "traefik.http.routers.openclaw-prod.tls=true"
-      - "traefik.http.routers.openclaw-prod.tls.certresolver=myresolver"
-      - "traefik.http.services.openclaw-prod.loadbalancer.server.port=8080"
 
   heartbeat-monitor:
     build:
@@ -53,5 +54,5 @@ services:
 networks:
   default:
     name: openclaw_net
-  traefik:
-    external: true
+
+

@@ -14,6 +14,12 @@ RUN pip install --no-cache-dir \
     beautifulsoup4==4.12.3 \
     lxml==5.3.0
 
+# Create the data directory that DB_PATH ('/app/data/memory_bank.db') depends on.
+# Without this sqlite3.connect() raises OperationalError at runtime.
+# Declared as a VOLUME so the DB survives container restarts when mounted.
+RUN mkdir -p /app/data
+VOLUME ["/app/data"]
+
 COPY monitor.py .
 
 CMD ["python", "-u", "monitor.py"]

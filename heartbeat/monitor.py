@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import telebot
 import requests
@@ -19,7 +20,7 @@ from bs4 import BeautifulSoup
 def require_env(name: str) -> str:
     """Return the value of an env var or exit immediately with [FATAL]."""
     val = os.getenv(name)
-    if not val:
+    if val is None:
         print(f"[FATAL] [HEARTBEAT] Required env var '{name}' is not set. Refusing to start.",
               flush=True)
         sys.exit(1)
@@ -39,39 +40,50 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 DB_PATH = '/app/data/memory_bank.db'
 WATCHLIST = ["AAPL", "TSLA", "NVDA", "MSFT"]
 
+# RULE-016 / Patch C: Global re-entrant lock for all SQLite write operations.
+# Three threads (main bot loop, schedule_checker, poll_sec_edgar) share the same
+# database file. Without a lock, concurrent writes raise:
+#   sqlite3.OperationalError: database is locked
+# Using a threading.Lock() ensures only one thread holds a write transaction at
+# a time; reads are fast enough that the contention overhead is negligible.
+db_lock = threading.Lock()
+
 # --- 1.5 THE MEMORY BANK ---
 def init_db():
-    """Creates the database and tables if they don't exist"""
+    """Creates the database and tables if they don't exist."""
+    # Patch C: Wrap the entire DDL block in db_lock so that no background
+    # thread can begin a write before the schema is fully initialised.
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS daily_audits (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    tickers_scanned TEXT,
-                    claude_analysis TEXT
-                )
-            ''')
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS processed_filings (
-                    filing_id TEXT PRIMARY KEY,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS trade_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ticker TEXT,
-                    action TEXT,
-                    price REAL,
-                    rsi_value REAL,
-                    sizing_kelly_ratio REAL,
-                    pnl REAL
-                )
-            ''')
-            conn.commit()
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute('''
+                    CREATE TABLE IF NOT EXISTS daily_audits (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        tickers_scanned TEXT,
+                        claude_analysis TEXT
+                    )
+                ''')
+                c.execute('''
+                    CREATE TABLE IF NOT EXISTS processed_filings (
+                        filing_id TEXT PRIMARY KEY,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                c.execute('''
+                    CREATE TABLE IF NOT EXISTS trade_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        ticker TEXT,
+                        action TEXT,
+                        price REAL,
+                        rsi_value REAL,
+                        sizing_kelly_ratio REAL,
+                        pnl REAL
+                    )
+                ''')
+                conn.commit()
     except Exception as e:
         print(f"Database initialization error: {e}")
 
@@ -120,8 +132,10 @@ def get_sec_8k(ticker):
         if not entries: return f"No recent 8-Ks for {ticker}."
         
         latest = entries[0]
-        title = latest.find('atom:title', ns).text
-        summary = latest.find('atom:summary', ns).text
+        title_el   = latest.find('atom:title', ns)
+        summary_el = latest.find('atom:summary', ns)
+        title   = title_el.text   if title_el   is not None else "No title"
+        summary = summary_el.text if summary_el is not None else "No summary"
         return f"RAW SEC 8-K ({ticker}): {title} - {summary}"
     except Exception as e:
         return f"SEC Pull Failed for {ticker}"
@@ -134,7 +148,11 @@ def run_scout_protocol():
             'https://data.alpaca.markets/v1beta1/news?symbols=NVDA,XOM,BTCUSD&limit=5',
             headers=headers, timeout=HTTP_TIMEOUT
         ).json()
-        news_context = "\n".join([f"- {n['headline']}" for n in news_req.get('news', [])])
+        news_context = "\n".join([
+            f"- {n['headline']}"
+            for n in news_req.get('news', [])
+            if isinstance(n, dict) and 'headline' in n
+        ])
         
         sec_context = "\n".join([get_sec_8k(ticker) for ticker in ["NVDA", "XOM"]])
         
@@ -154,12 +172,13 @@ def run_scout_protocol():
         analysis_text = response.content[0].text
         bot.send_message(CHAT_ID, f"🦅 *Nox Daily Audit Report*\n\n{analysis_text}", parse_mode='Markdown')
         
-        # Log to DB safely inside the successful try block
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("INSERT INTO daily_audits (tickers_scanned, claude_analysis) VALUES (?, ?)", 
-                      ("NVDA, XOM, BTCUSD", analysis_text))
-            conn.commit()
+        # Patch C: db_lock guards this write against concurrent SEC radar writes.
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute("INSERT INTO daily_audits (tickers_scanned, claude_analysis) VALUES (?, ?)",
+                          ("NVDA, XOM, BTCUSD", analysis_text))
+                conn.commit()
     except Exception as e:
         print(f"Scout Error: {e}")
 
@@ -215,7 +234,7 @@ def schedule_checker():
         print(
             f"[INFO] [HEARTBEAT] Daily Scout (re)scheduled: "
             f"11:30 ET = {utc_hhmm} UTC "
-            f"({'EDT UTC-4' if target_et.utcoffset().seconds == 72000 else 'EST UTC-5'}).",
+            f"({'EDT UTC-4' if target_et.utcoffset().total_seconds() == -14400 else 'EST UTC-5'}).",
             flush=True,
         )
 
@@ -227,7 +246,14 @@ def schedule_checker():
     schedule.every().day.at("00:01").do(_reschedule_scout)
 
     while True:
-        schedule.run_pending()
+        # Patch C: Catch any exception thrown by run_scout_protocol() (e.g.,
+        # Anthropic timeout, Alpaca 429, Telegram API block) so that a single
+        # failed invocation does NOT terminate the scheduler thread and
+        # permanently silence all future scheduled tasks.
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            print(f"⚠️ [SCHEDULER ERROR] Thread exception caught: {e}", flush=True)
         time.sleep(30)   # 30-second tick — tight enough not to miss the window
 
 # --- 4. CONVERSATIONAL AGENT HANDLERS ---
@@ -251,13 +277,23 @@ def send_status(message):
 
 @bot.message_handler(func=lambda message: True)
 def chat_with_nox(message):
+    # Patch A: The three variable assignments below were previously placed INSIDE
+    # the claude.messages.create() parameter list, causing a Python SyntaxError
+    # on startup (statements are not valid as keyword arguments). They are now
+    # correctly declared as local variables BEFORE the API call.
     try:
         bot.send_chat_action(message.chat.id, 'typing')
+
+        portfolio_keywords = ("portfolio", "position", "balance", "stock",
+                              "holding", "trade", "alpaca", "p&l", "pnl")
+        include_portfolio = any(kw in message.text.lower() for kw in portfolio_keywords)
+        portfolio_data = get_alpaca_portfolio() if include_portfolio else "(portfolio data not requested)"
+
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=250,
             system="You are Nox. Be witty, concise, and focused on algorithmic trading.",
-            messages=[{"role": "user", "content": message.text + "\n\nData: " + get_alpaca_portfolio()}]
+            messages=[{"role": "user", "content": f"{message.text}\n\nData: {portfolio_data}"}]
         )
 
         response_text = response.content[0].text
@@ -269,16 +305,21 @@ def chat_with_nox(message):
 
 # --- 5. REAL-TIME SEC POLING PIPELINE ---
 def is_filing_processed(filing_id):
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("SELECT 1 FROM processed_filings WHERE filing_id = ?", (filing_id,))
-        return c.fetchone() is not None
+    # Read-only query; no lock needed for SELECT on SQLite WAL mode, but we
+    # acquire db_lock for consistency and to guard against non-WAL deployments.
+    with db_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM processed_filings WHERE filing_id = ?", (filing_id,))
+            return c.fetchone() is not None
 
 def mark_filing_processed(filing_id):
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO processed_filings (filing_id) VALUES (?)", (filing_id,))
-        conn.commit()
+    # Patch C: db_lock guards this INSERT against concurrent daily_audits writes.
+    with db_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("INSERT OR IGNORE INTO processed_filings (filing_id) VALUES (?)", (filing_id,))
+            conn.commit()
 
 def poll_sec_edgar():
     print("[INFO] [HEARTBEAT] Nox Automated SEC Radar engaged...", flush=True)
@@ -292,16 +333,45 @@ def poll_sec_edgar():
                 root = ET.fromstring(response.content)
                 ns = {'atom': 'http://www.w3.org/2005/Atom'}
                 for entry in root.findall('atom:entry', ns):
-                    title = entry.find('atom:title', ns).text
-                    link = entry.find('atom:link', ns).attrib['href']
-                    filing_id = entry.find('atom:id', ns).text
+                    title_el     = entry.find('atom:title', ns)
+                    link_el      = entry.find('atom:link', ns)
+                    filing_id_el = entry.find('atom:id', ns)
+
+                    if title_el is None or link_el is None or filing_id_el is None:
+                        print("[WARN] [HEARTBEAT] Skipping malformed SEC feed entry.", flush=True)
+                        continue
+
+                    title     = title_el.text
+                    link      = link_el.attrib.get('href', '')
+                    filing_id = filing_id_el.text
+
+                    if not filing_id or not link:
+                        print("[WARN] [HEARTBEAT] Skipping entry with missing id or link.", flush=True)
+                        continue
 
                     if is_filing_processed(filing_id):
                         continue
 
                     for ticker in WATCHLIST:
-                        if f"({ticker})" in title or ticker in title.upper():
-                            print(f"🚨 [SEC RADAR] New 8-K found for {ticker}!")
+                        # Patch C / Issue 5: Replace naive substring check with a
+                        # regex word-boundary match to prevent false positives.
+                        #
+                        # Old logic:  ticker in title.upper()
+                        # Problem:    Short tickers like "A", "T", or "C" match any
+                        #             word containing that letter. "TSLA" matches
+                        #             "ATSLAVIC". Single-letter tickers match
+                        #             almost every filing title.
+                        #
+                        # Fix:        \b word boundaries ensure we only match
+                        #             the ticker as a discrete token (e.g. "TSLA"
+                        #             surrounded by spaces, punctuation, or the
+                        #             parenthetical form "(TSLA)").
+                        pattern = re.compile(
+                            rf"\b{re.escape(ticker)}\b", re.IGNORECASE
+                        )
+                        if pattern.search(title):
+                            print(f"🚨 [SEC RADAR] Verified 8-K found for {ticker}!",
+                                  flush=True)
                             process_automated_filing(ticker, link)
                             mark_filing_processed(filing_id)
         except Exception as e:
@@ -322,7 +392,9 @@ def process_automated_filing(ticker, filing_url):
         clean_text = soup.get_text(separator="\n")
         lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
         cleaned_document = "\n".join(lines)
-        dense_payload = cleaned_document[:40000] 
+        if len(cleaned_document) > 40000:
+            print(f"[WARN] [HEARTBEAT] Filing for {ticker} truncated from {len(cleaned_document)} to 40,000 chars.", flush=True)
+        dense_payload = cleaned_document[:40000]
 
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",

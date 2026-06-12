@@ -66,6 +66,9 @@ struct TradeSignal {
     long long vol = 0;
     double atr = 0.0;
     int risk_tier = 1;
+    double vix         = 20.0;  // Default neutral — cautious but not blocking
+    double spy_price   = 0.0;
+    double spy_200_sma = 0.0;
 };
 
 // --- 3. KELLY CALCULATOR ---
@@ -99,7 +102,23 @@ int calculate_kelly_size(double equity, double current_price,
     double dollar_amount = equity * adjusted_risk;
     int shares = static_cast<int>(std::floor(dollar_amount / current_price));
 
-    return (shares > 0) ? shares : 1;
+    // Patch B — RULE-005 / RULE-018: If the Kelly dollar allocation is smaller
+    // than the price of one share (shares == 0), the old code silently promoted
+    // the result to 1 share. On a small account (e.g. $1 000) trading a high-
+    // priced stock (e.g. $350), that forced purchase would represent 35 %+ of
+    // total equity, completely bypassing the 10 % hard cap enforced above.
+    //
+    // Correct behaviour: return -1 ("no valid sizing") so the caller aborts the
+    // trade — identical to the negative-Kelly path — and logs a CRITICAL alert.
+    if (shares <= 0) {
+        Logger::log("CRITICAL",
+            "[KELLY] Calculated share allocation is 0. "
+            "Forcing 1-share purchase would violate the 10 % portfolio risk cap. "
+            "Aborting trade.");
+        return -1;
+    }
+
+    return shares;
 }
 
 // --- 4. THE ENGINE ---
@@ -111,6 +130,7 @@ private:
     std::string alpacaBaseUrl;
     double      kellyWinRate;
     double      kellyWinLossRatio;
+    RegimeStateMachine regimeMachine;
 
     // RULE-005: Fetch live equity with exponential-backoff retry (2s -> 4s -> 8s).
     // Returns -1.0 on total failure — callers MUST NOT proceed with any fallback.
@@ -199,6 +219,24 @@ private:
             return;
         }
 
+        // ── Regime Gate ──────────────────────────────────────────────────────────
+        AllocationStrategy regime = regimeMachine.evaluate(
+            sig.vix, sig.spy_price, sig.spy_200_sma
+        );
+        Logger::log("INFO", "[REGIME] " + regime.log_message);
+        TelegramNotifier::sendMessage("📊 *Regime Check:* " + regime.log_message);
+        if (regime.capital_multiplier == 0.0) {
+            Logger::log("WARN", "[REGIME] RISK-OFF — new entries halted for " + sig.ticker);
+            TelegramNotifier::sendMessage(
+                "🛑 *REGIME BLOCK: RISK-OFF*\n"
+                "────────────────────────\n"
+                "• *Ticker:* " + sig.ticker + "\n"
+                "⛔ VIX ≥ 30 or SPY below 200 SMA. No new entries."
+            );
+            return;
+        }
+        // ─────────────────────────────────────────────────────────────────────────
+
         // RULE-005: Fetch live equity — abort if unavailable (no silent fallback).
         double live_equity = fetch_account_equity();
         if (live_equity < 0.0) {
@@ -208,7 +246,9 @@ private:
         }
 
         // RULE-005: Size position via Kelly — abort if no mathematical edge.
-        int qty = calculate_kelly_size(live_equity, sig.price, kellyWinRate, kellyWinLossRatio);
+        // Scale equity by regime multiplier before sizing (1.0 = full, 0.5 = half).
+        double regime_adjusted_equity = live_equity * regime.capital_multiplier;
+        int qty = calculate_kelly_size(regime_adjusted_equity, sig.price, kellyWinRate, kellyWinLossRatio);
         if (qty < 0) {
             Logger::log("CRITICAL", "[EXECUTION] Aborting order for " + sig.ticker +
                         " — Kelly sizing returned no-edge signal.");
@@ -383,6 +423,18 @@ public:
                             signal.atr = std::stod(data["atr"].get<std::string>());
                         }
                     }
+                    if (data.contains("vix")) {
+                        if (data["vix"].is_number()) signal.vix = data["vix"].get<double>();
+                        else if (data["vix"].is_string()) signal.vix = std::stod(data["vix"].get<std::string>());
+                    }
+                    if (data.contains("spy_price")) {
+                        if (data["spy_price"].is_number()) signal.spy_price = data["spy_price"].get<double>();
+                        else if (data["spy_price"].is_string()) signal.spy_price = std::stod(data["spy_price"].get<std::string>());
+                    }
+                    if (data.contains("spy_200_sma")) {
+                        if (data["spy_200_sma"].is_number()) signal.spy_200_sma = data["spy_200_sma"].get<double>();
+                        else if (data["spy_200_sma"].is_string()) signal.spy_200_sma = std::stod(data["spy_200_sma"].get<std::string>());
+                    }
                     if (data.contains("risk_tier")) {
                         if (data["risk_tier"].is_number_integer()) {
                             signal.risk_tier = data["risk_tier"].get<int>();
@@ -392,6 +444,18 @@ public:
                     }
 
                     Logger::log("INFO", "Signal Parsed successfully: " + signal.action + " " + signal.ticker);
+
+                    // Fast path for analyst audit reports: acknowledge immediately
+                    // so the caller does not time out waiting on downstream network
+                    // work (Telegram delivery, Alpaca checks, etc.).
+                    if (signal.action == "REPORT") {
+                        if (data.contains("report_body")) {
+                            Logger::log("INFO", "[EXECUTION] Analyst report: " + data.value("report_body", ""));
+                        }
+                        success_count++;
+                        return;
+                    }
+
                     TelegramNotifier::sendMessage("🚀 Signal Parsed: " + signal.action + " " + signal.ticker);
                     
                     process(signal);
