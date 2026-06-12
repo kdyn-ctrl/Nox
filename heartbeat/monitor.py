@@ -164,13 +164,17 @@ def run_scout_protocol():
         
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=350,
+            max_tokens=1024,
             system=system_prompt,
             messages=[{"role": "user", "content": f"Media Headlines:\n{news_context}\n\nSEC Filings:\n{sec_context}"}]
         )
 
         analysis_text = response.content[0].text
-        bot.send_message(CHAT_ID, f"🦅 *Nox Daily Audit Report*\n\n{analysis_text}", parse_mode='Markdown')
+        # Chunk the report so Telegram's 4096-char limit never cuts it off.
+        # smart_split splits on word boundaries, preserving readability.
+        full_msg = f"🦅 *Nox Daily Audit Report*\n\n{analysis_text}"
+        for chunk in smart_split(full_msg, chars_per_string=4096):
+            bot.send_message(CHAT_ID, chunk, parse_mode='Markdown')
         
         # Patch C: db_lock guards this write against concurrent SEC radar writes.
         with db_lock:
@@ -183,7 +187,7 @@ def run_scout_protocol():
         print(f"Scout Error: {e}")
 
 def schedule_checker():
-    # RULE-006: Daily Scout MUST fire at 11:30 AM Eastern Time (ET), not UTC.
+    # RULE-006: Daily Scout MUST fire at 10:00 AM Eastern Time (ET), not UTC.
     #
     # Why this approach:
     #   • `schedule` library has no native timezone awareness — `.at("HH:MM")`
@@ -225,15 +229,15 @@ def schedule_checker():
         schedule.clear("scout")
 
         now_et     = datetime.now(tz=ET)
-        # Build a timezone-aware 11:30 ET for today, then express it in UTC.
-        target_et  = now_et.replace(hour=11, minute=30, second=0, microsecond=0)
+        # Build a timezone-aware 10:00 AM ET for today, then express it in UTC.
+        target_et  = now_et.replace(hour=10, minute=0, second=0, microsecond=0)
         target_utc = target_et.astimezone(UTC)
         utc_hhmm   = target_utc.strftime("%H:%M")
 
         schedule.every().day.at(utc_hhmm).do(_guarded_scout).tag("scout")
         print(
             f"[INFO] [HEARTBEAT] Daily Scout (re)scheduled: "
-            f"11:30 ET = {utc_hhmm} UTC "
+            f"10:00 ET = {utc_hhmm} UTC "
             f"({'EDT UTC-4' if target_et.utcoffset().total_seconds() == -14400 else 'EST UTC-5'}).",
             flush=True,
         )
@@ -275,6 +279,59 @@ def send_status(message):
     except Exception as e:
         bot.reply_to(message, f"⚠️ Failed to retrieve status: {str(e)}")
 
+@bot.message_handler(commands=['history'])
+def send_history(message):
+    """
+    /history [n] — Returns the last N daily audit reports from the Memory Bank.
+    Defaults to 5 if no argument is supplied. Capped at 20 to prevent flooding.
+    Each report is sent as its own message so Telegram never has to chunk a wall
+    of text and the user can scroll through them individually.
+    """
+    try:
+        # Parse optional count argument from the command, e.g. "/history 10"
+        parts = message.text.strip().split()
+        try:
+            requested = int(parts[1]) if len(parts) > 1 else 5
+            count = max(1, min(requested, 20))  # clamp: 1 ≤ count ≤ 20
+        except (ValueError, IndexError):
+            count = 5
+
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute(
+                    "SELECT timestamp, tickers_scanned, claude_analysis "
+                    "FROM daily_audits ORDER BY timestamp DESC LIMIT ?",
+                    (count,)
+                )
+                rows = c.fetchall()
+
+        if not rows:
+            bot.reply_to(message, "📭 No audit reports found in the Memory Bank yet.")
+            return
+
+        # Confirm how many we're sending before the flood begins
+        bot.reply_to(
+            message,
+            f"📚 *Nox Memory Bank — Last {len(rows)} Audit Report(s)*",
+            parse_mode='Markdown'
+        )
+
+        # Send each report as its own chunked message (oldest → newest after reverse)
+        for timestamp, tickers, analysis in reversed(rows):
+            report_msg = (
+                f"🗓 *{timestamp}*\n"
+                f"📌 Tickers: `{tickers}`\n\n"
+                f"{analysis}"
+            )
+            for chunk in smart_split(report_msg, chars_per_string=4096):
+                bot.send_message(message.chat.id, chunk, parse_mode='Markdown')
+
+    except Exception as e:
+        print(f"[ERROR] [HEARTBEAT] /history command failed: {e}", flush=True)
+        bot.reply_to(message, f"⚠️ Failed to retrieve history: {str(e)}")
+
+
 @bot.message_handler(func=lambda message: True)
 def chat_with_nox(message):
     # Patch A: The three variable assignments below were previously placed INSIDE
@@ -291,7 +348,7 @@ def chat_with_nox(message):
 
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=250,
+            max_tokens=1024,
             system="You are Nox. Be witty, concise, and focused on algorithmic trading.",
             messages=[{"role": "user", "content": f"{message.text}\n\nData: {portfolio_data}"}]
         )
@@ -398,12 +455,15 @@ def process_automated_filing(ticker, filing_url):
 
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=150,
+            max_tokens=256,
             system="You are the Risk Analyst Node of OpenClaw. Analyze this SEC 8-K. Reply strictly format: RISK_FACTOR: [0.1 to 1.0] | SUMMARY: [One sentence].",
             messages=[{"role": "user", "content": f"Ticker: {ticker}\n\nFiling Text:\n{dense_payload}"}]
         )
         analysis = response.content[0].text
-        bot.send_message(CHAT_ID, f"🦅 *SEC Radar Alert: {ticker}*\n\n`{analysis}`", parse_mode='Markdown')
+        # Chunk the alert so Telegram's 4096-char limit never cuts it off.
+        full_msg = f"🦅 *SEC Radar Alert: {ticker}*\n\n`{analysis}`"
+        for chunk in smart_split(full_msg, chars_per_string=4096):
+            bot.send_message(CHAT_ID, chunk, parse_mode='Markdown')
     except Exception as e:
         print(f"Failed to process automated filing: {e}")
 

@@ -61,44 +61,49 @@ double fetch_vix() {
     }
 }
 
-// Fetches SPY current price and 200-day SMA from the Alpaca Data API.
-// Returns an invalid SpyData struct on any failure.
-SpyData fetch_spy_data(const std::string& api_key, const std::string& api_secret) {
+// Fetches SPY current price and 200-day SMA from Yahoo Finance.
+// Uses the same API already proven for VIX — no credentials required.
+// Alpaca's free-tier data API returns null bars for paper accounts, so
+// Yahoo Finance is the reliable zero-cost alternative.
+SpyData fetch_spy_data() {
     try {
-        httplib::Client cli("https://data.alpaca.markets");
+        httplib::Client cli("https://query1.finance.yahoo.com");
         cli.set_connection_timeout(std::chrono::seconds(10));
         cli.set_read_timeout(std::chrono::seconds(15));
-        cli.set_default_headers({
-            {"APCA-API-KEY-ID",     api_key},
-            {"APCA-API-SECRET-KEY", api_secret}
-        });
 
-        auto res = cli.Get("/v2/stocks/SPY/bars?timeframe=1Day&limit=200&sort=desc");
+        // range=1y gives ~252 daily bars — well above the 200 needed for SMA.
+        // Yahoo returns bars in ascending order; last element is most recent.
+        auto res = cli.Get("/v8/finance/chart/SPY?interval=1d&range=1y");
         if (!res || res->status != 200) {
-            std::cerr << "❌ [ANALYST] SPY bar fetch failed. Status: "
+            std::cerr << "❌ [ANALYST] SPY fetch failed. Status: "
                       << (res ? std::to_string(res->status) : "No Response") << std::endl;
             return {};
         }
 
         auto body = json::parse(res->body);
-        const auto& bars = body.at("bars");
+        const auto& closes = body.at("chart").at("result").at(0)
+                                  .at("indicators").at("quote").at(0)
+                                  .at("close");
 
-        if (bars.empty()) {
-            std::cerr << "❌ [ANALYST] SPY bars response was empty." << std::endl;
+        // Collect all non-null close values
+        std::vector<double> valid_closes;
+        valid_closes.reserve(closes.size());
+        for (const auto& c : closes) {
+            if (!c.is_null()) {
+                valid_closes.push_back(c.get<double>());
+            }
+        }
+
+        if (valid_closes.empty()) {
+            std::cerr << "❌ [ANALYST] SPY response contained no valid close values." << std::endl;
             return {};
         }
 
-        // bars[0] is the most recent bar (sort=desc)
-        double current_price = bars[0].at("c").get<double>();
+        // Last entry is the most recent close (Yahoo returns ascending order)
+        double current_price = valid_closes.back();
 
-        // Average all available closes for the SMA
-        std::vector<double> closes;
-        closes.reserve(bars.size());
-        for (const auto& bar : bars) {
-            closes.push_back(bar.at("c").get<double>());
-        }
-        double sma200 = std::accumulate(closes.begin(), closes.end(), 0.0) /
-                        static_cast<double>(closes.size());
+        double sma200 = std::accumulate(valid_closes.begin(), valid_closes.end(), 0.0) /
+                        static_cast<double>(valid_closes.size());
 
         return {current_price, sma200, true};
 
@@ -109,9 +114,10 @@ SpyData fetch_spy_data(const std::string& api_key, const std::string& api_secret
 }
 
 // Orchestrates both data fetches and returns a single combined MarketSnapshot.
-MarketSnapshot fetch_market_snapshot(const std::string& api_key, const std::string& api_secret) {
-    double vix     = fetch_vix();
-    SpyData spy    = fetch_spy_data(api_key, api_secret);
+// Both sources are Yahoo Finance — no Alpaca data API subscription required.
+MarketSnapshot fetch_market_snapshot() {
+    double vix  = fetch_vix();
+    SpyData spy = fetch_spy_data();
 
     if (vix < 0.0 || !spy.valid) {
         std::cerr << "❌ [ANALYST] Market snapshot incomplete — VIX: " << vix
@@ -179,8 +185,8 @@ int main() {
     std::cout << "[INFO] [ANALYST] Cycle interval set to " << cycle_hours << " hour(s)." << std::endl;
 
     while (true) {
-        // 1. Fetch live market data (VIX from Yahoo Finance, SPY from Alpaca)
-        MarketSnapshot snapshot = fetch_market_snapshot(alpaca_api_key, alpaca_api_secret);
+        // 1. Fetch live market data (VIX + SPY both from Yahoo Finance)
+        MarketSnapshot snapshot = fetch_market_snapshot();
 
         if (!snapshot.valid) {
             std::cerr << "⚠️  [ANALYST] Failed to obtain a valid market snapshot. Skipping cycle." << std::endl;

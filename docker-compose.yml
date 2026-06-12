@@ -11,10 +11,11 @@ services:
       - ALPACA_API_KEY=${ALPACA_API_KEY}
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
+      - ANALYST_CYCLE_HOURS=${ANALYST_CYCLE_HOURS:-6}
     volumes:
       - ./logs:/app/logs
     networks:
-      - default
+      - openclaw_net
 
   execution-engine:
     build:
@@ -33,7 +34,7 @@ services:
     ports:
       - "8080:8080"
     networks:
-      - default
+      - openclaw_net
 
   heartbeat-monitor:
     build:
@@ -49,10 +50,10 @@ services:
     volumes:
       - ./data:/app/data
     networks:
-      - default
+      - openclaw_net
 
 networks:
-  default:
-    name: openclaw_net
+  openclaw_net:
+    external: true
 
 
