@@ -13,6 +13,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from telebot.util import smart_split
 from bs4 import BeautifulSoup
+import akshare as ak
 
 # --- 1. CONFIGURATION ---
 # RULE-009: Validate all required credentials at startup.
@@ -140,6 +141,96 @@ def get_sec_8k(ticker):
     except Exception as e:
         return f"SEC Pull Failed for {ticker}"
 
+# --- 2.5 CHINESE MARKET INTELLIGENCE (AkShare) ---
+def get_chinese_market_context() -> str:
+    """
+    Pulls three layers of Chinese market intelligence via AkShare:
+      1. East Money (东方财富) hot stock board — the most-watched tickers
+         in Chinese retail markets right now, with price change and volume.
+      2. China Manufacturing PMI — the single most-watched macro indicator
+         for Chinese industrial health, published monthly by the NBS.
+      3. PBOC Loan Prime Rate (LPR) — China's benchmark lending rate,
+         the direct equivalent of the Fed Funds Rate for Chinese monetary
+         policy signaling.
+
+    Each source is wrapped in its own try/except so a failure in one
+    does not silence the others. Returns a formatted string ready to be
+    injected into the Claude prompt alongside the English context.
+    """
+    sections = []
+
+    # --- East Money Hot Board (东方财富人气榜) ---
+    # Returns the top retail-attention stocks on the Chinese market.
+    # High retail attention in China often leads institutional flows by
+    # 1-2 sessions — useful as a leading sentiment indicator.
+    try:
+        df = ak.stock_hot_rank_em()
+        # Columns: 排名, 代码, 股票名称, 最新价, 涨跌幅, 换手率
+        top = df.head(5)
+        lines = []
+        for _, row in top.iterrows():
+            name   = row.get('股票名称', 'N/A')
+            code   = row.get('代码', 'N/A')
+            price  = row.get('最新价', 'N/A')
+            change = row.get('涨跌幅', 'N/A')
+            lines.append(f"  {name} ({code}) — ¥{price} | 涨跌幅: {change}%")
+        sections.append(
+            "🇨🇳 East Money Hot Board (东方财富人气榜) — Top 5 Most-Watched A-Shares:\n"
+            + "\n".join(lines)
+        )
+        print("[INFO] [AKSHARE] East Money hot board fetched.", flush=True)
+    except Exception as e:
+        print(f"[WARN] [AKSHARE] East Money hot board failed: {e}", flush=True)
+        sections.append("🇨🇳 East Money Hot Board: unavailable.")
+
+    # --- China Manufacturing PMI (制造业PMI) ---
+    # Published monthly by the National Bureau of Statistics (NBS).
+    # PMI > 50 = expansion, < 50 = contraction.
+    # The most reliable leading indicator for Chinese industrial output
+    # and a direct input to global supply chain models.
+    try:
+        df = ak.macro_china_pmi_yearly()
+        # Columns: 月份, 制造业-指数, 制造业-同比增长, 非制造业-指数, 非制造业-同比增长
+        latest = df.iloc[-1]
+        month          = latest.get('月份', 'N/A')
+        mfg_pmi        = latest.get('制造业-指数', 'N/A')
+        non_mfg_pmi    = latest.get('非制造业-指数', 'N/A')
+        sections.append(
+            f"🏭 China PMI (NBS 国家统计局) — {month}:\n"
+            f"  Manufacturing (制造业): {mfg_pmi} "
+            f"({'EXPANSION ▲' if str(mfg_pmi) > '50' else 'CONTRACTION ▼'})\n"
+            f"  Non-Manufacturing (非制造业): {non_mfg_pmi}"
+        )
+        print("[INFO] [AKSHARE] China PMI fetched.", flush=True)
+    except Exception as e:
+        print(f"[WARN] [AKSHARE] China PMI fetch failed: {e}", flush=True)
+        sections.append("🏭 China PMI: unavailable.")
+
+    # --- PBOC Loan Prime Rate (贷款市场报价利率 LPR) ---
+    # China's benchmark lending rate set by the PBOC.
+    # Rate cuts = stimulus signal; holds or hikes = tightening.
+    # A divergence between PBOC and Fed policy is a direct USD/CNY
+    # pressure signal and affects cross-listed stocks (H-shares, ADRs).
+    try:
+        df = ak.macro_china_lpr()
+        # Columns: RATE_DATE, 1Y LPR, 5Y LPR
+        latest = df.iloc[-1]
+        rate_date = latest.iloc[0]
+        lpr_1y    = latest.iloc[1]
+        lpr_5y    = latest.iloc[2]
+        sections.append(
+            f"🏦 PBOC Loan Prime Rate (LPR 贷款市场报价利率) — {rate_date}:\n"
+            f"  1-Year LPR: {lpr_1y}%\n"
+            f"  5-Year LPR: {lpr_5y}%"
+        )
+        print("[INFO] [AKSHARE] PBOC LPR fetched.", flush=True)
+    except Exception as e:
+        print(f"[WARN] [AKSHARE] PBOC LPR fetch failed: {e}", flush=True)
+        sections.append("🏦 PBOC LPR: unavailable.")
+
+    return "\n\n".join(sections)
+
+
 # --- 3. THE SCOUT PROTOCOL (DAILY REPORT) ---
 def run_scout_protocol():
     try:
@@ -156,17 +247,32 @@ def run_scout_protocol():
         
         sec_context = "\n".join([get_sec_8k(ticker) for ticker in ["NVDA", "XOM"]])
         
+        # Pull Chinese market intelligence as a third context layer.
+        # Runs in the same thread as the scout — failure is non-fatal
+        # because get_chinese_market_context() handles its own exceptions
+        # internally and always returns a formatted string.
+        chinese_context = get_chinese_market_context()
+
         system_prompt = (
-            "You are Nox, a ruthlessly skeptical quantitative trading assistant. "
-            "Filter this market news and raw SEC 8-K data to find medium-term, structural shifts. "
-            "Output a concise, highly actionable, and highly cynical market report."
+            "You are Nox, a ruthlessly skeptical quantitative trading assistant "
+            "with deep expertise in both US and Chinese financial markets. "
+            "You will receive three data layers: US market headlines, SEC filings, "
+            "and Chinese market intelligence (A-share sentiment, PMI, PBOC policy). "
+            "Your job is to find cross-market structural shifts — moments where "
+            "Chinese macro data confirms, contradicts, or leads the US narrative. "
+            "Output a concise, highly actionable, bilingual-aware market report. "
+            "Flag any US/China divergence signals explicitly."
         )
         
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1024,
             system=system_prompt,
-            messages=[{"role": "user", "content": f"Media Headlines:\n{news_context}\n\nSEC Filings:\n{sec_context}"}]
+            messages=[{"role": "user", "content": (
+                f"🇺🇸 US Media Headlines:\n{news_context}\n\n"
+                f"📋 SEC Filings:\n{sec_context}\n\n"
+                f"🇨🇳 Chinese Market Intelligence:\n{chinese_context}"
+            )}]
         )
 
         analysis_text = response.content[0].text
@@ -435,10 +541,70 @@ def poll_sec_edgar():
             print(f"⚠️ SEC Radar Error: {e}")
         time.sleep(30)
 
+def resolve_primary_document(index_url: str, headers: dict) -> str | None:
+    """
+    SEC EDGAR filing index pages list documents but contain no 8-K text.
+    This function fetches the index page, finds the primary 8-K document
+    (the first .htm file typed '8-K' in the filing table), and returns
+    its absolute URL so the caller can fetch the actual filing content.
+
+    EDGAR index tables have a predictable structure:
+      <table class="tableFile"> with columns: Seq, Description, Document, Type, Size
+    We look for a row whose Type column is exactly '8-K' and return that
+    document's href. Falls back to the first .htm file if no typed match.
+    """
+    try:
+        idx_res = requests.get(index_url, headers=headers, timeout=HTTP_TIMEOUT)
+        if idx_res.status_code != 200:
+            print(f"[WARN] [HEARTBEAT] Index page returned {idx_res.status_code}: {index_url}", flush=True)
+            return None
+
+        soup = BeautifulSoup(idx_res.text, "html.parser")
+        base_url = "https://www.sec.gov"
+
+        # Primary pass: find the row explicitly typed '8-K'
+        for table in soup.find_all("table", {"class": "tableFile"}):
+            for row in table.find_all("tr"):
+                cells = row.find_all("td")
+                if len(cells) < 4:
+                    continue
+                doc_type = cells[3].get_text(strip=True)
+                if doc_type == "8-K":
+                    link_tag = cells[2].find("a", href=True)
+                    if link_tag:
+                        href = link_tag["href"]
+                        return href if href.startswith("http") else base_url + href
+
+        # Fallback: first .htm anchor in any tableFile row (excludes exhibits)
+        for table in soup.find_all("table", {"class": "tableFile"}):
+            for row in table.find_all("tr"):
+                cells = row.find_all("td")
+                if len(cells) < 3:
+                    continue
+                link_tag = cells[2].find("a", href=True)
+                if link_tag and link_tag["href"].endswith(".htm"):
+                    href = link_tag["href"]
+                    return href if href.startswith("http") else base_url + href
+
+        print("[WARN] [HEARTBEAT] Could not locate primary document in index page.", flush=True)
+        return None
+    except Exception as e:
+        print(f"[WARN] [HEARTBEAT] resolve_primary_document failed: {e}", flush=True)
+        return None
+
+
 def process_automated_filing(ticker, filing_url):
     headers = {"User-Agent": "OpenClawSwarm/1.0 openclaw@vanhellsing.tech"}
     try:
-        doc_res = requests.get(filing_url, headers=headers, timeout=HTTP_TIMEOUT)
+        # filing_url from the EDGAR atom feed points to the INDEX page, not the
+        # 8-K document itself. Resolve the actual primary document first.
+        primary_url = resolve_primary_document(filing_url, headers)
+        if not primary_url:
+            print(f"[WARN] [HEARTBEAT] Could not resolve primary document for {ticker}, skipping.", flush=True)
+            return
+
+        print(f"[INFO] [HEARTBEAT] Fetching primary 8-K document for {ticker}: {primary_url}", flush=True)
+        doc_res = requests.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
         if doc_res.status_code != 200:
             return
 

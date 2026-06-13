@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir \
     anthropic==0.40.0 \
     schedule==1.2.2 \
     beautifulsoup4==4.12.3 \
-    lxml==5.3.0
+    lxml==5.3.0 \
+    akshare==1.18.64
 
 # Create the data directory that DB_PATH ('/app/data/memory_bank.db') depends on.
 # Without this sqlite3.connect() raises OperationalError at runtime.
