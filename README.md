@@ -1,6 +1,6 @@
-# OpenClaw — Autonomous Quantitative Trading System
+# Nox — Autonomous Quantitative Trading System
 
-OpenClaw is a containerized, multi-agent quantitative trading framework built for automated macro regime classification, risk-managed position sizing, and low-latency order execution. The system is written in C++ and Python, deployed across three isolated Docker containers that communicate exclusively over a private internal network.
+Nox is a containerized, multi-agent quantitative trading framework built for automated macro regime classification, risk-managed position sizing, and low-latency order execution. The system is written in C++ and Python, deployed across three isolated Docker containers that communicate exclusively over a private internal network.
 
 Designed and maintained by a self-directed quantitative developer targeting systematic, rules-based exposure to US equity and crypto markets.
 
@@ -22,7 +22,7 @@ Designed and maintained by a self-directed quantitative developer targeting syst
 
 ## System Overview
 
-OpenClaw separates concerns across three autonomous agents. No single container has full system authority — the analyst cannot execute trades, the execution engine cannot generate signals, and the heartbeat monitor cannot touch orders. Each agent has one job and fails loudly if it cannot do it.
+Nox separates concerns across three autonomous agents. No single container has full system authority — the analyst cannot execute trades, the execution engine cannot generate signals, and the heartbeat monitor cannot touch orders. Each agent has one job and fails loudly if it cannot do it.
 
 | Container | Language | Role |
 |---|---|---|
