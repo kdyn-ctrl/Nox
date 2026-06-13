@@ -39,7 +39,16 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
 DB_PATH = '/app/data/memory_bank.db'
-WATCHLIST = ["AAPL", "TSLA", "NVDA", "MSFT"]
+
+# Watchlist segmentation.
+# DOMESTIC_WATCHLIST: US companies — file Form 8-K for material event disclosures.
+# CHINESE_ADRS:       Foreign Private Issuers listed in the US — file Form 6-K instead.
+#                     Polling the 8-K feed for these tickers would silently miss all
+#                     their disclosures. The get_filing_type() helper resolves which
+#                     feed and which document type to use for each ticker.
+DOMESTIC_WATCHLIST = ["AAPL", "TSLA", "NVDA", "MSFT"]
+CHINESE_ADRS       = ["BABA", "JD", "PDD", "BIDU", "NIO"]
+WATCHLIST          = DOMESTIC_WATCHLIST + CHINESE_ADRS
 
 # RULE-016 / Patch C: Global re-entrant lock for all SQLite write operations.
 # Three threads (main bot loop, schedule_checker, poll_sec_edgar) share the same
@@ -122,24 +131,74 @@ def get_alpaca_portfolio():
     except Exception as e:
         return f"Failed to pull Alpaca data due to exception: {str(e)}"
 
-def get_sec_8k(ticker):
-    url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type=8-K&output=atom"
+def get_filing_type(ticker: str) -> str:
+    """
+    Returns the correct SEC form type for a given ticker.
+    Chinese ADRs are Foreign Private Issuers and file Form 6-K.
+    All US domestic companies file Form 8-K.
+    """
+    return "6-K" if ticker in CHINESE_ADRS else "8-K"
+
+
+def get_latest_sec_filing(ticker: str) -> str:
+    """
+    Fetches the actual text of the latest 8-K or 6-K filing for a ticker.
+
+    Two-step process:
+      1. Pull the company's Atom feed for the correct form type (8-K or 6-K).
+      2. Resolve the index page from the latest entry to find and fetch
+         the primary HTML document — the actual filing text, not metadata.
+
+    Token budget: truncated to 8,000 chars for the daily scout. The
+    real-time pipeline (process_automated_filing) uses 40,000 chars
+    because it sends a dedicated alert and can afford the larger context.
+    """
+    filing_type = get_filing_type(ticker)
+    url = (
+        f"https://www.sec.gov/cgi-bin/browse-edgar"
+        f"?action=getcompany&CIK={ticker}&type={filing_type}&output=atom"
+    )
     headers = {'User-Agent': 'Nox/1.0 openclaw@vanhellsing.tech'}
     try:
         resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            return f"SEC feed returned {resp.status_code} for {ticker}."
+
         root = ET.fromstring(resp.content)
         ns = {'atom': 'http://www.w3.org/2005/Atom'}
         entries = root.findall('atom:entry', ns)
-        if not entries: return f"No recent 8-Ks for {ticker}."
-        
-        latest = entries[0]
-        title_el   = latest.find('atom:title', ns)
-        summary_el = latest.find('atom:summary', ns)
-        title   = title_el.text   if title_el   is not None else "No title"
-        summary = summary_el.text if summary_el is not None else "No summary"
-        return f"RAW SEC 8-K ({ticker}): {title} - {summary}"
+        if not entries:
+            return f"No recent {filing_type} filings found for {ticker}."
+
+        link_el = entries[0].find('atom:link', ns)
+        if link_el is None:
+            return f"No filing index link found in feed for {ticker}."
+
+        index_url = link_el.attrib.get('href', '')
+        if not index_url:
+            return f"Empty filing index link for {ticker}."
+
+        primary_url = resolve_primary_document(index_url, headers, filing_type)
+        if not primary_url:
+            return f"Could not resolve primary {filing_type} document for {ticker}."
+
+        doc_res = requests.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
+        if doc_res.status_code != 200:
+            return f"Primary document fetch returned {doc_res.status_code} for {ticker}."
+
+        soup = BeautifulSoup(doc_res.text, "html.parser")
+        for element in soup(["script", "style"]):
+            element.extract()
+
+        lines = [line.strip() for line in soup.get_text(separator="\n").splitlines() if line.strip()]
+        # 8,000 char budget for scout context — enough for Claude to identify
+        # the item numbers and key disclosures without burning excess tokens.
+        cleaned = "\n".join(lines)[:8000]
+        print(f"[INFO] [HEARTBEAT] Resolved {filing_type} text for {ticker} ({len(cleaned)} chars).", flush=True)
+        return f"SEC {filing_type} ({ticker}):\n{cleaned}"
     except Exception as e:
-        return f"SEC Pull Failed for {ticker}"
+        print(f"[WARN] [HEARTBEAT] get_latest_sec_filing failed for {ticker}: {e}", flush=True)
+        return f"SEC pull failed for {ticker}: {str(e)}"
 
 # --- 2.5 CHINESE MARKET INTELLIGENCE (AkShare) ---
 def get_chinese_market_context() -> str:
@@ -245,7 +304,9 @@ def run_scout_protocol():
             if isinstance(n, dict) and 'headline' in n
         ])
         
-        sec_context = "\n".join([get_sec_8k(ticker) for ticker in ["NVDA", "XOM"]])
+        # One domestic (NVDA, 8-K) and one Chinese ADR (BABA, 6-K) — gives Claude
+        # cross-market filing context without doubling token cost.
+        sec_context = "\n\n".join([get_latest_sec_filing(t) for t in ["NVDA", "BABA"]])
         
         # Pull Chinese market intelligence as a third context layer.
         # Runs in the same thread as the scout — failure is non-fatal
@@ -287,7 +348,7 @@ def run_scout_protocol():
             with sqlite3.connect(DB_PATH) as conn:
                 c = conn.cursor()
                 c.execute("INSERT INTO daily_audits (tickers_scanned, claude_analysis) VALUES (?, ?)",
-                          ("NVDA, XOM, BTCUSD", analysis_text))
+                          ("NVDA, BABA, BTCUSD", analysis_text))
                 conn.commit()
     except Exception as e:
         print(f"Scout Error: {e}")
@@ -486,13 +547,25 @@ def mark_filing_processed(filing_id):
 
 def poll_sec_edgar():
     print("[INFO] [HEARTBEAT] Nox Automated SEC Radar engaged...", flush=True)
-    sec_url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"
+    # Poll both the global 8-K feed (US domestic companies) and the global 6-K
+    # feed (Foreign Private Issuers — all Chinese ADRs file here).
+    # Running a single 8-K feed would silently miss every BABA/JD/PDD/BIDU/NIO
+    # material disclosure. The two feeds are polled sequentially each cycle;
+    # total wall time is roughly 2× a single request, well within the 30s tick.
+    SEC_FEEDS = [
+        ("8-K", "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"),
+        ("6-K", "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=6-K&output=atom"),
+    ]
     headers = {"User-Agent": "Nox/1.0 openclaw@vanhellsing.tech"}
 
     while True:
-        try:
-            response = requests.get(sec_url, headers=headers, timeout=HTTP_TIMEOUT)
-            if response.status_code == 200:
+        for feed_type, sec_url in SEC_FEEDS:
+            try:
+                response = requests.get(sec_url, headers=headers, timeout=HTTP_TIMEOUT)
+                if response.status_code != 200:
+                    print(f"[WARN] [HEARTBEAT] SEC {feed_type} feed returned {response.status_code}.", flush=True)
+                    continue
+
                 root = ET.fromstring(response.content)
                 ns = {'atom': 'http://www.w3.org/2005/Atom'}
                 for entry in root.findall('atom:entry', ns):
@@ -516,32 +589,32 @@ def poll_sec_edgar():
                         continue
 
                     for ticker in WATCHLIST:
-                        # Patch C / Issue 5: Replace naive substring check with a
-                        # regex word-boundary match to prevent false positives.
-                        #
-                        # Old logic:  ticker in title.upper()
-                        # Problem:    Short tickers like "A", "T", or "C" match any
-                        #             word containing that letter. "TSLA" matches
-                        #             "ATSLAVIC". Single-letter tickers match
-                        #             almost every filing title.
-                        #
-                        # Fix:        \b word boundaries ensure we only match
-                        #             the ticker as a discrete token (e.g. "TSLA"
-                        #             surrounded by spaces, punctuation, or the
-                        #             parenthetical form "(TSLA)").
+                        # Only act if the feed type matches what this ticker
+                        # should be filing. This prevents a 6-K hit on a
+                        # company with a similar name from alerting on a
+                        # domestic ticker, and vice versa.
+                        if get_filing_type(ticker) != feed_type:
+                            continue
+
+                        # Word-boundary regex prevents false positives from
+                        # short tickers ("JD" matching "adjusted", etc.).
                         pattern = re.compile(
                             rf"\b{re.escape(ticker)}\b", re.IGNORECASE
                         )
                         if pattern.search(title):
-                            print(f"🚨 [SEC RADAR] Verified 8-K found for {ticker}!",
-                                  flush=True)
-                            process_automated_filing(ticker, link)
+                            print(
+                                f"🚨 [SEC RADAR] Verified {feed_type} found for {ticker}!",
+                                flush=True
+                            )
+                            process_automated_filing(ticker, link, feed_type)
                             mark_filing_processed(filing_id)
-        except Exception as e:
-            print(f"⚠️ SEC Radar Error: {e}")
+
+            except Exception as e:
+                print(f"⚠️ SEC Radar Error ({feed_type} feed): {e}", flush=True)
+
         time.sleep(30)
 
-def resolve_primary_document(index_url: str, headers: dict) -> str | None:
+def resolve_primary_document(index_url: str, headers: dict, filing_type: str = "8-K") -> str | None:
     """
     SEC EDGAR filing index pages list documents but contain no 8-K text.
     This function fetches the index page, finds the primary 8-K document
@@ -562,20 +635,25 @@ def resolve_primary_document(index_url: str, headers: dict) -> str | None:
         soup = BeautifulSoup(idx_res.text, "html.parser")
         base_url = "https://www.sec.gov"
 
-        # Primary pass: find the row explicitly typed '8-K'
+        # Primary pass: find the row whose Type column exactly matches the
+        # expected form type ("8-K" for domestic, "6-K" for ADRs/FPIs).
+        # Hardcoding "8-K" here would silently return the wrong document
+        # for any Chinese ADR filing.
         for table in soup.find_all("table", {"class": "tableFile"}):
             for row in table.find_all("tr"):
                 cells = row.find_all("td")
                 if len(cells) < 4:
                     continue
                 doc_type = cells[3].get_text(strip=True)
-                if doc_type == "8-K":
+                if doc_type == filing_type:
                     link_tag = cells[2].find("a", href=True)
                     if link_tag:
                         href = link_tag["href"]
                         return href if href.startswith("http") else base_url + href
 
-        # Fallback: first .htm anchor in any tableFile row (excludes exhibits)
+        # Fallback: first .htm anchor in any tableFile row.
+        # Covers edge cases where the Type cell is blank or uses a variant
+        # like "6-K/A" (amended 6-K) that won't match an exact string check.
         for table in soup.find_all("table", {"class": "tableFile"}):
             for row in table.find_all("tr"):
                 cells = row.find_all("td")
@@ -593,17 +671,18 @@ def resolve_primary_document(index_url: str, headers: dict) -> str | None:
         return None
 
 
-def process_automated_filing(ticker, filing_url):
+def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8-K") -> None:
     headers = {"User-Agent": "Nox/1.0 openclaw@vanhellsing.tech"}
     try:
         # filing_url from the EDGAR atom feed points to the INDEX page, not the
-        # 8-K document itself. Resolve the actual primary document first.
-        primary_url = resolve_primary_document(filing_url, headers)
+        # document itself. Pass filing_type so resolve_primary_document looks
+        # for the correct form type in the index table (8-K or 6-K).
+        primary_url = resolve_primary_document(filing_url, headers, filing_type)
         if not primary_url:
             print(f"[WARN] [HEARTBEAT] Could not resolve primary document for {ticker}, skipping.", flush=True)
             return
 
-        print(f"[INFO] [HEARTBEAT] Fetching primary 8-K document for {ticker}: {primary_url}", flush=True)
+        print(f"[INFO] [HEARTBEAT] Fetching primary {filing_type} document for {ticker}: {primary_url}", flush=True)
         doc_res = requests.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
         if doc_res.status_code != 200:
             return
@@ -622,12 +701,17 @@ def process_automated_filing(ticker, filing_url):
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=256,
-            system="You are the Risk Analyst Node of Nox. Analyze this SEC 8-K. Reply strictly format: RISK_FACTOR: [0.1 to 1.0] | SUMMARY: [One sentence].",
+            system=(
+                f"You are the Risk Analyst Node of Nox. "
+                f"Analyze this SEC {filing_type} filing. "
+                f"Reply strictly in this format: "
+                f"RISK_FACTOR: [0.1 to 1.0] | SUMMARY: [One sentence]."
+            ),
             messages=[{"role": "user", "content": f"Ticker: {ticker}\n\nFiling Text:\n{dense_payload}"}]
         )
         analysis = response.content[0].text
         # Chunk the alert so Telegram's 4096-char limit never cuts it off.
-        full_msg = f"🦅 *SEC Radar Alert: {ticker}*\n\n`{analysis}`"
+        full_msg = f"🦅 *SEC Radar Alert — {filing_type}: {ticker}*\n\n`{analysis}`"
         for chunk in smart_split(full_msg, chars_per_string=4096):
             bot.send_message(CHAT_ID, chunk, parse_mode='Markdown')
     except Exception as e:
