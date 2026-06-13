@@ -533,17 +533,22 @@ def send_status(message):
                 filing_count = c.fetchone()[0]
 
         # --- 3. Assemble Dashboard ---
+        # Use a plain helper to escape all MarkdownV2 reserved characters.
+        # MarkdownV2 requires escaping: _ * [ ] ( ) ~ ` > # + - = | { } . !
+        def esc(text: str) -> str:
+            reserved = r'_*[]()~`>#+-=|{}.!'
+            return re.sub(f'([{re.escape(reserved)}])', r'\\\1', str(text))
+
         status_msg = (
             f"🦅 *Nox System Health Status*\n"
-            f"────────────────────────\n"
-            f"🧠 *Analyst Heartbeat:* Active (Last cycle: {last_audit_age})\n"
-            f"⚡ *Execution Engine:* {exec_status} (Ping: {exec_ping}ms)\n"
-            f"🇨🇳 *China Data Engine:* {data_status} (Cache updated: {data_cache_age})\n"
-            f"📚 *Memory Bank:* {audit_count} Audits | {filing_count} Processed Filings\n"
-            # The Analyst Brain container is responsible for Regime State, this is a placeholder
-            f"📊 *Current Market Regime:* `RISK_ON`"
+            f"\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\n"
+            f"🧠 *Analyst Heartbeat:* Active \(Last cycle: {esc(last_audit_age)}\)\n"
+            f"⚡ *Execution Engine:* {esc(exec_status)} \(Ping: {esc(exec_ping)}ms\)\n"
+            f"🇨🇳 *China Data Engine:* {esc(data_status)} \(Cache updated: {esc(data_cache_age)}\)\n"
+            f"📚 *Memory Bank:* {esc(audit_count)} Audits \| {esc(filing_count)} Processed Filings\n"
+            f"📊 *Current Market Regime:* `RISK\_ON`"
         )
-        bot.reply_to(message, status_msg, parse_mode='Markdown')
+        bot.reply_to(message, status_msg, parse_mode='MarkdownV2')
 
     except Exception as e:
         bot.reply_to(message, f"⚠️ Failed to retrieve status: {str(e)}")
