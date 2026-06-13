@@ -25,7 +25,7 @@ COPY main.cpp RegimeStateMachine.hpp ./
 
 # Issue #6 fix: compile with full C++17 + optimisation + required link flags.
 # -std=c++17 is required for structured bindings and chrono literals used in httplib.
-RUN g++ -std=c++17 -O3 main.cpp -o openclaw_engine -lssl -lcrypto -lpthread
+RUN g++ -std=c++17 -O3 main.cpp -o nox_engine -lssl -lcrypto -lpthread
 
 # ── Stage 2: Runtime ───────────────────────────────────────────────────────────────────────────────
 # Minimal runtime image — only the binary and its shared library dependencies.
@@ -41,14 +41,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd --no-create-home --shell /bin/false appuser
 
 WORKDIR /app
-COPY --from=builder /app/openclaw_engine .
-RUN chown appuser:appuser openclaw_engine
+COPY --from=builder /app/nox_engine .
+RUN chown appuser:appuser nox_engine
 
 USER appuser
 
 # Detect a hung/dead engine process.
 HEALTHCHECK --interval=60s --timeout=5s --start-period=10s --retries=3 \
-    CMD pgrep -x openclaw_engine > /dev/null || exit 1
+    CMD pgrep -x nox_engine > /dev/null || exit 1
 
 EXPOSE 8080
-CMD ["./openclaw_engine"]
+CMD ["./nox_engine"]

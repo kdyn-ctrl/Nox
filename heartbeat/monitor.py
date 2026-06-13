@@ -124,7 +124,7 @@ def get_alpaca_portfolio():
 
 def get_sec_8k(ticker):
     url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&type=8-K&output=atom"
-    headers = {'User-Agent': 'OpenClaw Swarm openclaw@vanhellsing.tech'}
+    headers = {'User-Agent': 'Nox/1.0 openclaw@vanhellsing.tech'}
     try:
         resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
         root = ET.fromstring(resp.content)
@@ -487,7 +487,7 @@ def mark_filing_processed(filing_id):
 def poll_sec_edgar():
     print("[INFO] [HEARTBEAT] Nox Automated SEC Radar engaged...", flush=True)
     sec_url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"
-    headers = {"User-Agent": "OpenClawSwarm/1.0 openclaw@vanhellsing.tech"}
+    headers = {"User-Agent": "Nox/1.0 openclaw@vanhellsing.tech"}
 
     while True:
         try:
@@ -594,7 +594,7 @@ def resolve_primary_document(index_url: str, headers: dict) -> str | None:
 
 
 def process_automated_filing(ticker, filing_url):
-    headers = {"User-Agent": "OpenClawSwarm/1.0 openclaw@vanhellsing.tech"}
+    headers = {"User-Agent": "Nox/1.0 openclaw@vanhellsing.tech"}
     try:
         # filing_url from the EDGAR atom feed points to the INDEX page, not the
         # 8-K document itself. Resolve the actual primary document first.
@@ -622,7 +622,7 @@ def process_automated_filing(ticker, filing_url):
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=256,
-            system="You are the Risk Analyst Node of OpenClaw. Analyze this SEC 8-K. Reply strictly format: RISK_FACTOR: [0.1 to 1.0] | SUMMARY: [One sentence].",
+            system="You are the Risk Analyst Node of Nox. Analyze this SEC 8-K. Reply strictly format: RISK_FACTOR: [0.1 to 1.0] | SUMMARY: [One sentence].",
             messages=[{"role": "user", "content": f"Ticker: {ticker}\n\nFiling Text:\n{dense_payload}"}]
         )
         analysis = response.content[0].text

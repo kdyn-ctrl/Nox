@@ -141,7 +141,7 @@ static std::string regime_to_string(Regime r) {
 
 int main() {
     RegimeStateMachine regime_monitor;
-    std::cout << "OpenClaw Analyst Agent: ONLINE." << std::endl;
+    std::cout << "Nox Analyst Agent: ONLINE." << std::endl;
 
     // RULE-009 — Hard-abort on any missing credential or config variable.
     const char* env_token = std::getenv("WEBHOOK_SECRET_TOKEN");

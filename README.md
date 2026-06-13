@@ -286,9 +286,9 @@ docker compose up -d --build analyst-brain
 
 **View live logs:**
 ```bash
-docker logs openclaw_heartbeat -f
-docker logs openclaw_execution -f
-docker logs openclaw_analyst -f
+docker logs nox_heartbeat -f
+docker logs nox_execution -f
+docker logs nox_analyst -f
 ```
 
 **Query the memory bank directly:**

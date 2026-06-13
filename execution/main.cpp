@@ -122,7 +122,7 @@ int calculate_kelly_size(double equity, double current_price,
 }
 
 // --- 4. THE ENGINE ---
-class OpenClawEngine {
+class NoxEngine {
 private:
     std::string secret;
     std::string apiKey;
@@ -330,7 +330,7 @@ private:
     }
 
 public:
-    OpenClawEngine() {
+    NoxEngine() {
         // RULE-009 / RULE-014: All credentials and config values come exclusively
         // from env vars. Any missing value is a hard-abort — no silent defaults.
         auto require_env = [](const char* name) -> std::string {
@@ -498,13 +498,13 @@ public:
             res.set_content("Processed " + std::to_string(success_count) + " signal(s)", "text/plain");
         }); // This perfectly closes the svr.Post router lambda
 
-        Logger::log("INFO", "OpenClaw Execution Engine listening on 0.0.0.0:8080...");
+        Logger::log("INFO", "Nox Execution Engine listening on 0.0.0.0:8080...");
         svr.listen("0.0.0.0", 8080);
     } // This closes void run()
 }; // This closes class OpenClawEngine
 
 int main() {
-    OpenClawEngine engine;
+    NoxEngine engine;
     engine.run();
     return 0;
 }

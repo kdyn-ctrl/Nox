@@ -1,4 +1,4 @@
-# OpenClaw Trading System — Architectural Rules & Design Contract
+# Nox Trading System — Architectural Rules & Design Contract
 # Version 1.0 | Author: Van Hellsing
 # Scope: Governs all current containers (analyst, execution, heartbeat) and all future modules.
 # This document is the single source of truth for system behavior, boundaries, and expansion standards.
@@ -46,7 +46,7 @@
 [RULE-003] Payload Serialization & Internal Routing
   After each evaluation, the analyst SHALL serialize the full regime result into a validated
   JSON payload and transmit it via HTTP POST to the execution engine at:
-  http://execution_engine:8080/webhook over the shared openclaw_net Docker bridge network.
+  http://execution_engine:8080/webhook over the shared nox_net Docker bridge network.
   The payload must include: secret_key, ticker, action, price, risk_tier, vol, regime_state,
   atr, kelly_pct, and report_body. No field may be omitted. Future payload fields for new
   asset classes (options Greeks, futures basis, etc.) must be added as optional extension
@@ -159,7 +159,7 @@
 
 [RULE-012] New Container & Service Standards
   Any new service added to docker-compose.yml must:
-    • Belong to the openclaw_net internal network for inter-service communication.
+    • Belong to the nox_net internal network for inter-service communication.
     • Define a restart: unless-stopped policy.
     • Inject all credentials exclusively through the environment block using .env references.
     • Include a clearly scoped responsibility comment in docker-compose.yml.

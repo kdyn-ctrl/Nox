@@ -8,7 +8,7 @@ bot = telebot.TeleBot(TOKEN)
 @bot.message_handler(commands=['start', 'status'])
 def send_status(message):
     # You can eventually make this query your C++ engine's API
-    bot.reply_to(message, "🔋 *OpenClaw System Status:* ONLINE\nAgents: 6/6 Active\nRegime: Risk-On")
+    bot.reply_to(message, "🔋 *Nox System Status:* ONLINE\nAgents: 6/6 Active\nRegime: Risk-On")
 
 @bot.message_handler(commands=['balance'])
 def send_balance(message):

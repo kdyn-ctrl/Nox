@@ -2,7 +2,7 @@ services:
   analyst-brain:
     build:
       context: ./analyst
-    container_name: openclaw_analyst
+    container_name: nox_analyst
     restart: unless-stopped
     depends_on:
       - execution-engine
@@ -15,12 +15,12 @@ services:
     volumes:
       - ./logs:/app/logs
     networks:
-      - openclaw_net
+      - nox_net
 
   execution-engine:
     build:
       context: ./execution
-    container_name: openclaw_execution
+    container_name: nox_execution
     restart: unless-stopped
     environment:
       - ALPACA_API_KEY=${ALPACA_API_KEY}
@@ -34,12 +34,12 @@ services:
     ports:
       - "8080:8080"
     networks:
-      - openclaw_net
+      - nox_net
 
   heartbeat-monitor:
     build:
       context: ./heartbeat
-    container_name: openclaw_heartbeat
+    container_name: nox_heartbeat
     restart: unless-stopped
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
@@ -50,10 +50,10 @@ services:
     volumes:
       - ./data:/app/data
     networks:
-      - openclaw_net
+      - nox_net
 
 networks:
-  openclaw_net:
+  nox_net:
     external: true
 
 
