@@ -158,7 +158,7 @@ def health_check() -> Dict[str, Any]:
     return {
         "status":      "healthy",
         "cache_ready": _CACHE["last_updated"] is not None,
-        "last_updated": _CACHE["last_updated"],
+        "last_updated_utc": _CACHE["last_updated"],
     }
 
 
