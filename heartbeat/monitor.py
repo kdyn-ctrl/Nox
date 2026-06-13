@@ -13,7 +13,6 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from telebot.util import smart_split
 from bs4 import BeautifulSoup
-import akshare as ak
 
 # --- 1. CONFIGURATION ---
 # RULE-009: Validate all required credentials at startup.
@@ -32,6 +31,7 @@ CHAT_ID        = require_env('TELEGRAM_CHAT_ID')
 ANTHROPIC_KEY  = require_env('ANTHROPIC_API_KEY')
 ALPACA_API     = require_env('ALPACA_API_KEY')
 ALPACA_SEC     = require_env('ALPACA_SECRET_KEY')
+WEBHOOK_SECRET = require_env('WEBHOOK_SECRET_TOKEN')
 
 print("[INFO] [HEARTBEAT] All required environment variables validated.", flush=True)
 
@@ -200,92 +200,128 @@ def get_latest_sec_filing(ticker: str) -> str:
         print(f"[WARN] [HEARTBEAT] get_latest_sec_filing failed for {ticker}: {e}", flush=True)
         return f"SEC pull failed for {ticker}: {str(e)}"
 
-# --- 2.5 CHINESE MARKET INTELLIGENCE (AkShare) ---
+# --- 2.5 CHINESE MARKET INTELLIGENCE (data-engine) ---
+
+def query_data_engine(endpoint: str) -> dict:
+    """
+    Sends an authenticated GET request to the internal data-engine microservice.
+
+    The data-engine runs AkShare scrapers on a 15-minute APScheduler cycle and
+    caches results in memory, so this call always returns instantly — no live
+    scrape is triggered. If the data-engine is unreachable (e.g., still starting
+    up) we return an empty dict; the caller must handle that gracefully.
+
+    Authentication follows the same shared-secret pattern used by the analyst →
+    execution webhook (RULE-004): the X-Nox-Token header carries WEBHOOK_SECRET.
+    RULE-008 timeouts are enforced via HTTP_TIMEOUT.
+    """
+    url = f"http://data-engine:8000{endpoint}"
+    headers = {"X-Nox-Token": WEBHOOK_SECRET}
+    try:
+        res = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        if res.status_code == 200:
+            return res.json()
+        print(
+            f"[WARN] [HEARTBEAT] data-engine returned HTTP {res.status_code} "
+            f"for {endpoint}.",
+            flush=True,
+        )
+    except Exception as e:
+        print(
+            f"[WARN] [HEARTBEAT] Could not reach data-engine at {endpoint}: {e}",
+            flush=True,
+        )
+    return {}
+
+
 def get_chinese_market_context() -> str:
     """
-    Pulls three layers of Chinese market intelligence via AkShare:
-      1. East Money (东方财富) hot stock board — the most-watched tickers
-         in Chinese retail markets right now, with price change and volume.
-      2. China Manufacturing PMI — the single most-watched macro indicator
-         for Chinese industrial health, published monthly by the NBS.
-      3. PBOC Loan Prime Rate (LPR) — China's benchmark lending rate,
-         the direct equivalent of the Fed Funds Rate for Chinese monetary
-         policy signaling.
+    Assembles three layers of Chinese market intelligence by querying the
+    dedicated data-engine microservice over the internal nox_net Docker network.
 
-    Each source is wrapped in its own try/except so a failure in one
-    does not silence the others. Returns a formatted string ready to be
-    injected into the Claude prompt alongside the English context.
+    Previously this function called AkShare directly inside the heartbeat
+    container. That design had two problems:
+      1. A slow or hanging AkShare call could block the Telegram bot thread.
+      2. akshare + pandas added ~400 MB to the heartbeat image for logic that
+         belongs in a data layer, not a notification layer.
+
+    Now the heartbeat simply reads from the data-engine cache (<5 ms per call)
+    and formats the response into a Claude-ready string. All scraping complexity
+    lives in data_engine/scrapers.py where it belongs.
+
+    Each endpoint is queried independently so a failure on one source (e.g.,
+    the sentiment endpoint) does not suppress PMI or LPR data.
     """
     sections = []
 
     # --- East Money Hot Board (东方财富人气榜) ---
-    # Returns the top retail-attention stocks on the Chinese market.
-    # High retail attention in China often leads institutional flows by
-    # 1-2 sessions — useful as a leading sentiment indicator.
-    try:
-        df = ak.stock_hot_rank_em()
-        # Columns: 排名, 代码, 股票名称, 最新价, 涨跌幅, 换手率
-        top = df.head(5)
-        lines = []
-        for _, row in top.iterrows():
-            name   = row.get('股票名称', 'N/A')
-            code   = row.get('代码', 'N/A')
-            price  = row.get('最新价', 'N/A')
-            change = row.get('涨跌幅', 'N/A')
-            lines.append(f"  {name} ({code}) — ¥{price} | 涨跌幅: {change}%")
+    sentiment_payload = query_data_engine("/sentiment/china")
+    hot_board = sentiment_payload.get("hot_board", [])
+    if hot_board:
+        lines = [
+            f"  {s['name']} ({s['ticker']}) — "
+            f"¥{s['price']} | 涨跌幅: {s['change_pct']}%"
+            for s in hot_board[:5]
+        ]
         sections.append(
             "🇨🇳 East Money Hot Board (东方财富人气榜) — Top 5 Most-Watched A-Shares:\n"
             + "\n".join(lines)
         )
-        print("[INFO] [AKSHARE] East Money hot board fetched.", flush=True)
-    except Exception as e:
-        print(f"[WARN] [AKSHARE] East Money hot board failed: {e}", flush=True)
+        print("[INFO] [HEARTBEAT] East Money hot board received from data-engine.", flush=True)
+    else:
         sections.append("🇨🇳 East Money Hot Board: unavailable.")
 
     # --- China Manufacturing PMI (制造业PMI) ---
-    # Published monthly by the National Bureau of Statistics (NBS).
-    # PMI > 50 = expansion, < 50 = contraction.
-    # The most reliable leading indicator for Chinese industrial output
-    # and a direct input to global supply chain models.
-    try:
-        df = ak.macro_china_pmi_yearly()
-        # Columns: 月份, 制造业-指数, 制造业-同比增长, 非制造业-指数, 非制造业-同比增长
-        latest = df.iloc[-1]
-        month          = latest.get('月份', 'N/A')
-        mfg_pmi        = latest.get('制造业-指数', 'N/A')
-        non_mfg_pmi    = latest.get('非制造业-指数', 'N/A')
+    macro_payload = query_data_engine("/macro/china")
+    pmi = macro_payload.get("pmi", {})
+    if pmi:
+        mfg     = pmi.get('manufacturing', 'N/A')
+        non_mfg = pmi.get('non_manufacturing', 'N/A')
+        month   = pmi.get('month', 'N/A')
+        try:
+            expansion = float(mfg) > 50.0
+        except (TypeError, ValueError):
+            expansion = False
         sections.append(
             f"🏭 China PMI (NBS 国家统计局) — {month}:\n"
-            f"  Manufacturing (制造业): {mfg_pmi} "
-            f"({'EXPANSION ▲' if str(mfg_pmi) > '50' else 'CONTRACTION ▼'})\n"
-            f"  Non-Manufacturing (非制造业): {non_mfg_pmi}"
+            f"  Manufacturing (制造业): {mfg} "
+            f"({'EXPANSION ▲' if expansion else 'CONTRACTION ▼'})\n"
+            f"  Non-Manufacturing (非制造业): {non_mfg}"
         )
-        print("[INFO] [AKSHARE] China PMI fetched.", flush=True)
-    except Exception as e:
-        print(f"[WARN] [AKSHARE] China PMI fetch failed: {e}", flush=True)
+        print("[INFO] [HEARTBEAT] China PMI received from data-engine.", flush=True)
+    else:
         sections.append("🏭 China PMI: unavailable.")
 
     # --- PBOC Loan Prime Rate (贷款市场报价利率 LPR) ---
-    # China's benchmark lending rate set by the PBOC.
-    # Rate cuts = stimulus signal; holds or hikes = tightening.
-    # A divergence between PBOC and Fed policy is a direct USD/CNY
-    # pressure signal and affects cross-listed stocks (H-shares, ADRs).
-    try:
-        df = ak.macro_china_lpr()
-        # Columns: RATE_DATE, 1Y LPR, 5Y LPR
-        latest = df.iloc[-1]
-        rate_date = latest.iloc[0]
-        lpr_1y    = latest.iloc[1]
-        lpr_5y    = latest.iloc[2]
+    lpr = macro_payload.get("lpr", {})
+    if lpr:
         sections.append(
-            f"🏦 PBOC Loan Prime Rate (LPR 贷款市场报价利率) — {rate_date}:\n"
-            f"  1-Year LPR: {lpr_1y}%\n"
-            f"  5-Year LPR: {lpr_5y}%"
+            f"🏦 PBOC Loan Prime Rate (LPR 贷款市场报价利率) — {lpr.get('date', 'N/A')}:\n"
+            f"  1-Year LPR: {lpr.get('lpr_1y', 'N/A')}%\n"
+            f"  5-Year LPR: {lpr.get('lpr_5y', 'N/A')}%"
         )
-        print("[INFO] [AKSHARE] PBOC LPR fetched.", flush=True)
-    except Exception as e:
-        print(f"[WARN] [AKSHARE] PBOC LPR fetch failed: {e}", flush=True)
+        print("[INFO] [HEARTBEAT] PBOC LPR received from data-engine.", flush=True)
+    else:
         sections.append("🏦 PBOC LPR: unavailable.")
+
+    # --- Cailian Press headlines (财联社电报) ---
+    # Injected as a fourth context layer for the scout — highest-velocity
+    # Chinese-language news source. Claude uses these to detect intraday
+    # policy signals that have not yet appeared in English-language feeds.
+    news_payload = query_data_engine("/news/cn")
+    news_cn = news_payload.get("news", [])
+    if news_cn:
+        lines = [
+            f"  [{n.get('time', '')}] {n.get('title', '')}"
+            for n in news_cn[:5]
+        ]
+        sections.append(
+            "📰 Cailian Press (财联社电报) — Latest 5 Headlines:\n"
+            + "\n".join(lines)
+        )
+        print("[INFO] [HEARTBEAT] Cailian Press headlines received from data-engine.", flush=True)
+    else:
+        sections.append("📰 Cailian Press: unavailable.")
 
     return "\n\n".join(sections)
 
