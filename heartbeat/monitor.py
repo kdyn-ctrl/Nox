@@ -546,7 +546,7 @@ def send_status(message):
             f"⚡ *Execution Engine:* {esc(exec_status)} \(Ping: {esc(exec_ping)}ms\)\n"
             f"🇨🇳 *China Data Engine:* {esc(data_status)} \(Cache updated: {esc(data_cache_age)}\)\n"
             f"📚 *Memory Bank:* {esc(audit_count)} Audits \| {esc(filing_count)} Processed Filings\n"
-            f"📊 *Current Market Regime:* `RISK\_ON`"
+            f"📊 *Current Market Regime:* `RISK_ON`"
         )
         bot.reply_to(message, status_msg, parse_mode='MarkdownV2')
 
