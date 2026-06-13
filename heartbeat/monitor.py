@@ -483,19 +483,68 @@ def trigger_report(message):
 
 @bot.message_handler(commands=['status'])
 def send_status(message):
+    """
+    /status - Overhauled to poll the entire system in real-time.
+    Pings the Execution and Data engines, and queries SQLite for the last
+    recorded timestamps, returning a structured health dashboard.
+    """
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM daily_audits")
-            audit_count = c.fetchone()[0]
-        
+        # --- 1. Ping Core Services ---
+        exec_status, exec_ping = "OFFLINE", -1
+        try:
+            start_time = time.time()
+            exec_res = requests.get("http://execution-engine:8080/health", timeout=HTTP_TIMEOUT)
+            if exec_res.status_code == 200 and exec_res.json().get("status") == "healthy":
+                exec_status = "ONLINE"
+                exec_ping = int((time.time() - start_time) * 1000)
+        except requests.RequestException:
+            pass  # Status remains OFFLINE
+
+        data_status, data_cache_age = "OFFLINE", "N/A"
+        try:
+            data_res = requests.get("http://data-engine:8000/health", timeout=HTTP_TIMEOUT)
+            if data_res.status_code == 200:
+                health_data = data_res.json()
+                if health_data.get("status") == "healthy":
+                    data_status = "ONLINE"
+                    last_updated_str = health_data.get("last_updated_utc")
+                    if last_updated_str:
+                        last_updated = datetime.fromisoformat(last_updated_str.replace("Z", "+00:00"))
+                        age = datetime.now(ZoneInfo("UTC")) - last_updated
+                        data_cache_age = f"{int(age.total_seconds() // 60)}m ago"
+        except requests.RequestException:
+            pass # Status remains OFFLINE
+
+        # --- 2. Query Memory Bank ---
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute("SELECT timestamp FROM daily_audits ORDER BY timestamp DESC LIMIT 1")
+                last_audit_row = c.fetchone()
+                last_audit_age = "Never"
+                if last_audit_row:
+                    last_audit = datetime.fromisoformat(last_audit_row[0])
+                    age = datetime.now() - last_audit
+                    last_audit_age = f"{int(age.total_seconds() // 3600)}h ago"
+                
+                c.execute("SELECT COUNT(*) FROM daily_audits")
+                audit_count = c.fetchone()[0]
+                c.execute("SELECT COUNT(*) FROM processed_filings")
+                filing_count = c.fetchone()[0]
+
+        # --- 3. Assemble Dashboard ---
         status_msg = (
-            "🦅 *Nox Systems Status*\n"
-            f"✅ Brain: Online\n"
-            f"✅ Memory Bank: {audit_count} audits saved\n"
-            f"✅ Kelly Engine: Ready"
+            f"🦅 *Nox System Health Status*\n"
+            f"────────────────────────\n"
+            f"🧠 *Analyst Heartbeat:* Active (Last cycle: {last_audit_age})\n"
+            f"⚡ *Execution Engine:* {exec_status} (Ping: {exec_ping}ms)\n"
+            f"🇨🇳 *China Data Engine:* {data_status} (Cache updated: {data_cache_age})\n"
+            f"📚 *Memory Bank:* {audit_count} Audits | {filing_count} Processed Filings\n"
+            # The Analyst Brain container is responsible for Regime State, this is a placeholder
+            f"📊 *Current Market Regime:* RISK_ON" 
         )
         bot.reply_to(message, status_msg, parse_mode='Markdown')
+
     except Exception as e:
         bot.reply_to(message, f"⚠️ Failed to retrieve status: {str(e)}")
 

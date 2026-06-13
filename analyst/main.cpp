@@ -4,9 +4,68 @@
 #include <thread>
 #include <vector>
 #include <numeric>
+#include <string>
+#include <cstdlib>
+#include <iomanip>
+#include <sstream>
+#include <cctype>
 #include "RegimeStateMachine.hpp" 
 #include "httplib.h"               // Add this for HTTP Client capabilities
 #include "nlohmann/json.hpp"       // Add this for JSON creation
+
+// Lightweight Telegram Notifier using httplib
+class TelegramNotifier {
+public:
+    TelegramNotifier(const std::string& token, const std::string& chat_id)
+        : bot_token_(token), chat_id_(chat_id) {
+        if (bot_token_.empty() || chat_id_.empty()) {
+            std::cerr << "⚠️  [TELEGRAM] Token or Chat ID is empty. Notifications disabled." << std::endl;
+            is_enabled_ = false;
+        } else {
+            std::cout << "[INFO] Telegram Notifier enabled for Chat ID: " << chat_id_ << std::endl;
+            is_enabled_ = true;
+        }
+    }
+
+    void send(const std::string& message) {
+        if (!is_enabled_) return;
+
+        std::string encoded_message = url_encode(message);
+
+        httplib::Client cli("https://api.telegram.org");
+        cli.set_connection_timeout(std::chrono::seconds(10));
+        
+        std::string path = "/bot" + bot_token_ + "/sendMessage?chat_id=" + chat_id_ + "&text=" + encoded_message;
+
+        auto res = cli.Get(path.c_str());
+
+        if (!res || res->status != 200) {
+            std::cerr << "❌ [TELEGRAM] Failed to send message. Status: "
+                      << (res ? std::to_string(res->status) : "No Response") << "\\n"
+                      << (res ? res->body : "") << std::endl;
+        }
+    }
+
+private:
+    std::string url_encode(const std::string& value) {
+        std::ostringstream escaped;
+        escaped.fill('0');
+        escaped << std::hex;
+
+        for (char c : value) {
+            if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                escaped << c;
+            } else {
+                escaped << '%' << std::setw(2) << std::uppercase << (int)(unsigned char)c;
+            }
+        }
+        return escaped.str();
+    }
+
+    std::string bot_token_;
+    std::string chat_id_;
+    bool is_enabled_ = false;
+};
 
 using json = nlohmann::json;
 
@@ -132,11 +191,21 @@ SpyData fetch_spy_data() {
 
 // Orchestrates both data fetches and returns a single combined MarketSnapshot.
 // Both sources are Yahoo Finance — no Alpaca data API subscription required.
-MarketSnapshot fetch_market_snapshot() {
+MarketSnapshot fetch_market_snapshot(TelegramNotifier& notifier) {
     double vix  = fetch_vix();
     SpyData spy = fetch_spy_data();
 
-    if (vix < 0.0 || !spy.valid) {
+    bool had_error = false;
+    if (vix < 0.0) {
+        notifier.send("🔴 ANALYST CRITICAL: Failed to fetch VIX data from Yahoo Finance. Market analysis is compromised.");
+        had_error = true;
+    }
+    if (!spy.valid) {
+        notifier.send("🔴 ANALYST CRITICAL: Failed to fetch SPY data from Yahoo Finance. Market analysis is compromised.");
+        had_error = true;
+    }
+
+    if (had_error) {
         std::cerr << "❌ [ANALYST] Market snapshot incomplete — VIX: " << vix
                   << ", SPY valid: " << std::boolalpha << spy.valid << std::endl;
         return {};
@@ -182,6 +251,12 @@ int main() {
     }
     std::string alpaca_api_secret = env_api_secret;
 
+    const char* env_tg_token = std::getenv("TELEGRAM_BOT_TOKEN");
+    const char* env_tg_chat_id = std::getenv("TELEGRAM_CHAT_ID");
+    std::string tg_token = env_tg_token ? env_tg_token : "";
+    std::string tg_chat_id = env_tg_chat_id ? env_tg_chat_id : "";
+    TelegramNotifier notifier(tg_token, tg_chat_id);
+
     // RULE-001 — Cycle interval MUST come from the environment; never hardcoded.
     // Allows the interval to be tightened (e.g., to 1–4 h) during elevated-volatility
     // regimes without a code rebuild or container restart.
@@ -203,7 +278,7 @@ int main() {
 
     while (true) {
         // 1. Fetch live market data (VIX + SPY both from Yahoo Finance)
-        MarketSnapshot snapshot = fetch_market_snapshot();
+        MarketSnapshot snapshot = fetch_market_snapshot(notifier);
 
         if (!snapshot.valid) {
             std::cerr << "⚠️  [ANALYST] Failed to obtain a valid market snapshot. Skipping cycle." << std::endl;
@@ -271,6 +346,10 @@ int main() {
 
         if (!success) {
             std::cerr << "💥 [ANALYST CRITICAL] All retry attempts exhausted. Failed to send payload to Execution Engine." << std::endl;
+            notifier.send("🔴 ANALYST CRITICAL: All 5 retries exhausted. The Analyst C++ brain CANNOT communicate with the Execution Engine. Manual intervention required.");
+        } else {
+            std::string success_message = "✅ Analyst cycle complete. " + current_strategy.log_message;
+            notifier.send(success_message);
         }
 
         // RULE-001 — Sleep for the env-configured interval, not a hardcoded 24 h.

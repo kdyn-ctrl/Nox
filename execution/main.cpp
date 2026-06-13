@@ -403,6 +403,11 @@ public:
     void run() {
         httplib::Server svr;
 
+        svr.Get("/health", [](const httplib::Request &, httplib::Response &res) {
+            json health_response = {{"status", "healthy"}};
+            res.set_content(health_response.dump(), "application/json");
+        });
+
         svr.Post("/webhook", [this](const httplib::Request& req, httplib::Response& res) {
             std::string body = req.body;
             int success_count = 0;
