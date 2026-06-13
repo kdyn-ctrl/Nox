@@ -357,13 +357,15 @@ def run_scout_protocol():
             "and Chinese market intelligence (A-share sentiment, PMI, PBOC policy). "
             "Your job is to find cross-market structural shifts — moments where "
             "Chinese macro data confirms, contradicts, or leads the US narrative. "
-            "Output a concise, highly actionable, bilingual-aware market report. "
-            "Flag any US/China divergence signals explicitly."
+            "Output a thorough, highly actionable, bilingual-aware market report. "
+            "Use markdown headers and tables where appropriate. "
+            "Flag any US/China divergence signals explicitly. "
+            "Do not truncate — complete every section fully."
         )
         
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
+            max_tokens=4096,
             system=system_prompt,
             messages=[{"role": "user", "content": (
                 f"🇺🇸 US Media Headlines:\n{news_context}\n\n"
@@ -387,7 +389,7 @@ def run_scout_protocol():
                           ("NVDA, BABA, BTCUSD", analysis_text))
                 conn.commit()
     except Exception as e:
-        print(f"Scout Error: {e}")
+        print(f"[ERROR] [HEARTBEAT] Scout protocol failed: {e}", flush=True)
 
 def schedule_checker():
     # RULE-006: Daily Scout MUST fire at 10:00 AM Eastern Time (ET), not UTC.
@@ -464,6 +466,21 @@ def schedule_checker():
         time.sleep(30)   # 30-second tick — tight enough not to miss the window
 
 # --- 4. CONVERSATIONAL AGENT HANDLERS ---
+@bot.message_handler(commands=['report'])
+def trigger_report(message):
+    """
+    /report — Manually triggers the full daily scout protocol on demand.
+    Sends an acknowledgement immediately so the user knows it fired,
+    then runs the full pipeline (news + SEC + Chinese market context + Claude)
+    in a background thread so the bot remains responsive during generation.
+    """
+    try:
+        bot.reply_to(message, "⚙️ *Nox Scout firing now...* Assembling data layers. This takes ~30 seconds.", parse_mode='Markdown')
+        threading.Thread(target=run_scout_protocol, daemon=True).start()
+    except Exception as e:
+        print(f"[ERROR] [HEARTBEAT] /report command failed: {e}", flush=True)
+        bot.reply_to(message, f"⚠️ Failed to trigger report: {str(e)}")
+
 @bot.message_handler(commands=['status'])
 def send_status(message):
     try:

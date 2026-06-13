@@ -99,11 +99,28 @@ SpyData fetch_spy_data() {
             return {};
         }
 
+        // RULE-001: We need at least 200 valid closes to compute a true SMA-200.
+        // range=1y returns ~252 bars, but holidays/early closes can reduce that.
+        // If we have fewer than 200 valid closes, the SMA is mathematically
+        // undefined — returning stale or incorrect data is worse than aborting.
+        if (valid_closes.size() < 200) {
+            std::cerr << "❌ [ANALYST] Insufficient SPY bars for SMA-200 calculation. "
+                      << "Got " << valid_closes.size() << ", need 200. Aborting cycle."
+                      << std::endl;
+            return {};
+        }
+
         // Last entry is the most recent close (Yahoo returns ascending order)
         double current_price = valid_closes.back();
 
-        double sma200 = std::accumulate(valid_closes.begin(), valid_closes.end(), 0.0) /
-                        static_cast<double>(valid_closes.size());
+        // RULE-001 Fix: Average ONLY the last 200 closes, not all ~252 bars.
+        // Averaging all bars was producing a ~252-day SMA, causing a lag-distorted
+        // regime signal that delayed RISK_ON/RISK_OFF transitions.
+        double sum = 0.0;
+        for (size_t i = valid_closes.size() - 200; i < valid_closes.size(); ++i) {
+            sum += valid_closes[i];
+        }
+        double sma200 = sum / 200.0;
 
         return {current_price, sma200, true};
 

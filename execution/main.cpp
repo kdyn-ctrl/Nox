@@ -262,6 +262,37 @@ private:
             return;
         }
 
+        // RULE-018 Condition 2 — Notional Value Ceiling (Physical Hard Gate).
+        // The Kelly calculator already enforces a 10% cap mathematically, but a
+        // price spike between the sizing calculation and the order submission can
+        // silently push the true notional value above the cap. This is the physical
+        // last-line-of-defense gate that catches that window and any future edge
+        // cases regardless of how qty was calculated (systematic or override).
+        //
+        // Condition: (Qty × CurrentPrice) must not exceed (LiveEquity × 10%).
+        // We check against live_equity (not regime_adjusted_equity) because the
+        // hard cap is a function of total account size, not a regime-scaled subset.
+        double notional_value    = static_cast<double>(qty) * sig.price;
+        double max_notional      = live_equity * 0.10;
+        if (notional_value > max_notional) {
+            Logger::log("CRITICAL",
+                "[RULE-018] Notional ceiling breached for " + sig.ticker +
+                " — Notional: $" + std::to_string(notional_value) +
+                " vs Max Allowed: $" + std::to_string(max_notional) +
+                ". Order blocked.");
+            TelegramNotifier::sendMessage(
+                "🚨 *CRITICAL: RULE-018 Notional Ceiling Breached*\n"
+                "────────────────────────\n"
+                "• *Ticker:* " + sig.ticker + "\n"
+                "• *Qty:* " + std::to_string(qty) + " shares\n"
+                "• *Notional:* $" + std::to_string(notional_value) + "\n"
+                "• *Max Allowed (10%):* $" + std::to_string(max_notional) + "\n"
+                "⛔ Price spike detected between sizing and submission.\n"
+                "Order blocked. Manual review required."
+            );
+            return;
+        }
+
         // RULE-014: alpacaBaseUrl is injected at runtime (paper vs. live)
         // and was validated at startup — never hardcoded here.
         try {
@@ -501,7 +532,7 @@ public:
         Logger::log("INFO", "Nox Execution Engine listening on 0.0.0.0:8080...");
         svr.listen("0.0.0.0", 8080);
     } // This closes void run()
-}; // This closes class OpenClawEngine
+}; // This closes class NoxEngine
 
 int main() {
     NoxEngine engine;
