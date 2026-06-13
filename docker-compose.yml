@@ -1,13 +1,24 @@
 services:
-  # data-engine: dedicated async microservice for Chinese financial data.
+  # china-data-engine: dedicated async microservice for Chinese financial data.
   # Scrapes East Money, Cailian Press, NBS PMI, and PBOC LPR on a 15-minute
   # APScheduler cycle and caches results in memory. All other containers
   # query it via authenticated HTTP — no container imports akshare directly.
   # Internal-only: port 8000 is NOT exposed to the host. (RULE-012)
-  data-engine:
+  america-data-engine:
     build:
-      context: ./data_engine
-    container_name: nox_data_engine
+      context: ./america_data_engine
+    container_name: nox_america_data_engine
+    restart: unless-stopped
+    environment:
+      - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+    networks:
+      - nox_net
+  china-data-engine:
+    build:
+      context: ./china_data_engine
+    container_name: nox_china_data_engine
     restart: unless-stopped
     environment:
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
@@ -61,14 +72,15 @@ services:
     container_name: nox_heartbeat
     restart: unless-stopped
     depends_on:
-      - data-engine
+      - china-data-engine
+      - america-data-engine
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - ALPACA_API_KEY=${ALPACA_API_KEY}
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
-      # Shared secret used to authenticate requests to the data-engine API.
+      # Shared secret used to authenticate requests to the china-data-engine API.
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
     volumes:
       - ./data:/app/data

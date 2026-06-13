@@ -8,9 +8,9 @@ WORKDIR /app
 #                   whole scheduler thread would crash silently at runtime.
 #
 # akshare is intentionally NOT listed here. All Chinese market data (East Money,
-# Cailian Press, NBS PMI, PBOC LPR) is now fetched by the dedicated data-engine
+# Cailian Press, NBS PMI, PBOC LPR) is now fetched by the dedicated china-data-engine
 # microservice and read by this container via authenticated HTTP calls to
-# http://data-engine:8000. Removing akshare shrinks this image by ~400 MB and
+# http://china-data-engine:8000. Removing akshare shrinks this image by ~400 MB and
 # eliminates any risk of a slow AkShare network call blocking the Telegram bot.
 RUN pip install --no-cache-dir \
     requests==2.32.3 \

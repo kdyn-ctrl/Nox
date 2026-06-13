@@ -200,35 +200,35 @@ def get_latest_sec_filing(ticker: str) -> str:
         print(f"[WARN] [HEARTBEAT] get_latest_sec_filing failed for {ticker}: {e}", flush=True)
         return f"SEC pull failed for {ticker}: {str(e)}"
 
-# --- 2.5 CHINESE MARKET INTELLIGENCE (data-engine) ---
+# --- 2.5 CHINESE MARKET INTELLIGENCE (china-data-engine) ---
 
-def query_data_engine(endpoint: str) -> dict:
+def query_data_engine(endpoint: str, base_url: str = "http://china-data-engine:8000") -> dict:
     """
-    Sends an authenticated GET request to the internal data-engine microservice.
+    Sends an authenticated GET request to an internal china-data-engine microservice.
 
-    The data-engine runs AkShare scrapers on a 15-minute APScheduler cycle and
+    The china-data-engine runs scrapers on a 15-minute APScheduler cycle and
     caches results in memory, so this call always returns instantly — no live
-    scrape is triggered. If the data-engine is unreachable (e.g., still starting
+    scrape is triggered. If the china-data-engine is unreachable (e.g., still starting
     up) we return an empty dict; the caller must handle that gracefully.
 
     Authentication follows the same shared-secret pattern used by the analyst →
     execution webhook (RULE-004): the X-Nox-Token header carries WEBHOOK_SECRET.
     RULE-008 timeouts are enforced via HTTP_TIMEOUT.
     """
-    url = f"http://data-engine:8000{endpoint}"
+    url = f"{base_url}{endpoint}"
     headers = {"X-Nox-Token": WEBHOOK_SECRET}
     try:
         res = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
         if res.status_code == 200:
             return res.json()
         print(
-            f"[WARN] [HEARTBEAT] data-engine returned HTTP {res.status_code} "
+            f"[WARN] [HEARTBEAT] china-data-engine at {base_url} returned HTTP {res.status_code} "
             f"for {endpoint}.",
             flush=True,
         )
     except Exception as e:
         print(
-            f"[WARN] [HEARTBEAT] Could not reach data-engine at {endpoint}: {e}",
+            f"[WARN] [HEARTBEAT] Could not reach china-data-engine at {url}: {e}",
             flush=True,
         )
     return {}
@@ -237,7 +237,7 @@ def query_data_engine(endpoint: str) -> dict:
 def get_chinese_market_context() -> str:
     """
     Assembles three layers of Chinese market intelligence by querying the
-    dedicated data-engine microservice over the internal nox_net Docker network.
+    dedicated china-data-engine microservice over the internal nox_net Docker network.
 
     Previously this function called AkShare directly inside the heartbeat
     container. That design had two problems:
@@ -245,7 +245,7 @@ def get_chinese_market_context() -> str:
       2. akshare + pandas added ~400 MB to the heartbeat image for logic that
          belongs in a data layer, not a notification layer.
 
-    Now the heartbeat simply reads from the data-engine cache (<5 ms per call)
+    Now the heartbeat simply reads from the china-data-engine cache (<5 ms per call)
     and formats the response into a Claude-ready string. All scraping complexity
     lives in data_engine/scrapers.py where it belongs.
 
@@ -267,7 +267,7 @@ def get_chinese_market_context() -> str:
             "🇨🇳 East Money Hot Board (东方财富人气榜) — Top 5 Most-Watched A-Shares:\n"
             + "\n".join(lines)
         )
-        print("[INFO] [HEARTBEAT] East Money hot board received from data-engine.", flush=True)
+        print("[INFO] [HEARTBEAT] East Money hot board received from china-data-engine.", flush=True)
     else:
         sections.append("🇨🇳 East Money Hot Board: unavailable.")
 
@@ -288,7 +288,7 @@ def get_chinese_market_context() -> str:
             f"({'EXPANSION ▲' if expansion else 'CONTRACTION ▼'})\n"
             f"  Non-Manufacturing (非制造业): {non_mfg}"
         )
-        print("[INFO] [HEARTBEAT] China PMI received from data-engine.", flush=True)
+        print("[INFO] [HEARTBEAT] China PMI received from china-data-engine.", flush=True)
     else:
         sections.append("🏭 China PMI: unavailable.")
 
@@ -300,7 +300,7 @@ def get_chinese_market_context() -> str:
             f"  1-Year LPR: {lpr.get('lpr_1y', 'N/A')}%\n"
             f"  5-Year LPR: {lpr.get('lpr_5y', 'N/A')}%"
         )
-        print("[INFO] [HEARTBEAT] PBOC LPR received from data-engine.", flush=True)
+        print("[INFO] [HEARTBEAT] PBOC LPR received from china-data-engine.", flush=True)
     else:
         sections.append("🏦 PBOC LPR: unavailable.")
 
@@ -319,26 +319,35 @@ def get_chinese_market_context() -> str:
             "📰 Cailian Press (财联社电报) — Latest 5 Headlines:\n"
             + "\n".join(lines)
         )
-        print("[INFO] [HEARTBEAT] Cailian Press headlines received from data-engine.", flush=True)
+        print("[INFO] [HEARTBEAT] Cailian Press headlines received from china-data-engine.", flush=True)
     else:
         sections.append("📰 Cailian Press: unavailable.")
 
     return "\n\n".join(sections)
 
 
+def get_us_news_context() -> str:
+    """
+    Assembles US news context by querying the america-china-data-engine.
+    """
+    news_payload = query_data_engine("/news/us", "http://america-china-data-engine:8001")
+    news_us = news_payload.get("news", [])
+    if news_us:
+        lines = [
+            f"- {n.get('headline', '')}"
+            for n in news_us[:5] #top 5
+        ]
+        print(f"[INFO] [HEARTBEAT] US news received from america-china-data-engine ({len(lines)} headlines).", flush=True)
+        return "\n".join(lines)
+    else:
+        print("[WARN] [HEARTBEAT] US news from america-china-data-engine was empty.", flush=True)
+        return "US news headlines unavailable."
+
+
 # --- 3. THE SCOUT PROTOCOL (DAILY REPORT) ---
 def run_scout_protocol():
     try:
-        headers = {'APCA-API-KEY-ID': ALPACA_API, 'APCA-API-SECRET-KEY': ALPACA_SEC}
-        news_req = requests.get(
-            'https://data.alpaca.markets/v1beta1/news?symbols=NVDA,XOM,BTCUSD&limit=5',
-            headers=headers, timeout=HTTP_TIMEOUT
-        ).json()
-        news_context = "\n".join([
-            f"- {n['headline']}"
-            for n in news_req.get('news', [])
-            if isinstance(n, dict) and 'headline' in n
-        ])
+        news_context = get_us_news_context()
         
         # One domestic (NVDA, 8-K) and one Chinese ADR (BABA, 6-K) — gives Claude
         # cross-market filing context without doubling token cost.
@@ -386,7 +395,7 @@ def run_scout_protocol():
             with sqlite3.connect(DB_PATH) as conn:
                 c = conn.cursor()
                 c.execute("INSERT INTO daily_audits (tickers_scanned, claude_analysis) VALUES (?, ?)",
-                          ("NVDA, BABA, BTCUSD", analysis_text))
+                          ("NVDA, BABA", analysis_text))
                 conn.commit()
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] Scout protocol failed: {e}", flush=True)
@@ -502,7 +511,7 @@ def send_status(message):
 
         data_status, data_cache_age = "OFFLINE", "N/A"
         try:
-            data_res = requests.get("http://data-engine:8000/health", timeout=HTTP_TIMEOUT)
+            data_res = requests.get("http://china-data-engine:8000/health", timeout=HTTP_TIMEOUT)
             if data_res.status_code == 200:
                 health_data = data_res.json()
                 if health_data.get("status") == "healthy":
@@ -512,6 +521,21 @@ def send_status(message):
                         last_updated = datetime.fromisoformat(last_updated_str.replace("Z", "+00:00"))
                         age = datetime.now(ZoneInfo("UTC")) - last_updated
                         data_cache_age = f"{int(age.total_seconds() // 60)}m ago"
+        except requests.RequestException:
+            pass # Status remains OFFLINE
+
+        america_data_status, america_data_cache_age = "OFFLINE", "N/A"
+        try:
+            america_data_res = requests.get("http://america-china-data-engine:8001/health", timeout=HTTP_TIMEOUT)
+            if america_data_res.status_code == 200:
+                health_data = america_data_res.json()
+                if health_data.get("status") == "healthy":
+                    america_data_status = "ONLINE"
+                    last_updated_str = health_data.get("last_updated_utc")
+                    if last_updated_str:
+                        last_updated = datetime.fromisoformat(last_updated_str.replace("Z", "+00:00"))
+                        age = datetime.now(ZoneInfo("UTC")) - last_updated
+                        america_data_cache_age = f"{int(age.total_seconds() // 60)}m ago"
         except requests.RequestException:
             pass # Status remains OFFLINE
 
@@ -545,6 +569,7 @@ def send_status(message):
             f"🧠 *Analyst Heartbeat:* Active \(Last cycle: {esc(last_audit_age)}\)\n"
             f"⚡ *Execution Engine:* {esc(exec_status)} \(Ping: {esc(exec_ping)}ms\)\n"
             f"🇨🇳 *China Data Engine:* {esc(data_status)} \(Cache updated: {esc(data_cache_age)}\)\n"
+            f"🇺🇸 *America Data Engine:* {esc(america_data_status)} \(Cache updated: {esc(america_data_cache_age)}\)\n"
             f"📚 *Memory Bank:* {esc(audit_count)} Audits \| {esc(filing_count)} Processed Filings\n"
             f"📊 *Current Market Regime:* `RISK_ON`"
         )

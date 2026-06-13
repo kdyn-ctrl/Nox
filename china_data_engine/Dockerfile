@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY scrapers.py main.py ./
 
-# Port 8000 is the internal-only data-engine port. It is NOT exposed to the
+# Port 8000 is the internal-only china-data-engine port. It is NOT exposed to the
 # host — only reachable by other containers on the nox_net bridge network.
 EXPOSE 8000
 
