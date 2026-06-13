@@ -541,7 +541,7 @@ def send_status(message):
             f"🇨🇳 *China Data Engine:* {data_status} (Cache updated: {data_cache_age})\n"
             f"📚 *Memory Bank:* {audit_count} Audits | {filing_count} Processed Filings\n"
             # The Analyst Brain container is responsible for Regime State, this is a placeholder
-            f"📊 *Current Market Regime:* RISK_ON" 
+            f"📊 *Current Market Regime:* `RISK_ON`"
         )
         bot.reply_to(message, status_msg, parse_mode='Markdown')
 

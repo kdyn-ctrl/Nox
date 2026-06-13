@@ -265,10 +265,10 @@ int main() {
         std::cerr << "[FATAL] [ANALYST] ANALYST_CYCLE_HOURS not set. Refusing to start." << std::endl;
         return 1;
     }
-    int cycle_hours = 0;
+    double cycle_hours = 0.0;
     try {
-        cycle_hours = std::stoi(env_cycle_hours);
-        if (cycle_hours <= 0) throw std::invalid_argument("must be positive");
+        cycle_hours = std::stod(env_cycle_hours);
+        if (cycle_hours <= 0.0) throw std::invalid_argument("must be positive");
     } catch (const std::exception& e) {
         std::cerr << "[FATAL] [ANALYST] ANALYST_CYCLE_HOURS is invalid ('" << env_cycle_hours
                   << "'): " << e.what() << ". Refusing to start." << std::endl;
@@ -355,7 +355,8 @@ int main() {
         // RULE-001 — Sleep for the env-configured interval, not a hardcoded 24 h.
         std::cout << "[INFO] [ANALYST] Cycle complete. Sleeping for "
                   << cycle_hours << " hour(s)." << std::endl;
-        std::this_thread::sleep_for(std::chrono::hours(cycle_hours));
+        auto sleep_duration = std::chrono::duration<double>(cycle_hours * 3600.0);
+        std::this_thread::sleep_for(sleep_duration);
     }
    
      return 0;
