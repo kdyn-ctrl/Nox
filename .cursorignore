@@ -1,0 +1,14 @@
+# .cursorignore
+# 🚨 FINANCIAL FIREWALL: DO NOT LET AI READ HISTORICAL DATA
+data/*.csv
+spy_vix_daily_v2.csv
+
+# 🚨 SECRETS & DATABASES
+.env
+memory_bank.db
+*.sqlite3
+
+# 🚨 BUILD ARTIFACTS
+build/
+*.o
+backtester

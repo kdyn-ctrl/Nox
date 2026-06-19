@@ -1,0 +1,15 @@
+# OpenClaw Architecture & System Rules
+
+## 1. Core Stack
+- Execution/Analyst: Strict C++17 optimized for ultra-low latency. 
+- Monitors/Scouts: Python 3.11.
+- Infrastructure: Docker Compose, Traefik reverse proxy.
+
+## 2. The Design Contract (DO NOT VIOLATE)
+- RULE-009: Every container must hard-abort at startup with [FATAL] if any required environment variable is missing. No silent defaults.
+- RULE-015: AI models NEVER determine trade size, side, or price. Only deterministic C++ handles this via the Half-Kelly Criterion.
+- RULE-018: Zero-share Kelly results are hard-blocked. Do not force a 1-share minimum purchase.
+
+## 3. Data Integrity
+- When interacting with `memory_bank.db`, you must respect strict SQLite thread-locking rules.
+- Do not modify `RegimeStateMachine.hpp` without explicit approval, as it breaks synchronization with the Monte Carlo Permutation Tests.
