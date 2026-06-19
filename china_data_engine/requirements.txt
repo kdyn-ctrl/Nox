@@ -1,0 +1,19 @@
+# All versions pinned for fully reproducible builds (RULE-009).
+#
+# fastapi       — async HTTP framework; serves all /news, /macro, /sentiment endpoints
+# uvicorn       — ASGI server; runs the FastAPI app inside the container
+# apscheduler   — background job scheduler; fires _refresh_cache() every 15 minutes
+# akshare       — Chinese financial data library; source for all A-share scrapers
+# requests      — HTTP client used by akshare and any direct REST calls
+# beautifulsoup4 + lxml — HTML parsing; reserved for future CNINFO / NBS scraping
+# pandas        — required by akshare for all dataframe returns
+# pydantic      — data validation; used implicitly by FastAPI for request/response models
+fastapi==0.110.0
+uvicorn==0.28.0
+apscheduler==3.10.4
+akshare==1.18.64
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
+pandas==2.2.1
+pydantic==2.6.4

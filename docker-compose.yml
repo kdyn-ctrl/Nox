@@ -1,0 +1,95 @@
+services:
+  # china-data-engine: dedicated async microservice for Chinese financial data.
+  # Scrapes East Money, Cailian Press, NBS PMI, and PBOC LPR on a 15-minute
+  # APScheduler cycle and caches results in memory. All other containers
+  # query it via authenticated HTTP — no container imports akshare directly.
+  # Internal-only: port 8000 is NOT exposed to the host. (RULE-012)
+  america-data-engine:
+    build:
+      context: ./america_data_engine
+    container_name: nox_america_data_engine
+    restart: unless-stopped
+    environment:
+      - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+    networks:
+      - nox_net
+  china-data-engine:
+    build:
+      context: ./china_data_engine
+    container_name: nox_china_data_engine
+    restart: unless-stopped
+    environment:
+      - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
+    networks:
+      - nox_net
+
+  analyst-brain:
+    build:
+      context: .
+      dockerfile: analyst/Dockerfile
+    container_name: nox_analyst
+    restart: unless-stopped
+    depends_on:
+      - execution-engine
+    environment:
+      - TZ=America/New_York
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
+      - ANALYST_CYCLE_HOURS=${ANALYST_CYCLE_HOURS:-6}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - nox_net
+
+  execution-engine:
+    build:
+      context: .
+      dockerfile: execution/Dockerfile
+    container_name: nox_execution
+    restart: unless-stopped
+    environment:
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
+      - ALPACA_BASE_URL=${ALPACA_BASE_URL}
+      - KELLY_WIN_RATE=${KELLY_WIN_RATE}
+      - KELLY_WIN_LOSS_RATIO=${KELLY_WIN_LOSS_RATIO}
+      - KELLY_FRACTION=${KELLY_FRACTION}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+    ports:
+      - "8080:8080"
+    networks:
+      - nox_net
+
+  heartbeat-monitor:
+    build:
+      context: ./heartbeat
+    container_name: nox_heartbeat
+    restart: unless-stopped
+    depends_on:
+      - china-data-engine
+      - america-data-engine
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      # Shared secret used to authenticate requests to the china-data-engine API.
+      - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
+    volumes:
+      - ./data:/app/data
+    networks:
+      - nox_net
+
+networks:
+  nox_net:
+    external: true
+
+
