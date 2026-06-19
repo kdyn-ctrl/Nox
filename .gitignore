@@ -1,0 +1,42 @@
+# Compiled binaries & objects
+*.o
+*.out
+build/
+
+# Docker & environment
+.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Additional build artifacts
+*.a
+*.so
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Python virtual environments
+venv/
+.venv/
+env/
+
+
+# Logs
+*.log
+logs/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+data/memory_bank.db
+/root/Nox/.continue
+.continue/
+CLAUDE.md
+Claude.md
+.gitleaksignore
+.env

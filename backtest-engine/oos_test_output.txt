@@ -1,0 +1,24 @@
+
+--- Backtest Results ---
+Parameters:
+  VIX Threshold: 30
+  SMA Buffer:    0.98
+  RSI Gate:      0
+------------------------
+Initial Balance:       $100000.00
+Final Balance:         $100000.00
+Total Return:           0.00%
+Max Drawdown:           0.00%
+Sharpe Ratio:           0.00
+------------------------
+Total Trades:           0
+Win Rate:               0.00%
+Avg Win:               $0.00
+Avg Loss:              $0.00
+Win/Loss Ratio:         0.00
+Max Consecutive Losses: 0
+Avg Holding Period:     0.00 days
+------------------------
+Buy & Hold Return:      0.00%
+------------------------
+Trade log saved to trades.csv

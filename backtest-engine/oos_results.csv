@@ -1,0 +1,4 @@
+vix_threshold,sma_buffer_pct,rsi_gate,cooldown_days,vol_gate,final_balance,total_return_pct,max_drawdown_pct,total_trades,buy_and_hold_pct,win_rate_pct,avg_win,avg_loss,win_loss_ratio,sharpe_ratio,max_consec_losses,avg_hold_days
+35,0.98,50,10,250572,150.572,23.0849,18,336.559,66.6667,15937.9,6780.36,2.35059,0.802253,3,122.278
+35,0.97,50,10,244778,144.778,25.3332,17,336.559,64.7059,17653.7,8235.4,2.14363,0.774706,3,130.176
+35,0.98,40,10,265578,165.578,23.0971,19,336.559,68.4211,15906.3,6867.36,2.31622,0.842747,3,116.368
