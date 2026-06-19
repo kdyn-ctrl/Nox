@@ -37,6 +37,8 @@ data/memory_bank.db
 /root/Nox/.continue
 .continue/
 CLAUDE.md
-Claude.md
+.Claude.md
 .gitleaksignore
 .env
+.cursorignore
+.cursorrules
