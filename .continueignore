@@ -1,4 +1,5 @@
-# .cursorignore
+.continueignore
+# .continueignore
 # 🚨 FINANCIAL FIREWALL: DO NOT LET AI READ HISTORICAL DATA
 data/*.csv
 spy_vix_daily_v2.csv

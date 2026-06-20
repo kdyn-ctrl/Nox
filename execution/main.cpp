@@ -7,6 +7,8 @@
 #include <cmath>
 #include <thread>
 #include <chrono>
+#include <sstream>
+#include <iomanip>
 
 using json = nlohmann::json;
 
@@ -65,6 +67,7 @@ struct TradeSignal {
     double rsi = 50.0;
     long long vol = 0;
     double atr = 0.0;
+    double stop_loss_atr_multiplier = 2.0; // Default, will be overridden by payload
     int risk_tier = 1;
     double vix         = 20.0;  // Default neutral — cautious but not blocking
     double spy_price   = 0.0;
@@ -218,172 +221,257 @@ private:
             return;
         }
 
-        // RSI overbought/oversold gate — block trades that contradict momentum
-        if (sig.action == "BUY" && sig.rsi > 70.0) {
-            Logger::log("WARN", "RSI gate blocked BUY for " + sig.ticker + " — RSI overbought at " + std::to_string(sig.rsi));
-            TelegramNotifier::sendMessage(
-                "🚧 *RSI GATE BLOCK*\n"
-                "────────────────────────\n"
-                "• *Ticker:* " + sig.ticker + "\n"
-                "• *Action:* BUY\n"
-                "• *RSI:* " + std::to_string(sig.rsi) + " (Overbought > 70)\n"
-                "────────────────────────\n"
-                "⚠️ _Order canceled to protect buying power._"
-            );
-            return;
-        }
-        if (sig.action == "SELL" && sig.rsi < 30.0) {
-            Logger::log("WARN", "RSI gate blocked SELL for " + sig.ticker + " — RSI oversold at " + std::to_string(sig.rsi));
-            TelegramNotifier::sendMessage(
-                "🚧 *RSI GATE BLOCK*\n"
-                "────────────────────────\n"
-                "• *Ticker:* " + sig.ticker + "\n"
-                "• *Action:* SELL\n"
-                "• *RSI:* " + std::to_string(sig.rsi) + " (Oversold < 30)\n"
-                "────────────────────────\n"
-                "⚠️ _Order canceled to prevent selling into low liquidity._"
-            );
-            return;
-        }
+        // --- SELL ROUTING: Close open position (enhanced) ---
+        if (sig.action == "SELL") {
+            Logger::log("INFO", "[EXECUTION] SELL signal for " + sig.ticker + ". Closing position.");
+            try {
+                httplib::Client alpaca_cli(alpacaBaseUrl);
+                // RULE-008: Strict timeout handling
+                alpaca_cli.set_connection_timeout(std::chrono::seconds(5));
+                alpaca_cli.set_read_timeout(std::chrono::seconds(10));
 
-        // ── Regime Gate ──────────────────────────────────────────────────────────
-        AllocationStrategy regime = regimeMachine.evaluate(
-            sig.vix, sig.spy_price, sig.spy_200_sma
-        );
-        Logger::log("INFO", "[REGIME] " + regime.log_message);
-        TelegramNotifier::sendMessage("📊 *Regime Check:* " + regime.log_message);
-        if (regime.capital_multiplier == 0.0) {
-            Logger::log("WARN", "[REGIME] RISK-OFF — new entries halted for " + sig.ticker);
-            TelegramNotifier::sendMessage(
-                "🛑 *REGIME BLOCK: RISK-OFF*\n"
-                "────────────────────────\n"
-                "• *Ticker:* " + sig.ticker + "\n"
-                "⛔ VIX ≥ 30 or SPY below 200 SMA. No new entries."
-            );
-            return;
-        }
-        // ─────────────────────────────────────────────────────────────────────────
+                httplib::Headers headers = {
+                    {"APCA-API-KEY-ID",     apiKey},
+                    {"APCA-API-SECRET-KEY", apiSec}
+                };
 
-        // RULE-005: Fetch live equity — abort if unavailable (no silent fallback).
-        double live_equity = fetch_account_equity();
-        if (live_equity < 0.0) {
-            Logger::log("CRITICAL", "[EXECUTION] Aborting order for " + sig.ticker +
-                        " — could not obtain live equity.");
-            return;
-        }
-
-        // RULE-005: Size position via Kelly — abort if no mathematical edge.
-        // Scale equity by regime multiplier before sizing (1.0 = full, 0.5 = half).
-        double regime_adjusted_equity = live_equity * regime.capital_multiplier;
-        int qty = calculate_kelly_size(regime_adjusted_equity, sig.price, kellyWinRate, kellyWinLossRatio, kellyFraction);
-        if (qty < 0) {
-            Logger::log("CRITICAL", "[EXECUTION] Aborting order for " + sig.ticker +
-                        " — Kelly sizing returned no-edge signal.");
-            TelegramNotifier::sendMessage(
-                "🚨 *CRITICAL: Kelly No-Edge*\n"
-                "────────────────────────\n"
-                "• *Ticker:* " + sig.ticker + "\n"
-                "⛔ Raw Kelly ≤ 0 — strategy has no statistical edge.\n"
-                "Order halted. Review KELLY_WIN_RATE / KELLY_WIN_LOSS_RATIO."
-            );
-            return;
-        }
-
-        // RULE-018 Condition 2 — Notional Value Ceiling (Physical Hard Gate).
-        // The Kelly calculator already enforces a 10% cap mathematically, but a
-        // price spike between the sizing calculation and the order submission can
-        // silently push the true notional value above the cap. This is the physical
-        // last-line-of-defense gate that catches that window and any future edge
-        // cases regardless of how qty was calculated (systematic or override).
-        //
-        // Condition: (Qty × CurrentPrice) must not exceed (LiveEquity × 10%).
-        // We check against live_equity (not regime_adjusted_equity) because the
-        // hard cap is a function of total account size, not a regime-scaled subset.
-        double notional_value    = static_cast<double>(qty) * sig.price;
-        double max_notional      = live_equity * 0.10;
-        if (notional_value > max_notional) {
-            Logger::log("CRITICAL",
-                "[RULE-018] Notional ceiling breached for " + sig.ticker +
-                " — Notional: $" + std::to_string(notional_value) +
-                " vs Max Allowed: $" + std::to_string(max_notional) +
-                ". Order blocked.");
-            TelegramNotifier::sendMessage(
-                "🚨 *CRITICAL: RULE-018 Notional Ceiling Breached*\n"
-                "────────────────────────\n"
-                "• *Ticker:* " + sig.ticker + "\n"
-                "• *Qty:* " + std::to_string(qty) + " shares\n"
-                "• *Notional:* $" + std::to_string(notional_value) + "\n"
-                "• *Max Allowed (10%):* $" + std::to_string(max_notional) + "\n"
-                "⛔ Price spike detected between sizing and submission.\n"
-                "Order blocked. Manual review required."
-            );
-            return;
-        }
-
-        // RULE-014: alpacaBaseUrl is injected at runtime (paper vs. live)
-        // and was validated at startup — never hardcoded here.
-        try {
-            httplib::Client alpaca_cli(alpacaBaseUrl);
-            alpaca_cli.set_connection_timeout(std::chrono::seconds(5));
-            alpaca_cli.set_read_timeout(std::chrono::seconds(10));
-
-            httplib::Headers headers = {
-                {"APCA-API-KEY-ID",     apiKey},
-                {"APCA-API-SECRET-KEY", apiSec},
-                {"Content-Type",        "application/json"}
-            };
-
-            // Structure the exact JSON payload Alpaca requires, using your dynamic Kelly qty
-            json order_payload = {
-                {"symbol", sig.ticker},
-                {"qty", qty}, // Uses your Kelly size!
-                {"side", sig.action == "BUY" ? "buy" : "sell"},
-                {"type", "market"},
-                {"time_in_force", "day"}
-            };
-
-        std::cout << "[EXECUTION] Routing order to Alpaca: " << qty << " shares of " << sig.ticker << "..." << std::endl;
-
-        auto res = alpaca_cli.Post("/v2/orders", headers, order_payload.dump(), "application/json");
-
-            if (res && res->status == 200) {
-                json response_data = json::parse(res->body);
-                std::string order_id = response_data.value("id", "UNKNOWN");
-                std::string order_status = response_data.value("status", "pending");
-                std::cout << " [ORDER EXECUTED] Alpaca Order ID: "
-                          << order_id << " | Status: "
-                          << order_status << std::endl;
-                TelegramNotifier::sendMessage(
-                    "🟢 *ORDER EXECUTED*\n"
-                    "────────────────────────\n"
-                    "• *Ticker:* " + sig.ticker + "\n"
-                    "• *Side:* " + sig.action + "\n"
-                    "• *Quantity:* " + std::to_string(qty) + " Shares (Kelly)\n"
-                    "• *Status:* " + order_status + "\n"
-                    "• *Order ID:* `" + order_id + "`\n"
-                    "────────────────────────"
-                );
-            } else {
-                std::string status_code = res ? std::to_string(res->status) : "TIMEOUT";
-                std::string details     = res ? res->body : "No response received.";
-                std::cerr << "⚠️ [ALPACA REJECTION] Exchange returned status code: "
-                          << status_code << std::endl;
-                if (res) {
-                    std::cerr << "Details: " << details << std::endl;
+                // --- 1. Cancel all open orders for the symbol to avoid interference ---
+                std::string cancel_path = "/v2/orders?symbol=" + sig.ticker;
+                std::cout << "[EXECUTION] Canceling any existing orders for " << sig.ticker << " before closing position..." << std::endl;
+                auto cancel_res = alpaca_cli.Delete(cancel_path.c_str(), headers);
+                if (cancel_res && (cancel_res->status == 200 || cancel_res->status == 207)) {
+                    // 207 Multi-Status can be returned. We consider it a success and proceed.
+                    std::cout << "[EXECUTION] Existing orders for " << sig.ticker << " canceled (or none existed)." << std::endl;
+                } else {
+                    // We log a warning but proceed anyway, as closing the position is the primary goal.
+                    std::string cancel_status = cancel_res ? std::to_string(cancel_res->status) : "TIMEOUT";
+                    std::cerr << "⚠️ [EXECUTION] Could not verify order cancellation for " << sig.ticker
+                              << ". Status: " << cancel_status << ". Proceeding to close position." << std::endl;
                 }
+
+                // --- 2. Liquidate the entire position ---
+                std::string path = "/v2/positions/" + sig.ticker;
+                std::cout << "[EXECUTION] Sending liquidate position request to Alpaca for " << sig.ticker << "..." << std::endl;
+                auto res = alpaca_cli.Delete(path.c_str(), headers);
+
+                if (res && res->status == 200) {
+                    json response_data = json::parse(res->body);
+                    std::cout << " [POSITION CLOSED] Alpaca response: " << response_data.dump(2) << std::endl;
+                    TelegramNotifier::sendMessage(
+                        "⚪ *POSITION CLOSED*\n"
+                        "────────────────────────\n"
+                        "• *Ticker:* " + sig.ticker + "\n"
+                        "• *Trigger:* Webhook SELL Signal\n"
+                        "• *Alpaca Order ID:* `" + response_data.value("id", "N/A") + "`"
+                    );
+                } else {
+                    std::string status_code = res ? std::to_string(res->status) : "TIMEOUT";
+                    std::string details     = res ? res->body : "No response received.";
+                    
+                    // A 404 here means we didn't have a position to close, which isn't a critical failure.
+                    if (res && res->status == 404) {
+                         std::cerr << "ℹ️ [CLOSE IGNORED] No open position for " << sig.ticker
+                                  << " to close. Details: " << details << std::endl;
+                         TelegramNotifier::sendMessage(
+                                "ℹ️ *CLOSE IGNORED*\n"
+                                "────────────────────────\n"
+                                "• *Ticker:* " + sig.ticker + "\n"
+                                "• *Details:* No open position found."
+                            );
+                    } else {
+                        std::cerr << "⚠️ [CLOSE REJECTED] Failed to close " << sig.ticker
+                                  << ". Status: " << status_code << ", Details: " << details << std::endl;
+                        TelegramNotifier::sendMessage(
+                            "🚨 *CLOSE REJECTED*\n"
+                            "────────────────────────\n"
+                            "• *Ticker:* " + sig.ticker + "\n"
+                            "• *Status Code:* " + status_code + "\n"
+                            "• *Details:* `" + details + "`"
+                        );
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "💥 Runtime Exception closing position for " << sig.ticker << ": " << e.what() << std::endl;
+            }
+            return;
+        }
+
+        // --- BUY ROUTING: Open new position with trailing stop ---
+        if (sig.action == "BUY") {
+            // RSI floor/ceiling gate — block trades that violate backtest rules
+            if (sig.rsi < 30.0) {
+                Logger::log("WARN", "RSI gate blocked BUY for " + sig.ticker + " — RSI below floor at " + std::to_string(sig.rsi));
                 TelegramNotifier::sendMessage(
-                    "🚨 *ALPACA REJECTION*\n"
+                    "🚧 *RSI GATE BLOCK*\n"
                     "────────────────────────\n"
                     "• *Ticker:* " + sig.ticker + "\n"
-                    "• *Side:* " + sig.action + "\n"
-                    "• *Quantity:* " + std::to_string(qty) + " Shares\n"
-                    "• *Status Code:* " + status_code + "\n"
-                    "• *Details:* `" + details + "`\n"
-                    "────────────────────────"
+                    "• *Action:* BUY\n"
+                    "• *RSI:* " + std::to_string(sig.rsi) + " (Below Floor < 30)\n"
+                    "────────────────────────\n"
+                    "⚠️ _Order canceled to protect buying power._"
                 );
+                return;
             }
-        } catch (const std::exception& e) {
-            std::cerr << "💥 Runtime Exception routing order to Alpaca: " << e.what() << std::endl;
+
+            // ── Regime Gate ──────────────────────────────────────────────────────────
+            AllocationStrategy regime = regimeMachine.evaluate(
+                sig.vix, sig.spy_price, sig.spy_200_sma
+            );
+            Logger::log("INFO", "[REGIME] " + regime.log_message);
+            TelegramNotifier::sendMessage("📊 *Regime Check:* " + regime.log_message);
+            if (regime.capital_multiplier == 0.0) {
+                Logger::log("WARN", "[REGIME] RISK-OFF — new entries halted for " + sig.ticker);
+                TelegramNotifier::sendMessage(
+                    "🛑 *REGIME BLOCK: RISK-OFF*\n"
+                    "────────────────────────\n"
+                    "• *Ticker:* " + sig.ticker + "\n"
+                    "⛔ VIX ≥ 30 or SPY below 200 SMA. No new entries."
+                );
+                return;
+            }
+            // ─────────────────────────────────────────────────────────────────────────
+
+            // RULE-005: Fetch live equity — abort if unavailable (no silent fallback).
+            double live_equity = fetch_account_equity();
+            if (live_equity < 0.0) {
+                Logger::log("CRITICAL", "[EXECUTION] Aborting order for " + sig.ticker +
+                            " — could not obtain live equity.");
+                return;
+            }
+
+            // RULE-005: Size position via Kelly — abort if no mathematical edge.
+            double regime_adjusted_equity = live_equity * regime.capital_multiplier;
+            int qty = calculate_kelly_size(regime_adjusted_equity, sig.price, kellyWinRate, kellyWinLossRatio, kellyFraction);
+            if (qty < 0) {
+                Logger::log("CRITICAL", "[EXECUTION] Aborting order for " + sig.ticker +
+                            " — Kelly sizing returned no-edge signal.");
+                TelegramNotifier::sendMessage(
+                    "🚨 *CRITICAL: Kelly No-Edge*\n"
+                    "────────────────────────\n"
+                    "• *Ticker:* " + sig.ticker + "\n"
+                    "⛔ Raw Kelly ≤ 0 — strategy has no statistical edge.\n"
+                    "Order halted. Review KELLY_WIN_RATE / KELLY_WIN_LOSS_RATIO."
+                );
+                return;
+            }
+
+            // RULE-018 Condition 2 — Notional Value Ceiling (Physical Hard Gate).
+            double notional_value    = static_cast<double>(qty) * sig.price;
+            double max_notional      = live_equity * 0.10;
+            if (notional_value > max_notional) {
+                Logger::log("CRITICAL",
+                    "[RULE-018] Notional ceiling breached for " + sig.ticker +
+                    " — Notional: $" + std::to_string(notional_value) +
+                    " vs Max Allowed: $" + std::to_string(max_notional) +
+                    ". Order blocked.");
+                TelegramNotifier::sendMessage(
+                    "🚨 *CRITICAL: RULE-018 Notional Ceiling Breached*\n"
+                    "────────────────────────\n"
+                    "• *Ticker:* " + sig.ticker + "\n"
+                    "• *Notional:* $" + std::to_string(notional_value) + "\n"
+                    "⛔ Price spike detected between sizing and submission."
+                );
+                return;
+            }
+
+            try {
+                httplib::Client alpaca_cli(alpacaBaseUrl);
+                // RULE-008: Strict timeout handling
+                alpaca_cli.set_connection_timeout(std::chrono::seconds(5));
+                alpaca_cli.set_read_timeout(std::chrono::seconds(10));
+
+                httplib::Headers headers = {
+                    {"APCA-API-KEY-ID",     apiKey},
+                    {"APCA-API-SECRET-KEY", apiSec},
+                    {"Content-Type",        "application/json"}
+                };
+
+                json order_payload = {
+                    {"symbol", sig.ticker},
+                    {"qty", qty},
+                    {"side", "buy"},
+                    {"type", "market"},
+                    {"time_in_force", "day"}
+                };
+
+                std::cout << "[EXECUTION] Routing BUY order to Alpaca: " << qty << " shares of " << sig.ticker << "..." << std::endl;
+                auto res = alpaca_cli.Post("/v2/orders", headers, order_payload.dump(), "application/json");
+
+                if (res && res->status == 200) {
+                    json response_data = json::parse(res->body);
+                    std::string order_id = response_data.value("id", "UNKNOWN");
+                    std::cout << " [BUY ORDER EXECUTED] Alpaca Order ID: " << order_id << std::endl;
+                    TelegramNotifier::sendMessage(
+                        "🟢 *BUY ORDER EXECUTED*\n"
+                        "────────────────────────\n"
+                        "• *Ticker:* " + sig.ticker + "\n"
+                        "• *Quantity:* " + std::to_string(qty) + " Shares (Kelly)\n"
+                        "• *Order ID:* `" + order_id + "`"
+                    );
+
+                    // --- Place Trailing Stop Order ---
+                    if (sig.atr > 0 && sig.stop_loss_atr_multiplier > 0) {
+                        double trail_offset = sig.atr * sig.stop_loss_atr_multiplier;
+                        
+                        std::stringstream stream;
+                        stream << std::fixed << std::setprecision(2) << trail_offset;
+                        std::string trail_offset_str = stream.str();
+
+                        json sl_payload = {
+                            {"symbol", sig.ticker},
+                            {"qty", qty},
+                            {"side", "sell"},
+                            {"type", "trailing_stop"},
+                            {"time_in_force", "gtc"},
+                            {"trail_price", trail_offset_str}
+                        };
+                        
+                        std::cout << "[EXECUTION] Placing trailing stop for " << sig.ticker 
+                                  << " with trail offset $" << trail_offset_str << std::endl;
+                        auto sl_res = alpaca_cli.Post("/v2/orders", headers, sl_payload.dump(), "application/json");
+
+                        if (sl_res && sl_res->status == 200) {
+                            json sl_data = json::parse(sl_res->body);
+                            std::cout << " [TRAILING STOP PLACED] Order ID: " << sl_data.value("id", "N/A") << std::endl;
+                            TelegramNotifier::sendMessage(
+                                "🛡️ *TRAILING STOP SET*\n"
+                                "────────────────────────\n"
+                                "• *Ticker:* " + sig.ticker + "\n"
+                                "• *Trail Offset:* $" + trail_offset_str
+                            );
+                        } else {
+                            std::string sl_status = sl_res ? std::to_string(sl_res->status) : "TIMEOUT";
+                            std::string sl_details = sl_res ? sl_res->body : "No response.";
+                            std::cerr << "⚠️ [STOP-LOSS FAILED] Status: " << sl_status 
+                                      << ", Details: " << sl_details << std::endl;
+                            TelegramNotifier::sendMessage(
+                                "🚨 *STOP-LOSS FAILED*\n"
+                                "────────────────────────\n"
+                                "• *Ticker:* " + sig.ticker + "\n"
+                                "• *Status Code:* " + sl_status + "\n"
+                                "• *Details:* `" + sl_details + "`"
+                            );
+                        }
+                    } else {
+                        Logger::log("WARN", "[EXECUTION] ATR or multiplier invalid, skipping trailing stop.");
+                    }
+                } else {
+                    std::string status_code = res ? std::to_string(res->status) : "TIMEOUT";
+                    std::string details     = res ? res->body : "No response received.";
+                    std::cerr << "⚠️ [ALPACA REJECTION] BUY order failed. Status: "
+                              << status_code << ", Details: " << details << std::endl;
+                    TelegramNotifier::sendMessage(
+                        "🚨 *ALPACA REJECTION*\n"
+                        "────────────────────────\n"
+                        "• *Ticker:* " + sig.ticker + "\n"
+                        "• *Side:* BUY\n"
+                        "• *Status Code:* " + status_code + "\n"
+                        "• *Details:* `" + details + "`"
+                    );
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "💥 Runtime Exception routing BUY order to Alpaca: " << e.what() << std::endl;
+            }
         }
     }
 
@@ -510,6 +598,13 @@ public:
                             signal.atr = data["atr"].get<double>();
                         } else if (data["atr"].is_string()) {
                             signal.atr = std::stod(data["atr"].get<std::string>());
+                        }
+                    }
+                    if (data.contains("stop_loss_atr_multiplier")) {
+                        if (data["stop_loss_atr_multiplier"].is_number()) {
+                            signal.stop_loss_atr_multiplier = data["stop_loss_atr_multiplier"].get<double>();
+                        } else if (data["stop_loss_atr_multiplier"].is_string()) {
+                            signal.stop_loss_atr_multiplier = std::stod(data["stop_loss_atr_multiplier"].get<std::string>());
                         }
                     }
                     if (data.contains("vix")) {
