@@ -65,8 +65,8 @@ private:
                 return {state, 1.0, 2.0, "STATUS: RISK-ON. Volatility low. Deploying full capital."};
             
             case Regime::TRANSITION:
-                // Choppy conditions: Deploy half capital, tighten stops to 1.5x ATR
-                return {state, 0.5, 1.5, "STATUS: TRANSITION. Geopolitical chop detected. Capital cut by 50%."};
+                // Choppy conditions: Halt buys, tighten stops to 1.5x ATR
+                return {state, 0.0, 1.5, "STATUS: TRANSITION. Geopolitical chop detected. Halting new entries."};
             
             case Regime::RISK_OFF:
                 // Bear market/Crash: Halt buys, accumulate cash reserves, tight 1.0x ATR trailing stop

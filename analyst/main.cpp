@@ -315,26 +315,29 @@ int main() {
                     {"regime_state", regime_to_string(current_strategy.current_regime)},
                     {"atr", 0.0},
                     {"kelly_pct", 0.0},
-                    {"report_body", current_strategy.log_message}
+                    {"report_body", current_strategy.log_message},
+                    {"vix", snapshot.vix},
+                    {"spy_price", snapshot.spy_price},
+                    {"spy_200_sma", snapshot.spy_200_sma}
                 };
 
                 // Hit the execution container directly over the shared Docker bridge network
-                httplib::Client cli("execution-engine", 8080);
+                httplib::Client cli("execution", 8080);
                 cli.set_connection_timeout(std::chrono::seconds(5));
                 cli.set_read_timeout(std::chrono::seconds(10));
 
                 auto res = cli.Post("/webhook", payload.dump(), "application/json");
 
                 if (res && res->status == 200) {
-                    std::cout << "✅ [ANALYST] Report payload successfully dispatched to Execution Engine." << std::endl;
+                    std::cout << "[INFO] [ANALYST] Report payload successfully dispatched to Execution Engine." << std::endl;
                     success = true;
                     break;
                 } else {
-                    std::cerr << "❌ [ANALYST ERROR] Failed to route report (Attempt " << attempt << "/" << max_retries << "). Status: " 
+                    std::cerr << "[ERROR] [ANALYST] Failed to route report (Attempt " << attempt << "/" << max_retries << "). Status: " 
                               << (res ? std::to_string(res->status) : "No Response") << std::endl;
                 }
             } catch (const std::exception& e) {
-                std::cerr << "💥 [ANALYST ERROR] Ingestion pipeline exception on attempt " << attempt << ": " << e.what() << std::endl;
+                std::cerr << "[ERROR] [ANALYST] Ingestion pipeline exception on attempt " << attempt << ": " << e.what() << std::endl;
             }
 
             if (attempt < max_retries) {
@@ -345,7 +348,7 @@ int main() {
         }
 
         if (!success) {
-            std::cerr << "💥 [ANALYST CRITICAL] All retry attempts exhausted. Failed to send payload to Execution Engine." << std::endl;
+            std::cerr << "[ERROR] [ANALYST] CRITICAL: All retry attempts exhausted. Failed to send payload to Execution Engine." << std::endl;
             notifier.send("🔴 ANALYST CRITICAL: All 5 retries exhausted. The Analyst C++ brain CANNOT communicate with the Execution Engine. Manual intervention required.");
         } else {
             std::string success_message = "✅ Analyst cycle complete. " + current_strategy.log_message;
