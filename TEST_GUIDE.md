@@ -1,5 +1,29 @@
 # Test Guide for Nox
 
+## 📚 All Test Guides
+
+This repository contains comprehensive guides for testing and understanding Nox:
+
+### For Everyone
+| Guide | Purpose |
+|-------|---------|
+| **[NOX_USER_GUIDE.md](NOX_USER_GUIDE.md)** | Non-technical users: What the bot does, how to read alerts, how to monitor |
+
+### For Developers
+| Component | Guide | Purpose |
+|-----------|-------|---------|
+| **Core Logic** | [TEST_GUIDE.md](TEST_GUIDE.md) | RegimeStateMachine, Kelly sizing, MCPT unit tests |
+| **Analyst** | [ANALYST_TEST_GUIDE.md](ANALYST_TEST_GUIDE.md) | Data fetching, regime classification, signal transmission |
+| **Execution** | [EXECUTION_TEST_GUIDE.md](EXECUTION_TEST_GUIDE.md) | Order validation, routing, position sizing |
+| **Backtest** | [BACKTEST_TEST_GUIDE.md](BACKTEST_TEST_GUIDE.md) | Historical simulation, parameter optimization |
+| **Data Engines** | [DATA_ENGINE_TEST_GUIDE.md](DATA_ENGINE_TEST_GUIDE.md) | News/macro data services (America & China) |
+| **Heartbeat** | [HEARTBEAT_TEST_GUIDE.md](HEARTBEAT_TEST_GUIDE.md) | Monitoring, intelligence reports, SEC radar |
+| **Maintenance** | [TEST_MAINTENANCE_GUIDE.md](TEST_MAINTENANCE_GUIDE.md) | When and how to update test guides |
+
+**👉 Start here**: If you're adding code, read [TEST_MAINTENANCE_GUIDE.md](TEST_MAINTENANCE_GUIDE.md) to understand which guides to update.
+
+---
+
 ## Quick Start
 
 Run all tests with:
