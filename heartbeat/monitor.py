@@ -572,9 +572,10 @@ def send_status(message):
             reserved = r'_*[]()~`>#+-=|{}.!'
             return re.sub(f'([{re.escape(reserved)}])', r'\\\1', str(text))
 
+        separator = esc("-" * 24)
         status_msg = (
             f"🦅 *Nox System Health Status*\n"
-            f"\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\-\n"
+            f"{separator}\n"
             f"🧠 *Analyst Heartbeat:* Active \(Last cycle: {esc(last_audit_age)}\)\n"
             f"⚡ *Execution Engine:* {esc(exec_status)} \(Ping: {esc(exec_ping)}ms\)\n"
             f"🇨🇳 *China Data Engine:* {esc(data_status)} \(Cache updated: {esc(data_cache_age)}\)\n"
