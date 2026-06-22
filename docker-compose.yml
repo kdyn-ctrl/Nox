@@ -63,7 +63,7 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     ports:
-      - "8080:8080"
+      - "80:8080"
     networks:
       - nox_net
 
