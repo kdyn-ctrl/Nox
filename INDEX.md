@@ -121,7 +121,7 @@ Location: **`/trading/`**
 - **Tier 3** (Grade A Gamble): Entry with volume spike
 - **Tier 1** (Standard): Entry without spike
 
-**Webhook Target:** `http://<YOUR_VPS_IP>:8080/webhook`
+**Webhook Target:** `http://<YOUR_VPS_IP>/webhook`
 
 ---
 
@@ -175,7 +175,7 @@ make
 ```
 TradingView Webhooks
         ↓
-Execution Engine (localhost:8080) ← Direct IP: <YOUR_VPS_IP>:8080
+Execution Engine (localhost:8080) ← Direct IP: <YOUR_VPS_IP>:80
         ↓
 Analyst Brain ← Data Engines (Internal Network)
         ↓
