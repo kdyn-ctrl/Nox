@@ -68,7 +68,7 @@ struct TradeSignal {
     long long vol = 0;
     double atr = 0.0;
     double stop_loss_atr_multiplier = 2.0; // Default, will be overridden by payload
-    int risk_tier = 1;
+    int risk_tier = 0; // Default 0 falls back to Kelly sizing
     double vix         = 20.0;  // Default neutral — cautious but not blocking
     double spy_price   = 0.0;
     double spy_200_sma = 0.0;
@@ -339,19 +339,42 @@ private:
                 return;
             }
 
-            // RULE-005: Size position via Kelly — abort if no mathematical edge.
-            double regime_adjusted_equity = live_equity * regime.capital_multiplier;
-            int qty = calculate_kelly_size(regime_adjusted_equity, sig.price, kellyWinRate, kellyWinLossRatio, kellyFraction);
-            if (qty < 0) {
+            // --- Position Sizing (Issue #9) ---
+            int qty = 0;
+            double stop_multiplier = sig.stop_loss_atr_multiplier; // Default from payload
+
+            // Dynamic sizing based on risk_tier
+            if (sig.risk_tier == 3) {
+                Logger::log("INFO", "[RISK] Tier 3: 'Let the knife cut' — Risking 5% of capital with 3.5x ATR stop.");
+                stop_multiplier = 3.5;
+                double dollar_amount = (live_equity * regime.capital_multiplier) * 0.05;
+                if (sig.price > 0) qty = static_cast<int>(std::floor(dollar_amount / sig.price));
+            } else if (sig.risk_tier == 1) {
+                Logger::log("INFO", "[RISK] Tier 1: 'Standard' — Risking 1% of capital with 2.0x ATR stop.");
+                stop_multiplier = 2.0;
+                double dollar_amount = (live_equity * regime.capital_multiplier) * 0.01;
+                if (sig.price > 0) qty = static_cast<int>(std::floor(dollar_amount / sig.price));
+            } else {
+                // Default to Kelly Criterion if risk_tier is not 1 or 3
+                Logger::log("INFO", "[RISK] Using Kelly Criterion sizing for " + sig.ticker);
+                double regime_adjusted_equity = live_equity * regime.capital_multiplier;
+                qty = calculate_kelly_size(regime_adjusted_equity, sig.price, kellyWinRate, kellyWinLossRatio, kellyFraction);
+            }
+
+            if (qty <= 0) {
                 Logger::log("CRITICAL", "[EXECUTION] Aborting order for " + sig.ticker +
-                            " — Kelly sizing returned no-edge signal.");
-                TelegramNotifier::sendMessage(
-                    "🚨 *CRITICAL: Kelly No-Edge*\n"
-                    "────────────────────────\n"
-                    "• *Ticker:* " + sig.ticker + "\n"
-                    "⛔ Raw Kelly ≤ 0 — strategy has no statistical edge.\n"
-                    "Order halted. Review KELLY_WIN_RATE / KELLY_WIN_LOSS_RATIO."
-                );
+                            " — position sizing resulted in zero or negative shares (" + std::to_string(qty) + ").");
+                
+                // Only send the specific "no-edge" alert if Kelly was the method that failed.
+                if (sig.risk_tier != 1 && sig.risk_tier != 3) {
+                    TelegramNotifier::sendMessage(
+                        "🚨 *CRITICAL: Kelly No-Edge or Insufficient Capital*\n"
+                        "────────────────────────\n"
+                        "• *Ticker:* " + sig.ticker + "\n"
+                        "⛔ Raw Kelly ≤ 0 or insufficient capital for 1 share.\n"
+                        "Order halted. Review Kelly params or account equity."
+                    );
+                }
                 return;
             }
 
@@ -405,13 +428,13 @@ private:
                         "🟢 *BUY ORDER EXECUTED*\n"
                         "────────────────────────\n"
                         "• *Ticker:* " + sig.ticker + "\n"
-                        "• *Quantity:* " + std::to_string(qty) + " Shares (Kelly)\n"
+                        "• *Quantity:* " + std::to_string(qty) + " Shares (Dynamic Kelly)\n"
                         "• *Order ID:* `" + order_id + "`"
                     );
 
                     // --- Place Trailing Stop Order ---
-                    if (sig.atr > 0 && sig.stop_loss_atr_multiplier > 0) {
-                        double trail_offset = sig.atr * sig.stop_loss_atr_multiplier;
+                    if (sig.atr > 0 && stop_multiplier > 0) {
+                        double trail_offset = sig.atr * stop_multiplier;
                         
                         std::stringstream stream;
                         stream << std::fixed << std::setprecision(2) << trail_offset;

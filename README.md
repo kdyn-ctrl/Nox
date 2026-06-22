@@ -42,13 +42,10 @@ This is the exact sequence of operations from raw market data to a live order, i
 - Computes the 200-day Simple Moving Average from the raw bar data
 - If either fetch fails, the cycle is marked invalid and retried in 5 minutes — no stale data is ever forwarded
 
-**Step 2 — Regime Classification** `analyst/RegimeStateMachine.hpp`
+**Step 2 — Regime Classification** `shared/RegimeStateMachine.hpp`
 - Feeds VIX and SPY/SMA values into the Regime State Machine
-- Classifies current market conditions as one of three states:
-  - `RISK_ON` — VIX < 20 and SPY above 200-day SMA → full capital deployment
-  - `TRANSITION` — VIX 20–30 or SPY choppy around SMA → 50% capital deployment
-  - `RISK_OFF` — VIX ≥ 30 or SPY > 2% below SMA → all new entries halted
-- Assigns a capital multiplier (1.0 / 0.5 / 0.0) to the strategy output
+- Classifies current market conditions based on optimized thresholds (see `RegimeStateMachine.hpp` for details)
+- Assigns a capital multiplier (1.0 for RISK_ON, 0.5 for TRANSITION, 0.0 for RISK_OFF) to the strategy output
 
 **Step 3 — Signal Serialization & Transmission** `analyst/main.cpp`
 - Serializes the full regime result into a validated JSON payload
@@ -82,7 +79,7 @@ This is the exact sequence of operations from raw market data to a live order, i
 
 **Step 9 — Kelly Position Sizing** `execution/main.cpp`
 - Applies the Kelly Criterion formula: `K% = W - ((1 - W) / R)`
-- Scales result by Half-Kelly safety multiplier (0.5) to reduce variance
+- Scales result by the dynamic `KELLY_FRACTION` safety multiplier (injected via env var)
 - Hard caps: maximum 10% portfolio risk per trade, minimum 1%
 - If Kelly output is zero or negative (no statistical edge), the order is aborted with a `[CRITICAL]` log
 - Zero-share allocations are blocked — a forced 1-share purchase that exceeds the 10% cap is never permitted
@@ -188,7 +185,7 @@ Where:
   W  =  KELLY_WIN_RATE          (injected at runtime)
   R  =  KELLY_WIN_LOSS_RATIO    (injected at runtime)
 
-Adjusted Kelly  =  Raw Kelly × 0.5   (Half-Kelly safety multiplier)
+Adjusted Kelly  =  Raw Kelly × KELLY_FRACTION   (configurable safety multiplier)
 Dollar Risk     =  Live Equity × Adjusted Kelly
 Share Quantity  =  floor(Dollar Risk / Current Price)
 
@@ -202,15 +199,15 @@ Hard caps:
 
 ## Regime State Machine
 
-The `RegimeStateMachine` runs in both the analyst and execution containers. The analyst generates the regime signal; the execution engine re-validates it at order time.
+The `RegimeStateMachine` (defined in `shared/RegimeStateMachine.hpp`) is the single source of truth for market regime classification. It runs in both the analyst and execution containers. The analyst generates the initial regime signal, and the execution engine re-validates it at order time to ensure conditions have not changed.
 
-| State | Conditions | Capital Multiplier | Effect |
-|---|---|---|---|
-| `RISK_ON` | VIX < 20 AND SPY > 200-day SMA | 1.0 | Full deployment |
-| `TRANSITION` | VIX 20–30 OR SPY near SMA band | 0.5 | Half deployment |
-| `RISK_OFF` | VIX ≥ 30 OR SPY > 2% below SMA | 0.0 | All entries halted |
+The machine uses a combination of the VIX index and the S&P 500's price relative to its 200-day moving average to classify the market into one of three states. The specific VIX thresholds and SMA buffer percentages are determined through walk-forward optimization and are documented within the `RegimeStateMachine.hpp` file itself. This ensures that the system's behavior is consistently governed by back-tested parameters.
 
-The machine defaults to `TRANSITION` at startup until live data resolves a valid state.
+| State | Capital Multiplier | Effect |
+|---|---|---|
+| `RISK_ON` | 1.0 | Full capital deployment |
+| `TRANSITION` | 0.5 | Reduced (50%) capital deployment |
+| `RISK_OFF` | 0.0 | All new entries halted |
 
 ---
 
