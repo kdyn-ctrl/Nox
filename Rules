@@ -27,21 +27,26 @@
   replace SPY/SMA and VIX as the primary regime triggers.
   
 [RULE-002] Regime State Classification
-  The RegimeStateMachine SHALL classify macro market conditions into exactly one of three
-  operational states at all times:
+  The RegimeStateMachine located in shared/RegimeStateMachine.hpp is the single source of truth
+  for classifying macro market conditions. It SHALL classify the market into exactly one of three
+  operational states at all times, with parameters derived from walk-forward optimization:
 
-    • RISK_ON     — VIX < 20 AND SPY price is above its 200-day SMA.
-                    Full capital deployment. Kelly multiplier = 1.0.
+    • RISK_ON     — Favorable market conditions (e.g., SPY above its 200-day SMA
+                    and VIX below the panic threshold).
+                    Full capital deployment (multiplier = 1.0).
 
-    • TRANSITION  — VIX between 20–30 OR SPY is choppy around the SMA band.
-                    Reduced deployment. Kelly multiplier = 0.5.
+    • TRANSITION  — Indeterminate market conditions (e.g., SPY is correcting
+                    towards its 200-day SMA but not in a confirmed downtrend).
+                    Reduced deployment (multiplier = 0.5).
 
-    • RISK_OFF    — VIX >= 30 OR SPY price is more than 2% below its 200-day SMA.
-                    All new entries halted. Kelly multiplier = 0.0.
+    • RISK_OFF    — Panic or high-volatility conditions (e.g., VIX spikes above the
+                    optimized threshold of 35, or SPY breaks >2% below its 200-day SMA).
+                    All new entries halted (multiplier = 0.0).
 
-  The machine defaults to TRANSITION on startup until live data resolves a valid state.
-  Future strategies (options, futures, sector ETFs) must read and respect the current regime
-  state before sizing or routing any order.
+  The exact VIX thresholds and SMA buffer percentages are defined and documented within
+  RegimeStateMachine.hpp and are subject to change based on backtest results; this rule
+  documents the intended behavior, not the specific hardcoded values. The machine defaults
+  to TRANSITION on startup until live data resolves a valid state.
 
 [RULE-003] Payload Serialization & Internal Routing
   After each evaluation, the analyst SHALL serialize the full regime result into a validated
@@ -69,7 +74,9 @@
     K% = W - ((1 - W) / R)
   Where W = win rate and R = win/loss ratio, both injected at runtime via environment
   variables (KELLY_WIN_RATE, KELLY_WIN_LOSS_RATIO). The raw Kelly output is then scaled
-  by a fixed Half-Kelly safety multiplier of 0.5 to reduce variance. Hard caps are enforced:
+  by a dynamic safety multiplier, KELLY_FRACTION, which is also injected via an
+  environment variable to allow for rapid tuning based on backtest results without
+  requiring a code change. Hard caps are enforced:
     • Maximum risk per trade: 10% of portfolio equity
     • Minimum risk per trade: 1% of portfolio equity (if strategy is active)
 

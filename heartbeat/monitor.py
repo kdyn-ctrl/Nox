@@ -803,32 +803,13 @@ def resolve_primary_document(index_url: str, headers: dict, filing_type: str = "
         return None
 
 
-def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8-K") -> None:
-    headers = {"User-Agent": "Nox/1.0 openclaw@vanhellsing.tech"}
+def analyze_and_alert(ticker: str, payload: str, filing_type: str, context: str = ""):
+    """Sends a formatted alert to Telegram after analysis by Claude."""
     try:
-        # filing_url from the EDGAR atom feed points to the INDEX page, not the
-        # document itself. Pass filing_type so resolve_primary_document looks
-        # for the correct form type in the index table (8-K or 6-K).
-        primary_url = resolve_primary_document(filing_url, headers, filing_type)
-        if not primary_url:
-            print(f"[WARN] [HEARTBEAT] Could not resolve primary document for {ticker}, skipping.", flush=True)
-            return
-
-        print(f"[INFO] [HEARTBEAT] Fetching primary {filing_type} document for {ticker}: {primary_url}", flush=True)
-        doc_res = requests.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
-        if doc_res.status_code != 200:
-            return
-
-        soup = BeautifulSoup(doc_res.text, "html.parser")
-        for element in soup(["script", "style"]):
-            element.extract()
-
-        clean_text = soup.get_text(separator="\n")
-        lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
-        cleaned_document = "\n".join(lines)
-        if len(cleaned_document) > 40000:
-            print(f"[WARN] [HEARTBEAT] Filing for {ticker} truncated from {len(cleaned_document)} to 40,000 chars.", flush=True)
-        dense_payload = cleaned_document[:40000]
+        # Truncate payload if it's still too large after potential chunking.
+        final_payload = payload[:40000]
+        if len(payload) > 40000:
+            print(f"[WARN] [HEARTBEAT] Final payload for {ticker} truncated to 40,000 chars.", flush=True)
 
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -839,15 +820,135 @@ def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8
                 f"Reply strictly in this format: "
                 f"RISK_FACTOR: [0.1 to 1.0] | SUMMARY: [One sentence]."
             ),
-            messages=[{"role": "user", "content": f"Ticker: {ticker}\n\nFiling Text:\n{dense_payload}"}]
+            messages=[{"role": "user", "content": f"Ticker: {ticker}\n\nFiling Text:\n{final_payload}"}]
         )
         analysis = response.content[0].text
-        # Chunk the alert so Telegram's 4096-char limit never cuts it off.
-        full_msg = f"🦅 *SEC Radar Alert — {filing_type}: {ticker}*\n\n`{analysis}`"
+        full_msg = f"🦅 *SEC Radar Alert — {filing_type}: {ticker}* {context}\n\n`{analysis}`"
         for chunk in smart_split(full_msg, chars_per_string=4096):
             bot.send_message(CHAT_ID, chunk, parse_mode='Markdown')
     except Exception as e:
-        print(f"Failed to process automated filing: {e}")
+        print(f"[ERROR] [HEARTBEAT] Analysis/alerting failed for {ticker}: {e}", flush=True)
+        bot.send_message(CHAT_ID, f"⚠️ Analysis failed for {ticker} filing.", parse_mode='Markdown')
+
+
+def process_heavyweight_filing(ticker: str, document: str, filing_type: str):
+    """
+    Handles large filings by breaking them into overlapping chunks, summarizing
+    each, and then performing a final analysis on the combined summaries.
+    RULE-017: Runs in a background thread to avoid blocking the SEC poller.
+    """
+    TOKEN_CHAR_RATIO = 4
+    CHUNK_SIZE = 4000 * TOKEN_CHAR_RATIO  # 16,000 chars
+    OVERLAP = 200 * TOKEN_CHAR_RATIO   # 800 chars
+
+    chunks = [
+        document[i:i + CHUNK_SIZE]
+        for i in range(0, len(document), CHUNK_SIZE - OVERLAP)
+    ]
+
+    summaries = []
+    bot.send_message(CHAT_ID,
+        f"⏳ Heavyweight filing for `{ticker}` is too large for Fast Lane (`{len(document):,}` chars). "
+        f"Breaking into {len(chunks)} overlapping chunks. Analysis will follow.",
+        parse_mode='Markdown'
+    )
+
+    for i, chunk in enumerate(chunks):
+        print(f"[INFO] [HEARTBEAT] Heavyweight: processing chunk {i+1}/{len(chunks)} for {ticker}...", flush=True)
+        try:
+            # Use a smaller, faster model for per-chunk summarization.
+            response = claude.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=512,
+                system=(
+                    "You are a summarization engine. You will receive a chunk of a "
+                    "large SEC filing. Your task is to extract the key material information. "
+                    "Be concise and focus on actionable events."
+                ),
+                messages=[{
+                    "role": "user",
+                    "content": f"Chunk {i+1}/{len(chunks)} of a {filing_type} for {ticker}:\n\n{chunk}"
+                }]
+            )
+            summaries.append(response.content[0].text)
+        except Exception as e:
+            print(f"[ERROR] [HEARTBEAT] Chunk {i+1} for {ticker} failed: {e}", flush=True)
+            summaries.append(f"[Chunk {i+1} failed to process]")
+        time.sleep(1) # Rate-limit to avoid hitting API limits.
+
+    combined_summary = "\n\n".join(summaries)
+    print(f"[INFO] [HEARTBEAT] Heavyweight: all {len(chunks)} chunks for {ticker} summarized.", flush=True)
+    analyze_and_alert(ticker, combined_summary, filing_type, context="(Heavyweight Analysis)")
+
+
+def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8-K") -> None:
+    """
+    Orchestrates the filing processing pipeline, implementing the Dynamic
+    Routing Architecture (RULE-017).
+
+    1.  Pre-processes the filing to strip HTML and extract high-value sections.
+    2.  Routes to Fast Lane (instant, synchronous) for documents under 15k tokens.
+    3.  Routes to Heavyweight Lane (background thread, chunked analysis) for
+        larger documents to prevent blocking the main SEC polling loop.
+    """
+    headers = {"User-Agent": "Nox/1.0 openclaw@vanhellsing.tech"}
+    try:
+        primary_url = resolve_primary_document(filing_url, headers, filing_type)
+        if not primary_url:
+            print(f"[WARN] [HEARTBEAT] Could not resolve primary doc for {ticker}, skipping.", flush=True)
+            return
+
+        print(f"[INFO] [HEARTBEAT] Fetching primary {filing_type} doc for {ticker}: {primary_url}", flush=True)
+        doc_res = requests.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
+        if doc_res.status_code != 200:
+            return
+
+        soup = BeautifulSoup(doc_res.text, "html.parser")
+        # Pre-processing: strip raw HTML tables, scripts, and styles.
+        for element in soup(["script", "style", "table"]):
+            element.extract()
+
+        clean_text = soup.get_text(separator="\n")
+        lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
+        cleaned_document = "\n".join(lines)
+
+        # Pre-processing: Target high-value sections like Item 1.01, 5.02, or 8.01.
+        # These items contain the most material, market-moving information.
+        item_pattern = re.compile(r"(Item\s+(1\.01|5\.02|8\.01))", re.IGNORECASE)
+        matches = list(item_pattern.finditer(cleaned_document))
+        
+        if matches:
+            print(f"[INFO] [HEARTBEAT] High-value items found in {ticker} filing. Extracting.", flush=True)
+            high_value_text = []
+            for i, match in enumerate(matches):
+                start = match.start()
+                end = matches[i+1].start() if i + 1 < len(matches) else len(cleaned_document)
+                high_value_text.append(cleaned_document[start:end])
+            dense_payload = "\n\n---\n\n".join(high_value_text)
+        else:
+            print(f"[INFO] [HEARTBEAT] No specific items found for {ticker}. Using full document.", flush=True)
+            dense_payload = cleaned_document
+
+        # --- Dynamic Routing Architecture (RULE-017) ---
+        TOKEN_CHAR_RATIO = 4
+        FAST_LANE_TOKEN_LIMIT = 15000
+        FAST_LANE_CHAR_LIMIT = FAST_LANE_TOKEN_LIMIT * TOKEN_CHAR_RATIO
+
+        if len(dense_payload) <= FAST_LANE_CHAR_LIMIT:
+            # FAST LANE: Process synchronously.
+            print(f"[INFO] [HEARTBEAT] Routing {ticker} filing to FAST LANE ({len(dense_payload):,} chars).", flush=True)
+            analyze_and_alert(ticker, dense_payload, filing_type, context="(Fast Lane)")
+        else:
+            # HEAVYWEIGHT LANE: Process in a background thread to avoid blocking.
+            print(f"[INFO] [HEARTBEAT] Routing {ticker} filing to HEAVYWEIGHT LANE ({len(dense_payload):,} chars).", flush=True)
+            threading.Thread(
+                target=process_heavyweight_filing,
+                args=(ticker, dense_payload, filing_type),
+                daemon=True
+            ).start()
+
+    except Exception as e:
+        print(f"[ERROR] [HEARTBEAT] Failed to process automated filing for {ticker}: {e}", flush=True)
 
 # --- 6. CORE INITIALIZATION ENGINE ---
 if __name__ == "__main__":
