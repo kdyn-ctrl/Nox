@@ -33,5 +33,13 @@ logs/
 .idea/
 *.suo
 *.ntvs*
+
+# Swap files & backups
+*.swp
+*.swo
+*~
+.*.swp
+
+# Runtime data
 data/memory_bank.db
-.env 
+.env
