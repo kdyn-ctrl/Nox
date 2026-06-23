@@ -43,32 +43,29 @@ struct UnderlyingData {
 
 class OptionsSignalGenerator {
 public:
+    // Profile-driven constructor — all risk parameters come from the RiskProfile.
     OptionsSignalGenerator(const std::string& alpacaUrl,
                            const std::string& apiKey,
                            const std::string& apiSec,
                            const std::string& tgToken,
                            const std::string& tgChatId,
-                           double             freeCapitalAmount = 0.0,
-                           bool               autoExecute       = false,
-                           int                qtyContracts      = 1)
+                           RiskProfile        profile)
         : alpacaUrl_(alpacaUrl)
         , apiKey_(apiKey)
         , apiSec_(apiSec)
         , tgToken_(tgToken)
         , tgChatId_(tgChatId)
-        , freeCapitalAmount_(freeCapitalAmount)
-        , autoExecute_(autoExecute)
-        , qtyContracts_(qtyContracts)
+        , profile_(std::move(profile))
     {}
 
     // Entry point — called once per scan cycle from the engine's background thread.
-    void run_scan(const std::vector<std::string>& watchlist, double live_equity) {
-        // Resolve effective capital and tier
+    void run_scan(double live_equity) {
+        const auto& watchlist = profile_.watchlist;
         double effective_capital = resolveCapital(live_equity);
         std::string tier         = computeCapitalTier(effective_capital);
-        bool  fc_mode            = (freeCapitalAmount_ > 0.0);
+        bool  fc_mode            = (profile_.free_capital_amount > 0.0);
 
-        log("INFO", "[OPTIONS_SCAN] Tier=" + tier +
+        log("INFO", "[OPTIONS_SCAN][" + profile_.name + "] Tier=" + tier +
             " | Capital=$" + fmt(effective_capital, 0) +
             " | Tickers=" + std::to_string(watchlist.size()));
 
@@ -106,9 +103,7 @@ private:
     std::string apiSec_;
     std::string tgToken_;
     std::string tgChatId_;
-    double      freeCapitalAmount_;
-    bool        autoExecute_;
-    int         qtyContracts_;
+    RiskProfile profile_;
     RegimeStateMachine regimeMachine_;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -126,7 +121,7 @@ private:
     // ── Capital / tier logic ──────────────────────────────────────────────────
 
     double resolveCapital(double live_equity) const {
-        if (freeCapitalAmount_ > 0.0) return freeCapitalAmount_;
+        if (profile_.free_capital_amount > 0.0) return profile_.free_capital_amount;
         return live_equity;
     }
 
@@ -137,38 +132,40 @@ private:
         return "STARTER";
     }
 
-    // Risk dollars per trade — scales with tier / free-capital mode
-    static double computeMaxRisk(double capital, const std::string& tier) {
-        if (tier == "FREE_CAPITAL") return capital * 0.015; // 1.5% of custom capital
-        if (tier == "ADVANCED")     return capital * 0.020; // 2%
-        if (tier == "STANDARD")     return capital * 0.015; // 1.5%
-        return capital * 0.010;                              // 1% STARTER
+    // Risk dollars per trade — uses profile-specific percentages
+    double computeMaxRisk(double capital, const std::string& tier) const {
+        if (tier == "FREE_CAPITAL") return capital * profile_.risk_pct_free;
+        if (tier == "ADVANCED")     return capital * profile_.risk_pct_advanced;
+        if (tier == "STANDARD")     return capital * profile_.risk_pct_standard;
+        return capital * profile_.risk_pct_starter;
     }
 
-    // Returns true if a strategy is allowed for the given tier
-    static bool strategyAllowed(const std::string& strategy, const std::string& tier) {
-        // STARTER: long directional only
+    // Returns true if a strategy is allowed — tier gates honoured only when enforce_tier_gates is set
+    bool strategyAllowed(const std::string& strategy, const std::string& tier) const {
+        if (!profile_.enforce_tier_gates) return true; // personal: all strategies open
+
         if (tier == "STARTER") {
             return strategy == "LONG_CALL" || strategy == "LONG_PUT";
         }
-        // STANDARD: + income strategies
         if (tier == "STANDARD") {
             return strategy == "LONG_CALL"  || strategy == "LONG_PUT" ||
                    strategy == "CSP"        || strategy == "CC";
         }
-        // ADVANCED / FREE_CAPITAL: everything
-        return true;
+        return true; // ADVANCED / FREE_CAPITAL
     }
 
     // ── Regime confidence multiplier ──────────────────────────────────────────
 
-    static double regimeConfidence(Regime r, const std::string& strategy) {
+    double regimeConfidence(Regime r, const std::string& strategy) const {
         bool is_long_premium = (strategy == "LONG_CALL"  || strategy == "LONG_PUT" ||
                                 strategy == "BULL_CALL_SPREAD" || strategy == "BEAR_PUT_SPREAD" ||
                                 strategy == "STRADDLE"   || strategy == "STRANGLE");
 
-        if (r == Regime::RISK_OFF && is_long_premium) return 0.0; // suppressed
-        if (r == Regime::TRANSITION)                  return 0.5;
+        if (r == Regime::RISK_OFF && is_long_premium) {
+            // Bot: hard suppress. Personal: show warning (50% confidence) but don't block.
+            return profile_.enforce_regime_gate ? 0.0 : 0.50;
+        }
+        if (r == Regime::TRANSITION) return 0.65;
         return 1.0; // RISK_ON
     }
 
@@ -366,45 +363,47 @@ private:
     // Long premium preferred when IV Rank < 30 (cheap vol)
     // Short premium preferred when IV Rank > 50 (expensive vol)
 
-    static std::string selectStrategy(DirectionalBias bias, double iv_rank,
-                                      const std::string& tier) {
+    std::string selectStrategy(DirectionalBias bias, double iv_rank,
+                               const std::string& tier) const {
+        const double buy_max  = profile_.iv_rank_buy_max;
+        const double sell_min = profile_.iv_rank_sell_min;
+
         if (bias == DirectionalBias::Bullish) {
-            if (iv_rank < 30) {
+            if (iv_rank <= buy_max) {
                 if (strategyAllowed("BULL_CALL_SPREAD", tier)) return "BULL_CALL_SPREAD";
                 return "LONG_CALL";
             }
-            if (iv_rank > 50) {
-                if (strategyAllowed("CSP", tier)) return "CSP"; // cash-secured put (bullish income)
+            if (iv_rank >= sell_min) {
+                if (strategyAllowed("CSP", tier)) return "CSP";
                 return "LONG_CALL";
             }
-            // iv_rank 30–50 neutral zone
+            // neutral zone between buy_max and sell_min
             if (strategyAllowed("BULL_CALL_SPREAD", tier)) return "BULL_CALL_SPREAD";
             return "LONG_CALL";
         }
 
         if (bias == DirectionalBias::Bearish) {
-            if (iv_rank < 30) {
+            if (iv_rank <= buy_max) {
                 if (strategyAllowed("BEAR_PUT_SPREAD", tier)) return "BEAR_PUT_SPREAD";
                 return "LONG_PUT";
             }
-            if (iv_rank > 50) {
-                if (strategyAllowed("CC", tier)) return "CC"; // covered call (bearish hedge income)
+            if (iv_rank >= sell_min) {
+                if (strategyAllowed("CC", tier)) return "CC";
                 return "LONG_PUT";
             }
             if (strategyAllowed("BEAR_PUT_SPREAD", tier)) return "BEAR_PUT_SPREAD";
             return "LONG_PUT";
         }
 
-        // Neutral
-        if (iv_rank < 25) {
+        // Neutral — vol expansion play or income
+        if (iv_rank < buy_max * 0.8) { // well below buy threshold → straddle
             if (strategyAllowed("STRADDLE", tier)) return "STRADDLE";
         }
-        if (iv_rank > 50) {
+        if (iv_rank >= sell_min) {
             if (strategyAllowed("STRANGLE", tier)) return "STRANGLE";
         }
-        // Default neutral income
         if (strategyAllowed("CSP", tier)) return "CSP";
-        return "LONG_CALL"; // last resort for STARTER tier
+        return "LONG_CALL";
     }
 
     // ── Contract parameter construction ───────────────────────────────────────
@@ -420,17 +419,18 @@ private:
         std::string expiry_date;
     };
 
-    static ContractParams buildContractParams(const std::string& strategy,
-                                              double spot, double atr,
-                                              double rfr, double iv_sigma) {
+    ContractParams buildContractParams(const std::string& strategy,
+                                       double spot, double atr,
+                                       double rfr, double iv_sigma) const {
         ContractParams p;
 
-        // Target DTE in calendar days → fraction of year
-        int target_dte = 45;
-        if (strategy == "CSP" || strategy == "CC")                    target_dte = 30;
-        else if (strategy == "STRADDLE" || strategy == "STRANGLE")    target_dte = 30;
-        else if (strategy == "LONG_CALL" || strategy == "LONG_PUT")   target_dte = 45;
-        else                                                           target_dte = 45; // spreads
+        // Target DTE from profile
+        int target_dte = profile_.dte_long;
+        if (strategy == "CSP" || strategy == "CC")
+            target_dte = profile_.dte_income;
+        else if (strategy == "STRADDLE" || strategy == "STRANGLE" ||
+                 strategy == "BULL_CALL_SPREAD" || strategy == "BEAR_PUT_SPREAD")
+            target_dte = profile_.dte_spread;
 
         p.expiry = target_dte / 365.0;
 
@@ -472,31 +472,31 @@ private:
             return best_strike;
         };
 
+        const double d_long = profile_.delta_long;
+        const double d_inc  = profile_.delta_income;
+        const double d_wing = profile_.delta_spread_wing;
+
         if (strategy == "LONG_CALL") {
-            p.strike = findStrikeForDelta(0.45, nox::options::OptionType::Call);
+            p.strike = findStrikeForDelta(d_long, nox::options::OptionType::Call);
         } else if (strategy == "LONG_PUT") {
-            p.strike = findStrikeForDelta(0.45, nox::options::OptionType::Put);
+            p.strike = findStrikeForDelta(d_long, nox::options::OptionType::Put);
         } else if (strategy == "CSP") {
-            // Sell OTM put below spot
-            p.strike = findStrikeForDelta(0.25, nox::options::OptionType::Put);
+            p.strike = findStrikeForDelta(d_inc, nox::options::OptionType::Put);
         } else if (strategy == "CC") {
-            // Sell OTM call above spot
-            p.strike = findStrikeForDelta(0.25, nox::options::OptionType::Call);
+            p.strike = findStrikeForDelta(d_inc, nox::options::OptionType::Call);
         } else if (strategy == "BULL_CALL_SPREAD") {
-            p.strike  = findStrikeForDelta(0.45, nox::options::OptionType::Call); // buy leg
-            p.strike2 = findStrikeForDelta(0.20, nox::options::OptionType::Call); // sell leg
+            p.strike  = findStrikeForDelta(d_long, nox::options::OptionType::Call);
+            p.strike2 = findStrikeForDelta(d_wing, nox::options::OptionType::Call);
             if (p.strike2 <= p.strike) p.strike2 = p.strike + atr;
         } else if (strategy == "BEAR_PUT_SPREAD") {
-            p.strike  = findStrikeForDelta(0.45, nox::options::OptionType::Put); // buy leg
-            p.strike2 = findStrikeForDelta(0.20, nox::options::OptionType::Put); // sell leg
+            p.strike  = findStrikeForDelta(d_long, nox::options::OptionType::Put);
+            p.strike2 = findStrikeForDelta(d_wing, nox::options::OptionType::Put);
             if (p.strike2 >= p.strike) p.strike2 = p.strike - atr;
         } else if (strategy == "STRADDLE") {
-            // ATM call + ATM put, same strike
             p.strike = std::round(spot);
         } else if (strategy == "STRANGLE") {
-            // OTM call + OTM put
-            p.strike  = findStrikeForDelta(0.25, nox::options::OptionType::Call); // call side
-            p.strike2 = findStrikeForDelta(0.25, nox::options::OptionType::Put);  // put side
+            p.strike  = findStrikeForDelta(d_inc, nox::options::OptionType::Call);
+            p.strike2 = findStrikeForDelta(d_inc, nox::options::OptionType::Put);
         }
         return p;
     }
@@ -626,7 +626,8 @@ private:
         }
 
         // Rationale
-        sig.rationale = buildRationale(strategy, d, iv_rank);
+        sig.rationale    = buildRationale(strategy, d, iv_rank);
+        sig.profile_name = profile_.name;
         return sig;
     }
 
@@ -686,7 +687,7 @@ private:
                             : "NEUTRAL";
 
         std::string alert =
-            "📊 *OPTIONS SIGNAL — " + s.underlying + "* [" + s.capital_tier + "]\n"
+            "📊 *OPTIONS SIGNAL — " + s.underlying + "* [" + s.profile_name + " · " + s.capital_tier + "]\n"
             "────────────────────────────────────\n"
             "🎯 *Strategy:* " + strategy_label + "\n"
             "📅 *Expiry:* " + s.expiry_date + "\n"
@@ -791,7 +792,7 @@ private:
         log("INFO", "[OPTIONS_SCAN] Signal emitted: " + ticker + " / " + strategy +
             " | conf=" + fmt(conf * 100.0, 0) + "%");
 
-        if (autoExecute_) {
+        if (profile_.auto_execute) {
             executeSignal(sig);
         }
     }
@@ -804,7 +805,7 @@ private:
         // header for ODR compliance; the router is instantiated per-signal, which is
         // fine given the low frequency of options scans.
         nox::options_router::OptionsOrderRouter router(alpacaUrl_, apiKey_, apiSec_);
-        auto result = router.route(sig, qtyContracts_);
+        auto result = router.route(sig, profile_.qty_contracts);
 
         if (result.success) {
             log("INFO", "[OPTIONS_EXEC] Order placed — " + result.message);
@@ -813,7 +814,7 @@ private:
                 "────────────────────────\n"
                 "• *Ticker:* " + sig.underlying + "\n"
                 "• *Strategy:* " + sig.strategy + "\n"
-                "• *Contracts:* " + std::to_string(qtyContracts_) + "\n"
+                "• *Contracts:* " + std::to_string(profile_.qty_contracts) + "\n"
                 "• *Expiry:* " + sig.expiry_date + "\n"
                 "• *Order ID:* `" + result.order_id + "`"
             );

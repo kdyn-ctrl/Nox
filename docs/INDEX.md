@@ -105,7 +105,8 @@ Location: **`/docs/`**
 
 | Document | Purpose |
 |----------|---------|
-| [NOX_USER_GUIDE.md](docs/NOX_USER_GUIDE.md) | System setup, operation, options signals, and signal troubleshooting |
+| **[NOX_COMPLETE_GUIDE.md](docs/NOX_COMPLETE_GUIDE.md)** | **Full system guide — start here. Covers every feature end-to-end in plain English** |
+| [NOX_USER_GUIDE.md](docs/NOX_USER_GUIDE.md) | Original user guide — signal troubleshooting, options how-to |
 | [DOCUMENTATION_OVERVIEW.md](docs/DOCUMENTATION_OVERVIEW.md) | Architecture and design |
 | [DOCUMENTATION_SUMMARY.txt](docs/DOCUMENTATION_SUMMARY.txt) | Quick reference |
 
