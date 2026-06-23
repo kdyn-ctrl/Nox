@@ -507,24 +507,31 @@ def send_status(message):
     recorded timestamps, returning a structured health dashboard.
     """
     try:
+        print("[STATUS CMD] Received /status command. Beginning health checks.", flush=True)
+
         # --- 1. Ping Core Services ---
         exec_status, exec_ping = "OFFLINE", -1
         try:
             start_time = time.time()
             exec_res = requests.get("http://execution-engine:8080/health", timeout=HTTP_TIMEOUT)
+            print(f"[STATUS CMD] Execution Engine response: {exec_res.status_code}", flush=True)
             if exec_res.status_code == 200:
                 data = exec_res.json()
+                print(f"[STATUS CMD] Execution Engine data: {data}", flush=True)
                 if data.get("status") == "healthy":
                     exec_status = "ONLINE"
                     exec_ping = int((time.time() - start_time) * 1000)
-        except (requests.RequestException, ValueError):
+        except (requests.RequestException, ValueError) as e:
+            print(f"[STATUS CMD] Execution Engine check failed: {e}", flush=True)
             pass  # Status remains OFFLINE
 
         data_status, data_cache_age = "OFFLINE", "N/A"
         try:
             data_res = requests.get("http://china-data-engine:8000/health", timeout=HTTP_TIMEOUT)
+            print(f"[STATUS CMD] China Data Engine response: {data_res.status_code}", flush=True)
             if data_res.status_code == 200:
                 health_data = data_res.json()
+                print(f"[STATUS CMD] China Data Engine data: {health_data}", flush=True)
                 if health_data.get("status") == "healthy":
                     data_status = "ONLINE"
                     last_updated_str = health_data.get("last_updated_utc")
@@ -532,14 +539,17 @@ def send_status(message):
                         last_updated = datetime.fromisoformat(last_updated_str.replace("Z", "+00:00"))
                         age = datetime.now(ZoneInfo("UTC")) - last_updated
                         data_cache_age = f"{int(age.total_seconds() // 60)}m ago"
-        except (requests.RequestException, ValueError):
+        except (requests.RequestException, ValueError) as e:
+            print(f"[STATUS CMD] China Data Engine check failed: {e}", flush=True)
             pass # Status remains OFFLINE
 
         america_data_status, america_data_cache_age = "OFFLINE", "N/A"
         try:
             america_data_res = requests.get("http://america-data-engine:8001/health", timeout=HTTP_TIMEOUT)
+            print(f"[STATUS CMD] America Data Engine response: {america_data_res.status_code}", flush=True)
             if america_data_res.status_code == 200:
                 health_data = america_data_res.json()
+                print(f"[STATUS CMD] America Data Engine data: {health_data}", flush=True)
                 if health_data.get("status") == "healthy":
                     america_data_status = "ONLINE"
                     last_updated_str = health_data.get("last_updated_utc")
@@ -547,10 +557,12 @@ def send_status(message):
                         last_updated = datetime.fromisoformat(last_updated_str.replace("Z", "+00:00"))
                         age = datetime.now(ZoneInfo("UTC")) - last_updated
                         america_data_cache_age = f"{int(age.total_seconds() // 60)}m ago"
-        except (requests.RequestException, ValueError):
+        except (requests.RequestException, ValueError) as e:
+            print(f"[STATUS CMD] America Data Engine check failed: {e}", flush=True)
             pass # Status remains OFFLINE
 
         # --- 2. Query Memory Bank ---
+        print("[STATUS CMD] Querying Memory Bank...", flush=True)
         with db_lock:
             with sqlite3.connect(DB_PATH) as conn:
                 c = conn.cursor()
@@ -566,28 +578,31 @@ def send_status(message):
                 audit_count = c.fetchone()[0]
                 c.execute("SELECT COUNT(*) FROM processed_filings")
                 filing_count = c.fetchone()[0]
+        print(f"[STATUS CMD] DB query successful: Last audit {last_audit_age}, {audit_count} audits, {filing_count} filings.", flush=True)
 
         # --- 3. Assemble Dashboard ---
-        # Use a plain helper to escape all MarkdownV2 reserved characters.
-        # MarkdownV2 requires escaping: _ * [ ] ( ) ~ ` > # + - = | { } . !
+        # Escape only values that might contain MarkdownV2 reserved characters.
         def esc(text: str) -> str:
             reserved = r'_*[]()~`>#+-=|{}.!'
             return re.sub(f'([{re.escape(reserved)}])', r'\\\1', str(text))
 
-        separator = esc("-" * 24)
+        separator = "─" * 24  # Use box drawing character instead of hyphens
         status_msg = (
             f"🦅 *Nox System Health Status*\n"
             f"{separator}\n"
-            f"🧠 *Analyst Heartbeat:* Active \(Last cycle: {esc(last_audit_age)}\)\n"
-            f"⚡ *Execution Engine:* {esc(exec_status)} \(Ping: {esc(exec_ping)}ms\)\n"
-            f"🇨🇳 *China Data Engine:* {esc(data_status)} \(Cache updated: {esc(data_cache_age)}\)\n"
-            f"🇺🇸 *America Data Engine:* {esc(america_data_status)} \(Cache updated: {esc(america_data_cache_age)}\)\n"
-            f"📚 *Memory Bank:* {esc(audit_count)} Audits \| {esc(filing_count)} Processed Filings\n"
+            f"🧠 *Analyst Heartbeat:* Active \\(Last cycle: {last_audit_age}\\)\n"
+            f"⚡ *Execution Engine:* {exec_status} \\(Ping: {exec_ping}ms\\)\n"
+            f"🇨🇳 *China Data Engine:* {data_status} \\(Cache updated: {data_cache_age}\\)\n"
+            f"🇺🇸 *America Data Engine:* {america_data_status} \\(Cache updated: {america_data_cache_age}\\)\n"
+            f"📚 *Memory Bank:* {audit_count} Audits \\| {filing_count} Processed Filings\n"
             f"📊 *Current Market Regime:* `RISK_ON`"
         )
+        print(f"[STATUS CMD] Assembled status message:\n{status_msg}", flush=True)
         bot.reply_to(message, status_msg, parse_mode='MarkdownV2')
+        print("[STATUS CMD] Successfully sent status message.", flush=True)
 
     except Exception as e:
+        print(f"[STATUS CMD] An unexpected error occurred: {e}", flush=True)
         bot.reply_to(message, f"⚠️ Failed to retrieve status: {str(e)}")
 
 @bot.message_handler(commands=['history'])
