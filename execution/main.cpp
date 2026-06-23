@@ -161,6 +161,7 @@ private:
     double      kellyWinLossRatio;
     double      kellyFraction;
     RegimeStateMachine regimeMachine;
+    std::string last_analyst_report_time;
 
     // RULE-005: Fetch live equity with exponential-backoff retry (2s -> 4s -> 8s).
     // Returns -1.0 on total failure — callers MUST NOT proceed with any fallback.
@@ -572,6 +573,13 @@ public:
             res.set_content(health_response.dump(), "application/json");
         });
 
+        svr.Get("/last-report", [this](const httplib::Request &, httplib::Response &res) {
+            json response = {
+                {"last_analyst_report", last_analyst_report_time.empty() ? "Never" : last_analyst_report_time}
+            };
+            res.set_content(response.dump(), "application/json");
+        });
+
         svr.Post("/webhook", [this](const httplib::Request& req, httplib::Response& res) {
             std::string body = req.body;
             int success_count = 0;
@@ -658,6 +666,14 @@ public:
                     if (signal.action == "REPORT") {
                         if (data.contains("report_body")) {
                             Logger::log("INFO", "[EXECUTION] Analyst report: " + data.value("report_body", ""));
+                        }
+                        // Update the last analyst report timestamp
+                        if (signal.ticker == "GLOBAL_AUDIT") {
+                            auto now = std::chrono::system_clock::now();
+                            auto time_t = std::chrono::system_clock::to_time_t(now);
+                            std::stringstream ss;
+                            ss << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ");
+                            last_analyst_report_time = ss.str();
                         }
                         success_count++;
                         return;
