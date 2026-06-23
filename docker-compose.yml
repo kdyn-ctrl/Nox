@@ -68,8 +68,6 @@ services:
       - "traefik.http.routers.execution-webhook.entrypoints=web,websecure"
       - "traefik.http.routers.execution-webhook.tls.certresolver=letsencrypt"
       - "traefik.http.services.execution-webhook.loadbalancer.server.port=8080"
-    ports:
-      - "8080:8080"
     networks:
       - nox_net
 
