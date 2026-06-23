@@ -553,7 +553,25 @@ def send_status(message):
             print(f"[STATUS CMD] America Data Engine check failed: {e}", flush=True)
             pass # Status remains OFFLINE
 
-        # --- 2. Query Memory Bank ---
+        # --- 2. Query Analyst Heartbeat from Execution Engine ---
+        analyst_heartbeat = "Never"
+        try:
+            analyst_res = requests.get("http://execution-engine:8080/last-report", timeout=HTTP_TIMEOUT)
+            print(f"[STATUS CMD] Analyst heartbeat response: {analyst_res.status_code}", flush=True)
+            if analyst_res.status_code == 200:
+                analyst_data = analyst_res.json()
+                last_report_str = analyst_data.get("last_analyst_report", "Never")
+                if last_report_str != "Never":
+                    last_report = datetime.fromisoformat(last_report_str.replace("Z", "+00:00"))
+                    age = datetime.now(ZoneInfo("UTC")) - last_report
+                    analyst_heartbeat = f"{int(age.total_seconds() // 3600)}h ago"
+                else:
+                    analyst_heartbeat = "Never"
+        except (requests.RequestException, ValueError) as e:
+            print(f"[STATUS CMD] Analyst heartbeat check failed: {e}", flush=True)
+            analyst_heartbeat = "Error"
+
+        # --- 3. Query Memory Bank ---
         print("[STATUS CMD] Querying Memory Bank...", flush=True)
         with db_lock:
             with sqlite3.connect(DB_PATH) as conn:
@@ -584,7 +602,7 @@ def send_status(message):
         status_msg = (
             f"🦅 *Nox System Health Status*\n"
             f"{separator}\n"
-            f"🧠 *Analyst Heartbeat:* Active \\(Last cycle: {esc(last_audit_age)}\\)\n"
+            f"🧠 *Analyst Heartbeat:* Active \\(Last cycle: {esc(analyst_heartbeat)}\\)\n"
             f"⚡ *Execution Engine:* {esc(exec_status)} \\(Ping: {esc(exec_ping)}ms\\)\n"
             f"🇨🇳 *China Data Engine:* {esc(data_status)} \\(Cache updated: {esc(data_cache_age)}\\)\n"
             f"🇺🇸 *America Data Engine:* {esc(america_data_status)} \\(Cache updated: {esc(america_data_cache_age)}\\)\n"
