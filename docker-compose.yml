@@ -62,8 +62,14 @@ services:
       - KELLY_FRACTION=${KELLY_FRACTION}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.execution-webhook.rule=Path(`/webhook`)"
+      - "traefik.http.routers.execution-webhook.entrypoints=web,websecure"
+      - "traefik.http.routers.execution-webhook.tls.certresolver=letsencrypt"
+      - "traefik.http.services.execution-webhook.loadbalancer.server.port=8080"
     ports:
-      - "80:8080"
+      - "8080:8080"
     networks:
       - nox_net
 
