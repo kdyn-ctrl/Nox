@@ -2,7 +2,7 @@
 
 Nox is a containerized, multi-agent quantitative trading framework built for automated macro regime classification, risk-managed position sizing, and low-latency order execution. The system is written in C++ and Python, deployed across three isolated Docker containers that communicate exclusively over a private internal network.
 
-Designed and maintained by a self-directed quantitative developer targeting systematic, rules-based exposure to US equity and crypto markets.
+Designed and maintained by a self-directed quantitative developer targeting systematic, rules-based exposure to US equity, crypto, and **Chinese A-share markets**.
 
 ---
 
@@ -14,9 +14,10 @@ Designed and maintained by a self-directed quantitative developer targeting syst
 5. [Three-Gate Execution Model](#three-gate-execution-model)
 6. [Kelly Position Sizing](#kelly-position-sizing)
 7. [Regime State Machine](#regime-state-machine)
-8. [Observability & Memory Bank](#observability--memory-bank)
-9. [Safety Rules & Design Contracts](#safety-rules--design-contracts)
-10. [Deployment](#deployment)
+8. [Chinese A-Share Constraints](#chinese-a-share-constraints)
+9. [Observability & Memory Bank](#observability--memory-bank)
+10. [Safety Rules & Design Contracts](#safety-rules--design-contracts)
+11. [Deployment](#deployment)
 
 ---
 
@@ -83,6 +84,17 @@ This is the exact sequence of operations from raw market data to a live order, i
 - Hard caps: maximum 10% portfolio risk per trade, minimum 1%
 - If Kelly output is zero or negative (no statistical edge), the order is aborted with a `[CRITICAL]` log
 - Zero-share allocations are blocked — a forced 1-share purchase that exceeds the 10% cap is never permitted
+
+**Step 9a — Chinese A-Share Board-Lot Truncation** `execution/main.cpp` *(CN-RULE-001)*
+- After Kelly sizing, the raw share quantity is truncated down to the nearest multiple of `CN_BOARD_LOT_SIZE` (default 100)
+- A-share exchanges reject any order not in a whole lot (一手, 100 shares minimum)
+- If truncation reduces the quantity to zero the trade is aborted with `[CRITICAL]` log and Telegram alert
+
+**Step 9b — Chinese A-Share T+1 Settlement Gate** `execution/main.cpp` *(CN-RULE-002)*
+- On every confirmed BUY, the entry date is recorded in memory and persisted to `CN_POSITIONS_PATH`
+- On every SELL signal, the engine verifies the sell date is strictly later than the entry date
+- If `sell_date == entry_date` the signal is discarded — same-day round-trips are prohibited on all A-share boards
+- State survives engine restarts; stale entries (entry_date before today) are pruned at load time
 
 **Step 10 — Order Routing** `execution/main.cpp`
 - Constructs a validated Alpaca order payload with the Kelly-calculated share quantity
@@ -211,6 +223,46 @@ The machine uses a combination of the VIX index and the S&P 500's price relative
 
 ---
 
+## Chinese A-Share Constraints
+
+The execution engine enforces two rules that are unique to Chinese A-share (沪深 A股) markets and have no equivalent in US equity execution.
+
+### CN-RULE-001 — Board-Lot Truncation (手, shǒu)
+
+A-share exchanges accept orders only in multiples of 100 shares (one lot / 一手). After the Kelly calculator (or fixed-tier sizing) produces a raw share quantity, the engine truncates to the nearest lower multiple before constructing the order payload.
+
+```
+Raw Kelly qty:  345 shares
+Board-lot size: 100
+Submitted qty:  300 shares   ← 300 = (345 ÷ 100) × 100
+```
+
+If truncation reduces the quantity to zero (e.g., Kelly allocates 60 shares), the trade is **aborted** — the engine will not submit a sub-lot order or round up. A `[CRITICAL]` log and Telegram alert are fired.
+
+The lot size is configurable via the `CN_BOARD_LOT_SIZE` environment variable (default: `100`). This lets the engine adapt if future board rules change without requiring a code rebuild.
+
+### CN-RULE-002 — T+1 Settlement (T+1交割制度)
+
+Chinese A-share markets prohibit same-day round-trips. A position purchased on trading day **T** cannot be sold until day **T+1** or later. The engine enforces this at the signal level:
+
+1. On a confirmed BUY, the entry date is recorded in an in-memory map and persisted to disk at `CN_POSITIONS_PATH` (default: `/tmp/china_positions.json`).
+2. On every SELL signal, the engine looks up the entry date for that ticker. If `sell_date == entry_date`, the signal is **silently discarded** — no order is placed, a `[CRITICAL]` log is emitted, and a Telegram alert is sent.
+3. On a confirmed SELL, the entry record is evicted from both memory and disk.
+4. On engine restart, the persistence file is reloaded. Records with an entry date before today are automatically pruned (they are at minimum T+1 old and the restriction has lifted).
+
+**Backtester mode:** The signal payload may include a `trade_date` field (`"YYYY-MM-DD"`) to inject the simulation clock date. If absent, the engine uses the current system date. All backtester-generated signals **must** include this field or the T+1 gate will compare against today's wall-clock date, which is almost always T+N and will never block correctly.
+
+**Important:** The gate has no override flag. To manually close a same-day position (e.g., a stop-loss triggered by the broker), use the broker dashboard directly — this is correct behavior, as the exchange itself enforces T+1 and will reject a same-day sell.
+
+### Environment Variables (China-Specific)
+
+| Variable | Default | Description |
+|---|---|---|
+| `CN_BOARD_LOT_SIZE` | `100` | Lot size for board-lot truncation (CN-RULE-001) |
+| `CN_POSITIONS_PATH` | `/tmp/china_positions.json` | Persistence path for T+1 position state (CN-RULE-002) |
+
+---
+
 ## Observability & Memory Bank
 
 Every order, regime transition, and SEC alert produces both a structured stdout log and a Telegram notification. Silent execution is not permitted by design.
@@ -249,6 +301,8 @@ All rules are documented in full in the `Rules` file. Summary of non-negotiable 
 | RULE-014 | All trading validated on Alpaca Paper first — `ALPACA_BASE_URL` controls paper vs live |
 | RULE-015 | AI models never determine trade size, side, or price — only deterministic C++ does |
 | RULE-018 | Zero-share Kelly results are hard-blocked — no forced minimum purchase |
+| CN-RULE-001 | A-share orders truncated to nearest lot (`CN_BOARD_LOT_SIZE`); sub-lot results abort the trade |
+| CN-RULE-002 | T+1 gate blocks same-day sells; entry dates persisted across restarts via `CN_POSITIONS_PATH` |
 
 ---
 
@@ -263,10 +317,15 @@ ALPACA_BASE_URL=https://paper-api.alpaca.markets
 WEBHOOK_SECRET_TOKEN=
 KELLY_WIN_RATE=
 KELLY_WIN_LOSS_RATIO=
+KELLY_FRACTION=0.15
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 ANTHROPIC_API_KEY=
 ANALYST_CYCLE_HOURS=6
+
+# Chinese A-share constraints (optional — defaults shown)
+CN_BOARD_LOT_SIZE=100
+CN_POSITIONS_PATH=/tmp/china_positions.json
 ```
 
 **Start the system:**

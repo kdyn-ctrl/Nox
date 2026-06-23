@@ -2,6 +2,8 @@
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 #include "../shared/RegimeStateMachine.hpp"
+#include "OptionEngine.hpp"
+#include "OptionsSignalGenerator.hpp"
 #include <iostream>
 #include <string>
 #include <cmath>
@@ -9,6 +11,9 @@
 #include <chrono>
 #include <sstream>
 #include <iomanip>
+#include <map>
+#include <mutex>
+#include <fstream>
 
 using json = nlohmann::json;
 
@@ -72,6 +77,15 @@ struct TradeSignal {
     double vix         = 20.0;  // Default neutral — cautious but not blocking
     double spy_price   = 0.0;
     double spy_200_sma = 0.0;
+    // CN-RULE-001: Trade date used for T+1 enforcement.
+    // Backtester feeds this field; live execution defaults to today's system date.
+    std::string trade_date = "";
+};
+
+// Tracks the purchase date of an open A-share position.
+// Used exclusively by the T+1 settlement gate (CN-RULE-002).
+struct ChinaPositionRecord {
+    std::string entry_date; // "YYYY-MM-DD" format
 };
 
 // --- 3. KELLY CALCULATOR ---
@@ -160,8 +174,88 @@ private:
     double      kellyWinRate;
     double      kellyWinLossRatio;
     double      kellyFraction;
+    int         cnBoardLotSize;   // CN-RULE-001: configurable via CN_BOARD_LOT_SIZE (default 100)
+    std::string cnPositionsPath;  // path for T+1 persistence file
     RegimeStateMachine regimeMachine;
     std::string last_analyst_report_time;
+
+    // Options signal generator config
+    std::vector<std::string> optionsWatchlist_;
+    int                      optionsScanIntervalMin_;
+    double                   optionsFreeCapitalAmount_;
+    bool                     optionsAutoExecute_;
+    int                      optionsQtyContracts_;
+
+    // CN-RULE-002: T+1 position state — maps ticker → entry date.
+    // Written on confirmed BUY, read & evicted on confirmed SELL.
+    // Persisted to cnPositionsPath so state survives engine restarts.
+    // Guarded by mutex because httplib dispatches concurrent handler threads.
+    std::map<std::string, ChinaPositionRecord> china_positions_;
+    std::mutex china_positions_mutex_;
+
+    // Returns today's date as "YYYY-MM-DD" in the local system timezone.
+    static std::string get_today_date_string() {
+        auto now    = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm* tm_ptr = std::localtime(&time_t);
+        std::ostringstream oss;
+        oss << std::put_time(tm_ptr, "%Y-%m-%d");
+        return oss.str();
+    }
+
+    // Writes the current china_positions_ map to disk as JSON.
+    // Called under china_positions_mutex_ — callers must already hold the lock.
+    void persist_china_positions_locked() {
+        try {
+            json j = json::object();
+            for (const auto& kv : china_positions_) {
+                j[kv.first] = kv.second.entry_date;
+            }
+            std::ofstream f(cnPositionsPath, std::ios::trunc);
+            if (f.is_open()) {
+                f << j.dump(2);
+            } else {
+                Logger::log("WARN", "[CN-RULE-002] Could not open " + cnPositionsPath + " for writing.");
+            }
+        } catch (const std::exception& e) {
+            Logger::log("WARN", "[CN-RULE-002] Failed to persist positions: " + std::string(e.what()));
+        }
+    }
+
+    // Loads china_positions_ from disk at startup.
+    // Removes entries whose entry_date is strictly before today — they are at
+    // minimum T+1 old and the T+1 sell gate no longer applies to them.
+    void load_china_positions() {
+        std::lock_guard<std::mutex> lock(china_positions_mutex_);
+        std::ifstream f(cnPositionsPath);
+        if (!f.is_open()) {
+            Logger::log("INFO", "[CN-RULE-002] No persisted positions file found at " +
+                        cnPositionsPath + ". Starting with empty T+1 map.");
+            return;
+        }
+        try {
+            json j = json::parse(f);
+            std::string today = get_today_date_string();
+            int loaded = 0, pruned = 0;
+            for (auto it = j.begin(); it != j.end(); ++it) {
+                std::string ticker     = it.key();
+                std::string entry_date = it.value().get<std::string>();
+                if (entry_date < today) {
+                    // Entry is from a previous day — T+1 restriction has lifted.
+                    pruned++;
+                } else {
+                    china_positions_[ticker] = ChinaPositionRecord{entry_date};
+                    loaded++;
+                }
+            }
+            Logger::log("INFO", "[CN-RULE-002] Loaded " + std::to_string(loaded) +
+                        " active T+1 position(s) from disk; pruned " +
+                        std::to_string(pruned) + " stale record(s).");
+        } catch (const std::exception& e) {
+            Logger::log("WARN", "[CN-RULE-002] Failed to parse positions file: " +
+                        std::string(e.what()) + ". Starting with empty T+1 map.");
+        }
+    }
 
     // RULE-005: Fetch live equity with exponential-backoff retry (2s -> 4s -> 8s).
     // Returns -1.0 on total failure — callers MUST NOT proceed with any fallback.
@@ -224,6 +318,46 @@ private:
 
         // --- SELL ROUTING: Close open position (enhanced) ---
         if (sig.action == "SELL") {
+            // CN-RULE-002: T+1 Settlement Gate.
+            // Chinese A-share rules prohibit same-day round trips: a position
+            // bought on day T cannot be sold until T+1 or later.
+            // If the sell signal arrives on the same calendar date as the
+            // recorded entry, discard the signal entirely and log CRITICAL.
+            {
+                std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                auto it = china_positions_.find(sig.ticker);
+                if (it != china_positions_.end()) {
+                    std::string effective_sell_date = sig.trade_date.empty()
+                        ? get_today_date_string()
+                        : sig.trade_date;
+                    if (effective_sell_date == it->second.entry_date) {
+                        Logger::log("CRITICAL",
+                            "[CN-RULE-002] T+1 gate blocked SELL for " + sig.ticker +
+                            " — entry_date=" + it->second.entry_date +
+                            " equals sell_date=" + effective_sell_date +
+                            ". Same-day round-trips are prohibited on Chinese A-shares.");
+                        TelegramNotifier::sendMessage(
+                            "🚫 *CN T+1 GATE BLOCKED*\n"
+                            "────────────────────────\n"
+                            "• *Ticker:* " + sig.ticker + "\n"
+                            "• *Entry Date:* " + it->second.entry_date + "\n"
+                            "• *Sell Date:* " + effective_sell_date + "\n"
+                            "⛔ Same-day sell prohibited (T+1 rule). Signal discarded."
+                        );
+                        return;
+                    }
+                } else {
+                    // No record found — position may have been entered before this engine
+                    // instance started (e.g., restart mid-day) or the persistence file was
+                    // lost. Log a warning so the operator can verify manually; do NOT block
+                    // the sell, as holding a position indefinitely would be worse.
+                    Logger::log("WARN",
+                        "[CN-RULE-002] SELL received for " + sig.ticker +
+                        " but no T+1 entry record found. "
+                        "Position may pre-date this engine instance. Proceeding with SELL.");
+                }
+            }
+
             Logger::log("INFO", "[EXECUTION] SELL signal for " + sig.ticker + ". Closing position.");
             try {
                 httplib::Client alpaca_cli(alpacaBaseUrl);
@@ -265,6 +399,12 @@ private:
                         "• *Trigger:* Webhook SELL Signal\n"
                         "• *Alpaca Order ID:* `" + response_data.value("id", "N/A") + "`"
                     );
+                    // CN-RULE-002: Position is closed — remove from T+1 tracking map.
+                    {
+                        std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                        china_positions_.erase(sig.ticker);
+                        persist_china_positions_locked();
+                    }
                 } else {
                     std::string status_code = res ? std::to_string(res->status) : "TIMEOUT";
                     std::string details     = res ? res->body : "No response received.";
@@ -365,7 +505,7 @@ private:
             if (qty <= 0) {
                 Logger::log("CRITICAL", "[EXECUTION] Aborting order for " + sig.ticker +
                             " — position sizing resulted in zero or negative shares (" + std::to_string(qty) + ").");
-                
+
                 // Only send the specific "no-edge" alert if Kelly was the method that failed.
                 if (sig.risk_tier != 1 && sig.risk_tier != 3) {
                     TelegramNotifier::sendMessage(
@@ -377,6 +517,38 @@ private:
                     );
                 }
                 return;
+            }
+
+            // CN-RULE-001: Board-Lot Truncation.
+            // Chinese A-share exchanges require orders in multiples of cnBoardLotSize
+            // shares (one 手, shǒu; standard = 100). Any fractional lot is truncated,
+            // not rounded, to avoid accidentally exceeding the Kelly allocation.
+            // e.g. Kelly = 345 shares → submitted qty = 300 shares.
+            {
+                int lot_qty = (qty / cnBoardLotSize) * cnBoardLotSize;
+                if (lot_qty <= 0) {
+                    Logger::log("CRITICAL",
+                        "[CN-RULE-001] Board-lot truncation dropped qty to 0 for " + sig.ticker +
+                        " (raw qty=" + std::to_string(qty) +
+                        " < lot size " + std::to_string(cnBoardLotSize) + "). "
+                        "Trade aborted. Increase account equity or lower stock price.");
+                    TelegramNotifier::sendMessage(
+                        "🚨 *CRITICAL: CN Board-Lot Gate*\n"
+                        "────────────────────────\n"
+                        "• *Ticker:* " + sig.ticker + "\n"
+                        "• *Raw Kelly Qty:* " + std::to_string(qty) + " shares\n"
+                        "• *Lot Size:* " + std::to_string(cnBoardLotSize) + "\n"
+                        "⛔ Cannot form one full lot. Order aborted.\n"
+                        "Increase account equity or reduce stock price."
+                    );
+                    return;
+                }
+                if (lot_qty != qty) {
+                    Logger::log("INFO",
+                        "[CN-RULE-001] Board-lot truncation: raw=" + std::to_string(qty) +
+                        " → submitted=" + std::to_string(lot_qty) + " shares for " + sig.ticker);
+                }
+                qty = lot_qty;
             }
 
             // RULE-018 Condition 2 — Notional Value Ceiling (Physical Hard Gate).
@@ -425,6 +597,22 @@ private:
                     json response_data = json::parse(res->body);
                     std::string order_id = response_data.value("id", "UNKNOWN");
                     std::cout << " [BUY ORDER EXECUTED] Alpaca Order ID: " << order_id << std::endl;
+
+                    // CN-RULE-002: Record entry date for T+1 enforcement.
+                    // Use the signal's trade_date if provided (backtester path);
+                    // fall back to today's system date for live execution.
+                    {
+                        std::string entry_date = sig.trade_date.empty()
+                            ? get_today_date_string()
+                            : sig.trade_date;
+                        std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                        china_positions_[sig.ticker] = ChinaPositionRecord{entry_date};
+                        persist_china_positions_locked();
+                        Logger::log("INFO",
+                            "[CN-RULE-002] Recorded T+1 entry for " + sig.ticker +
+                            " on " + entry_date + ". Sell gate active until T+1.");
+                    }
+
                     TelegramNotifier::sendMessage(
                         "🟢 *BUY ORDER EXECUTED*\n"
                         "────────────────────────\n"
@@ -562,6 +750,82 @@ public:
         require_env("TELEGRAM_BOT_TOKEN");
         require_env("TELEGRAM_CHAT_ID");
 
+        // CN-RULE-001: Board-lot size (default 100 for all A-share boards).
+        // Override with CN_BOARD_LOT_SIZE if a non-standard lot size is needed.
+        cnBoardLotSize = 100;
+        const char* lot_env = std::getenv("CN_BOARD_LOT_SIZE");
+        if (lot_env && std::string(lot_env) != "") {
+            try {
+                int parsed = std::stoi(std::string(lot_env));
+                if (parsed > 0) {
+                    cnBoardLotSize = parsed;
+                } else {
+                    std::cerr << "[WARN] [EXECUTION] CN_BOARD_LOT_SIZE must be positive. "
+                              << "Using default of 100." << std::endl;
+                }
+            } catch (...) {
+                std::cerr << "[WARN] [EXECUTION] CN_BOARD_LOT_SIZE is not a valid integer. "
+                          << "Using default of 100." << std::endl;
+            }
+        }
+        Logger::log("INFO", "[CN-RULE-001] Board-lot size: " + std::to_string(cnBoardLotSize) + " shares.");
+
+        // CN-RULE-002: Path for T+1 position persistence file.
+        // Override with CN_POSITIONS_PATH env var, default to /tmp/china_positions.json.
+        const char* pos_path_env = std::getenv("CN_POSITIONS_PATH");
+        cnPositionsPath = (pos_path_env && std::string(pos_path_env) != "")
+            ? std::string(pos_path_env)
+            : "/tmp/china_positions.json";
+        Logger::log("INFO", "[CN-RULE-002] T+1 positions persistence path: " + cnPositionsPath);
+        load_china_positions();
+
+        // ── Options signal generator (all optional — safe defaults) ────────────
+        {
+            const char* wl = std::getenv("OPTIONS_WATCHLIST");
+            std::string wl_str = (wl && std::string(wl) != "")
+                ? std::string(wl) : "SPY,QQQ,AAPL,TSLA,NVDA";
+
+            std::istringstream ss(wl_str);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                if (!token.empty()) optionsWatchlist_.push_back(token);
+            }
+
+            optionsScanIntervalMin_ = 30;
+            const char* interval_env = std::getenv("OPTIONS_SCAN_INTERVAL_MINUTES");
+            if (interval_env && std::string(interval_env) != "") {
+                try { optionsScanIntervalMin_ = std::stoi(std::string(interval_env)); }
+                catch (...) {}
+            }
+
+            optionsFreeCapitalAmount_ = 0.0;
+            const char* fc_env = std::getenv("OPTIONS_FREE_CAPITAL_AMOUNT");
+            if (fc_env && std::string(fc_env) != "") {
+                try { optionsFreeCapitalAmount_ = std::stod(std::string(fc_env)); }
+                catch (...) {}
+            }
+
+            optionsAutoExecute_ = false;
+            const char* ae_env = std::getenv("OPTIONS_AUTO_EXECUTE");
+            if (ae_env && (std::string(ae_env) == "true" || std::string(ae_env) == "1"))
+                optionsAutoExecute_ = true;
+
+            optionsQtyContracts_ = 1;
+            const char* qty_env = std::getenv("OPTIONS_QTY_CONTRACTS");
+            if (qty_env && std::string(qty_env) != "") {
+                try { optionsQtyContracts_ = std::max(1, std::stoi(std::string(qty_env))); }
+                catch (...) {}
+            }
+
+            Logger::log("INFO", "[OPTIONS_SIGNAL] Watchlist: " + wl_str
+                + " | Interval: " + std::to_string(optionsScanIntervalMin_) + " min"
+                + " | AutoExecute: " + (optionsAutoExecute_ ? "ON" : "OFF (advisory)")
+                + " | Qty: " + std::to_string(optionsQtyContracts_) + " contract(s)"
+                + (optionsFreeCapitalAmount_ > 0.0
+                    ? " | Free Capital: $" + std::to_string(optionsFreeCapitalAmount_)
+                    : ""));
+        }
+
         Logger::log("INFO", "[EXECUTION] All required environment variables validated.");
     }
 
@@ -578,6 +842,46 @@ public:
                 {"last_analyst_report", last_analyst_report_time.empty() ? "Never" : last_analyst_report_time}
             };
             res.set_content(response.dump(), "application/json");
+        });
+
+        svr.Post("/options/price", [](const httplib::Request& req, httplib::Response& res) {
+            try {
+                json body = json::parse(req.body);
+
+                nox::options::OptionContract contract;
+                contract.symbol         = body.value("symbol", "");
+                contract.strike         = body.value("strike", 0.0);
+                contract.underlying     = body.value("underlying", 0.0);
+                contract.expiry         = body.value("expiry", 0.0);
+                contract.risk_free_rate = body.value("risk_free_rate", 0.05);
+                contract.volatility     = body.value("volatility", 0.0);
+                contract.type           = (body.value("option_type", "call") == "put")
+                                          ? nox::options::OptionType::Put
+                                          : nox::options::OptionType::Call;
+
+                bool solve_iv = body.value("solve_iv", false);
+                nox::options::OptionGreeks greeks = nox::options::compute_greeks(contract, solve_iv);
+
+                json response = {
+                    {"symbol",             contract.symbol},
+                    {"option_type",        (contract.type == nox::options::OptionType::Call) ? "call" : "put"},
+                    {"price",              greeks.price},
+                    {"delta",              greeks.delta},
+                    {"gamma",              greeks.gamma},
+                    {"theta",              greeks.theta},
+                    {"vega",               greeks.vega},
+                    {"rho",                greeks.rho},
+                    {"implied_volatility", greeks.implied_volatility}
+                };
+                res.set_content(response.dump(), "application/json");
+
+            } catch (const json::parse_error& e) {
+                res.status = 400;
+                res.set_content(std::string("Bad Request: ") + e.what(), "text/plain");
+            } catch (const std::exception& e) {
+                res.status = 422;
+                res.set_content(std::string("Pricing error: ") + e.what(), "text/plain");
+            }
         });
 
         svr.Post("/webhook", [this](const httplib::Request& req, httplib::Response& res) {
@@ -657,6 +961,11 @@ public:
                             signal.risk_tier = std::stoi(data["risk_tier"].get<std::string>());
                         }
                     }
+                    // CN-RULE-001/002: Optional trade date for backtester mode.
+                    // Expected format: "YYYY-MM-DD". If absent, live system date is used.
+                    if (data.contains("trade_date") && data["trade_date"].is_string()) {
+                        signal.trade_date = data["trade_date"].get<std::string>();
+                    }
 
                     Logger::log("INFO", "Signal Parsed successfully: " + signal.action + " " + signal.ticker);
 
@@ -720,6 +1029,36 @@ public:
             res.status = 200;
             res.set_content("Processed " + std::to_string(success_count) + " signal(s)", "text/plain");
         }); // This perfectly closes the svr.Post router lambda
+
+        // ── Options signal scanner background thread ────────────────────────
+        std::thread options_thread([this]() {
+            std::string tg_token  = std::getenv("TELEGRAM_BOT_TOKEN")  ? std::getenv("TELEGRAM_BOT_TOKEN")  : "";
+            std::string tg_chat   = std::getenv("TELEGRAM_CHAT_ID")    ? std::getenv("TELEGRAM_CHAT_ID")    : "";
+
+            nox::options_signal::OptionsSignalGenerator generator(
+                alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat,
+                optionsFreeCapitalAmount_,
+                optionsAutoExecute_,
+                optionsQtyContracts_
+            );
+
+            while (true) {
+                try {
+                    double equity = fetch_account_equity();
+                    if (equity > 0.0) {
+                        generator.run_scan(optionsWatchlist_, equity);
+                    } else {
+                        Logger::log("WARN", "[OPTIONS_SIGNAL] Skipping scan — equity unavailable.");
+                    }
+                } catch (const std::exception& e) {
+                    Logger::log("WARN", "[OPTIONS_SIGNAL] Scan exception: " + std::string(e.what()));
+                }
+                std::this_thread::sleep_for(
+                    std::chrono::minutes(optionsScanIntervalMin_));
+            }
+        });
+        options_thread.detach();
+        // ────────────────────────────────────────────────────────────────────
 
         Logger::log("INFO", "Nox Execution Engine listening on 0.0.0.0:8080...");
         svr.listen("0.0.0.0", 8080);

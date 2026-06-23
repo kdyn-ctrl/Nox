@@ -260,3 +260,75 @@
 
   Both conditions are non-negotiable and apply to all asset classes. No override flag,
   environment variable, or runtime parameter may disable either condition in production.
+
+
+════════════════════════════════════════════════════════════
+ SECTION V — CHINESE A-SHARE MARKET CONSTRAINTS
+════════════════════════════════════════════════════════════
+
+[CN-RULE-001] Board-Lot Truncation (手, shǒu)
+  All A-share order quantities MUST be submitted in whole multiples of the configured
+  board-lot size (CN_BOARD_LOT_SIZE, default 100 shares). After the Kelly calculator or
+  any fixed-tier sizing path produces a raw share quantity, the execution engine MUST
+  truncate — never round — to the nearest lower multiple before constructing the order
+  payload.
+
+  Truncation formula:
+    submitted_qty = floor(raw_qty / CN_BOARD_LOT_SIZE) * CN_BOARD_LOT_SIZE
+
+  If this truncation produces a submitted_qty of 0, the engine MUST:
+    1. Abort the trade immediately — do NOT submit a sub-lot order or round up to one lot.
+    2. Log the event as [CRITICAL] to container stdout.
+    3. Fire a Telegram alert identifying the ticker, raw Kelly quantity, and configured lot size.
+    4. Return without touching Alpaca.
+
+  This behaviour parallels the zero-share rule in RULE-018: a sub-lot purchase is never
+  permitted because it would represent an outsized percentage of the Kelly allocation and
+  violates the spirit of the 10% notional hard cap.
+
+  CN_BOARD_LOT_SIZE is an environment variable that defaults to 100. It may be overridden
+  without a code change if exchange rules are amended. It MUST be a positive integer;
+  invalid or non-positive values must fall back to 100 with a [WARN] log.
+
+[CN-RULE-002] T+1 Settlement Enforcement (T+1交割制度)
+  Chinese A-share markets prohibit same-day round-trips under the T+1 settlement rule.
+  A position purchased on trading day T cannot be sold until T+1 or later. The execution
+  engine MUST enforce this rule at the signal-dispatch level as follows:
+
+  On BUY confirmed (broker returns HTTP 200):
+    • Record the ticker and entry date in the in-process ChinaPositionRecord map.
+    • Immediately persist the full map to the file at CN_POSITIONS_PATH
+      (default /tmp/china_positions.json) so the state survives engine restarts.
+
+  On SELL signal received (before any broker call):
+    • Determine the effective sell date: use the signal's trade_date field if present;
+      otherwise use the current system date.
+    • Look up the ticker in the position map.
+      - If found and sell_date == entry_date: DISCARD the signal — log [CRITICAL],
+        fire a Telegram alert, and return without routing any order to the broker.
+      - If found and sell_date > entry_date: allow the signal to proceed normally.
+      - If not found: log [WARN] (position may pre-date this engine instance) and
+        allow the sell to proceed — blocking indefinitely would be worse than an
+        unverified sell.
+
+  On SELL confirmed (broker returns HTTP 200):
+    • Evict the ticker from the map and re-persist the file.
+
+  On engine startup:
+    • Load the persisted JSON file. Discard any entries whose entry_date is strictly
+      before today (they are at minimum T+1 old and the restriction has lifted).
+      Log the count of loaded and pruned records at [INFO].
+
+  Backtester mode: Signal payloads may include a trade_date field ("YYYY-MM-DD") to
+  inject the simulation clock. All backtester-generated BUY and SELL signals MUST include
+  this field; relying on the system clock in a simulation produces incorrect gate behaviour.
+
+  No override flag, environment variable, or API parameter may bypass the T+1 gate in
+  production. To close a same-day position under exceptional circumstances, operators
+  MUST act directly through the broker dashboard — the exchange itself enforces T+1 at
+  the matching engine level.
+
+  CN_POSITIONS_PATH is an environment variable that controls the persistence file path.
+  It defaults to /tmp/china_positions.json. For production deployments, mount a persistent
+  volume and point this variable to a path within it to ensure state survives container
+  restarts.
