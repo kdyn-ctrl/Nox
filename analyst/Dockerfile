@@ -1,33 +1,5 @@
-# ── Stage 1: Builder ──────────────────────────────────────────────────────────
-# Compiles the analyst binary inside a full build environment.
-# The final image receives only the stripped binary — no compiler, no headers.
-FROM ubuntu:24.04 AS builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    g++ \
-    libssl-dev \
-    ca-certificates \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Download vendored single-header libraries — both pinned to explicit release tags.
-# httplib: v0.18.5 | nlohmann/json: v3.11.3
-RUN mkdir -p nlohmann \
-    && wget -q -O httplib.h \
-       https://raw.githubusercontent.com/yhirose/cpp-httplib/v0.18.5/httplib.h \
-    && wget -q -O nlohmann/json.hpp \
-       https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
-
-COPY analyst/main.cpp ./analyst/
-COPY shared/RegimeStateMachine.hpp ./shared/
-
-# Compile with full C++17 + optimisation + required link flags (Build Standards)
-RUN cd analyst && g++ -std=c++17 -I.. -O3 main.cpp -o analyst_agent -lssl -lcrypto -lpthread
-
-# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-# Minimal runtime image — only the binary and its shared library dependencies.
+# ── Minimal Runtime Image ──────────────────────────────────────────────────────
+# Copies pre-built binary from the host
 FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -40,8 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd --no-create-home --shell /bin/false appuser
 
 WORKDIR /app
-COPY --from=builder /app/analyst_agent .
-RUN chown appuser:appuser analyst_agent
+
+# Copy pre-built binary from analyst directory
+COPY analyst/analyst_agent .
+
+RUN chown appuser:appuser analyst_agent && chmod +x analyst_agent
 
 USER appuser
 
