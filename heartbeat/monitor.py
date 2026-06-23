@@ -360,30 +360,27 @@ def run_scout_protocol():
         chinese_context = get_chinese_market_context()
 
         system_prompt = (
-            "You are Nox, a ruthlessly skeptical quantitative trading assistant. Your sole job is to "
-            "synthesize US and Chinese market data into a highly scannable, zero-filler daily "
-            "report formatted for Telegram."
+            "You are Nox, a ruthlessly skeptical quantitative trading assistant. Generate a "
+            "comprehensive daily market report with clear structure for easy phone reading."
             "\n\n"
-            "**RULES:**\n"
-            "1.  **No conversational filler.** No intros, outros, warnings, or disclaimers. "
-            "Get straight to the point.\n"
-            "2.  **Metrics & Bullets Only.** The output must be sharp metrics, highly scannable "
-            "bullet points, and bolded text to guide the eye.\n"
-            "3.  **No large tables.** Convert all tabular data into compact, bulleted lists. "
-            "Vertical tables are forbidden.\n"
-            "4.  **Strict Markdown.** Use Markdown for structure: headers (`#`), bold (`*text*`), "
-            "and bullets (`-`).\n"
-            "5.  **Find the signal.** Your analysis must find cross-market structural shifts where "
-            "Chinese macro data confirms, contradicts, or leads the US narrative. "
-            "Flag divergence signals explicitly."
-            "\n\n"
-            "The output must be dense, actionable, and formatted for a narrow mobile screen. "
-            "Adhere to this structure strictly."
+            "STRUCTURE:\n"
+            "- Use # for main sections and ## for subsections\n"
+            "- Use - for bullet points under sections\n"
+            "- Keep formatting minimal but readable as plain text\n"
+            "\n"
+            "CONTENT RULES:\n"
+            "1. No filler, disclaimers, or conversational padding.\n"
+            "2. Lead with the most actionable signals.\n"
+            "3. Find cross-market shifts where Chinese macro data confirms, contradicts, or leads US narrative.\n"
+            "4. Each section should be 2-4 bullet points max. Be specific with numbers/metrics.\n"
+            "5. Focus on material events and structural breaks, not noise.\n"
+            "\n"
+            "Target ~3000-3500 tokens worth of detailed analysis. Comprehensive but tight."
         )
         
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=32768,
+            max_tokens=4500,
             system=system_prompt,
             messages=[{"role": "user", "content": (
                 f"🇺🇸 US Media Headlines:\n{news_context}\n\n"
@@ -393,9 +390,11 @@ def run_scout_protocol():
         )
 
         analysis_text = response.content[0].text
-        # Chunk the report so Telegram's 4096-char limit never cuts it off.
-        # smart_split splits on word boundaries, preserving readability.
-        full_msg = f"🦅 *Nox Daily Audit Report*\n\n{analysis_text}"
+        # Header with timestamp, then detailed report split across 3-4 messages.
+        # Split on 4096 chars for clean Telegram message boundaries.
+        et_tz = ZoneInfo('America/New_York')
+        report_header = f"# NOX DAILY AUDIT\n{datetime.now(et_tz).strftime('%Y-%m-%d %H:%M ET')}\n\n"
+        full_msg = report_header + analysis_text
         for chunk in smart_split(full_msg, chars_per_string=4096):
             bot.send_message(CHAT_ID, chunk, parse_mode='Markdown')
         
@@ -432,35 +431,28 @@ def schedule_checker():
     ET  = ZoneInfo("America/New_York")
     UTC = ZoneInfo("UTC")
 
-    _scout_fired_today: dict = {"date": None}   # mutable container for closure
-
-    def _guarded_scout():
-        """Wrapper that prevents double-fires within the same calendar day (ET)."""
-        today_et = datetime.now(tz=ET).date()
-        if _scout_fired_today["date"] == today_et:
-            print("[WARN] [HEARTBEAT] Scout double-fire suppressed.", flush=True)
-            return
-        _scout_fired_today["date"] = today_et
+    def _scheduled_scout():
+        """Scheduled daily scout. Manual /report runs don't interfere with this."""
         run_scout_protocol()
 
     def _reschedule_scout():
         """
         Clear any existing 'scout' job, compute the UTC wall-clock time that
-        corresponds to 11:30 AM ET *today*, and register a new daily job.
+        corresponds to 9:00 AM ET (pre-market) *today*, and register a new daily job.
         Called once at startup and then nightly at 00:01 UTC.
         """
         schedule.clear("scout")
 
         now_et     = datetime.now(tz=ET)
-        # Build a timezone-aware 10:00 AM ET for today, then express it in UTC.
-        target_et  = now_et.replace(hour=10, minute=0, second=0, microsecond=0)
+        # Build a timezone-aware 9:00 AM ET for today (pre-market), then express it in UTC.
+        target_et  = now_et.replace(hour=9, minute=0, second=0, microsecond=0)
         target_utc = target_et.astimezone(UTC)
         utc_hhmm   = target_utc.strftime("%H:%M")
 
-        schedule.every().day.at(utc_hhmm).do(_guarded_scout).tag("scout")
+        schedule.every().day.at(utc_hhmm).do(_scheduled_scout).tag("scout")
         print(
             f"[INFO] [HEARTBEAT] Daily Scout (re)scheduled: "
-            f"10:00 ET = {utc_hhmm} UTC "
+            f"9:00 AM ET (pre-market) = {utc_hhmm} UTC "
             f"({'EDT UTC-4' if target_et.utcoffset().total_seconds() == -14400 else 'EST UTC-5'}).",
             flush=True,
         )
@@ -581,20 +573,22 @@ def send_status(message):
         print(f"[STATUS CMD] DB query successful: Last audit {last_audit_age}, {audit_count} audits, {filing_count} filings.", flush=True)
 
         # --- 3. Assemble Dashboard ---
-        # Escape only values that might contain MarkdownV2 reserved characters.
+        # CRITICAL: MarkdownV2 requires escaping these reserved chars: _*[]()~`>#+-=|{}.!
+        # This includes hyphens and underscores. ALWAYS apply esc() to ALL dynamic values
+        # before inserting into status_msg. Negative numbers (-1, etc.) are a common source of errors.
         def esc(text: str) -> str:
             reserved = r'_*[]()~`>#+-=|{}.!'
             return re.sub(f'([{re.escape(reserved)}])', r'\\\1', str(text))
 
-        separator = "─" * 24  # Use box drawing character instead of hyphens
+        separator = "─" * 24
         status_msg = (
             f"🦅 *Nox System Health Status*\n"
             f"{separator}\n"
-            f"🧠 *Analyst Heartbeat:* Active \\(Last cycle: {last_audit_age}\\)\n"
-            f"⚡ *Execution Engine:* {exec_status} \\(Ping: {exec_ping}ms\\)\n"
-            f"🇨🇳 *China Data Engine:* {data_status} \\(Cache updated: {data_cache_age}\\)\n"
-            f"🇺🇸 *America Data Engine:* {america_data_status} \\(Cache updated: {america_data_cache_age}\\)\n"
-            f"📚 *Memory Bank:* {audit_count} Audits \\| {filing_count} Processed Filings\n"
+            f"🧠 *Analyst Heartbeat:* Active \\(Last cycle: {esc(last_audit_age)}\\)\n"
+            f"⚡ *Execution Engine:* {esc(exec_status)} \\(Ping: {esc(exec_ping)}ms\\)\n"
+            f"🇨🇳 *China Data Engine:* {esc(data_status)} \\(Cache updated: {esc(data_cache_age)}\\)\n"
+            f"🇺🇸 *America Data Engine:* {esc(america_data_status)} \\(Cache updated: {esc(america_data_cache_age)}\\)\n"
+            f"📚 *Memory Bank:* {esc(audit_count)} Audits \\| {esc(filing_count)} Processed Filings\n"
             f"📊 *Current Market Regime:* `RISK_ON`"
         )
         print(f"[STATUS CMD] Assembled status message:\n{status_msg}", flush=True)
