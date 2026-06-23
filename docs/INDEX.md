@@ -13,11 +13,13 @@
 ## 🚀 Core Services
 
 ### `/execution` — Execution Engine (C++)
-Webhook-enabled order execution and risk management
+Webhook-enabled order execution, risk management, and options signal generation
 - Listens on **port 8080** (exposed to host)
-- Receives JSON webhooks from TradingView
+- Receives JSON webhooks from TradingView for equity trades
 - Implements Kelly sizing and trailing stops
 - Communicates with Alpaca broker API
+- **`OptionEngine.hpp`** — Black-Scholes pricing + Greeks (`/options/price` endpoint)
+- **`OptionsSignalGenerator.hpp`** — Self-generating options advisory signals via Telegram (no TradingView needed)
 
 ### `/analyst` — Analyst Brain (C++)
 Market analysis and regime classification
@@ -46,6 +48,7 @@ System health checks and Telegram notifications
 Historical strategy testing and out-of-sample validation
 - Generates performance metrics
 - Helps validate regime classification logic
+- Supports Chinese A-share simulation via `trade_date` signal field (T+1 gate + board-lot rules)
 
 ---
 
@@ -80,7 +83,7 @@ Location: **`/docs/testing/`**
 | [ANALYST_TEST_GUIDE.md](docs/testing/ANALYST_TEST_GUIDE.md) | Test analyst brain signals |
 | [HEARTBEAT_TEST_GUIDE.md](docs/testing/HEARTBEAT_TEST_GUIDE.md) | Test monitoring service |
 | [DATA_ENGINE_TEST_GUIDE.md](docs/testing/DATA_ENGINE_TEST_GUIDE.md) | Test data scraping |
-| [BACKTEST_TEST_GUIDE.md](docs/testing/BACKTEST_TEST_GUIDE.md) | Test backtesting engine |
+| [BACKTEST_TEST_GUIDE.md](docs/testing/BACKTEST_TEST_GUIDE.md) | Test backtesting engine (includes CN A-share rules) |
 | [TESTING_PHILOSOPHY.md](docs/testing/TESTING_PHILOSOPHY.md) | Testing principles |
 | [TEST_MAINTENANCE_GUIDE.md](docs/testing/TEST_MAINTENANCE_GUIDE.md) | Maintaining test suites |
 | [TEST_UPDATE_CHECKLIST.md](docs/testing/TEST_UPDATE_CHECKLIST.md) | Checklist for new features |
@@ -102,9 +105,14 @@ Location: **`/docs/`**
 
 | Document | Purpose |
 |----------|---------|
-| [NOX_USER_GUIDE.md](docs/NOX_USER_GUIDE.md) | System setup and operation |
+| [NOX_USER_GUIDE.md](docs/NOX_USER_GUIDE.md) | System setup, operation, options signals, and signal troubleshooting |
 | [DOCUMENTATION_OVERVIEW.md](docs/DOCUMENTATION_OVERVIEW.md) | Architecture and design |
 | [DOCUMENTATION_SUMMARY.txt](docs/DOCUMENTATION_SUMMARY.txt) | Quick reference |
+
+**Key sections in NOX_USER_GUIDE.md:**
+- [Why Am I Not Getting Trade Signals?](#why-am-i-not-getting-trade-signals) — 6-step diagnosis + course of action
+- [Options Signal Generator](#options-signal-generator) — How to use, tiers, IV rank, strategy glossary
+- [Developing Your Own Signals](#developing-your-own-signals) — TradingView webhook format, paper trading
 
 ---
 
@@ -242,5 +250,5 @@ Nox/
 
 ---
 
-**Last Updated:** 2026-06-22  
-**Version:** 1.0
+**Last Updated:** 2026-06-23  
+**Version:** 1.2

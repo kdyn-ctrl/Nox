@@ -278,7 +278,7 @@ A: Yes, but be careful. Your manual orders and Nox's orders will both execute. T
 A: You can close it manually in Alpaca. Nox will see the position is gone and generate a new one if conditions are right. But remember: Nox made that trade for a mathematical reason. Closing it might lock in a loss.
 
 **Q: Does Nox trade options or leverage?**
-A: No. Nox only buys and sells whole shares of SPY. No options, no margin, no leverage. It's conservative by design.
+A: The core equity bot trades whole shares only. Options signals are now available as a separate advisory channel — see the Options Signal Generator section below.
 
 **Q: What happens if the market crashes while Nox is on?**
 A: Nox switches to RISK_OFF regime and stops trading. It doesn't sell existing positions automatically (that would lock in losses). It just waits for calm to return.
@@ -322,7 +322,251 @@ A: First, check Telegram for error alerts. Second, check Alpaca to verify the or
 
 ---
 
-**Last Updated: 2026-06-22**  
+**Last Updated: 2026-06-23**  
 **Status: Ready to use**
 
 This guide should be re-read every time the bot's behavior changes. If you notice something in the actual bot that doesn't match this guide, that's a sign the guide needs updating.
+
+---
+
+## Why Am I Not Getting Trade Signals?
+
+This is the most common operational question. Here is the honest answer:
+
+### How equity signals actually work
+
+The execution engine does **not** self-generate buy/sell signals for equities. It is a receiver. The full pipeline is:
+
+```
+TradingView strategy fires an alert
+        ↓
+TradingView sends a JSON webhook to your VPS (port 80/443 → execution engine port 8080)
+        ↓
+Execution engine validates the signal, checks the regime, sizes the position
+        ↓
+Alpaca order is placed
+```
+
+**The analyst agent only sends `REPORT` signals.** It tells you the market regime (RISK_ON / RISK_OFF) but it does not send BUY or SELL signals. Only TradingView does that.
+
+If you have not received a trade signal in months, one of the following is true:
+
+---
+
+### Diagnosis checklist — run through these in order
+
+**Step 1: Is TradingView sending webhooks?**
+- Log into TradingView → open your strategy → go to Alerts
+- Check if any alerts exist and whether they are **active** (green dot)
+- TradingView free tier alerts expire after a certain time. If the alert is grey or deleted, it stopped sending months ago
+- **Fix:** Recreate the alert on the Pine Script strategy and set it to `Once Per Bar Close` with your webhook URL
+
+**Step 2: Is the webhook URL correct?**
+- The webhook target should be `https://<your-domain-or-ip>/webhook` (or `http://` if no SSL)
+- If your VPS IP changed, the URL is dead
+- **Fix:** Update the TradingView alert URL to your current server address
+
+**Step 3: Is the execution engine actually running?**
+- From your VPS: `docker-compose ps`
+- You should see `execution-engine` with status `Up`
+- **Fix:** `docker-compose up -d execution-engine`
+
+**Step 4: Is the regime blocking signals?**
+- The regime gate blocks all new BUY orders when `RISK_OFF` is active
+- RISK_OFF fires when VIX ≥ 35 OR SPY is more than 2% below its 200-day average
+- For most of 2025-2026, regime has alternated between RISK_ON and TRANSITION due to macro volatility
+- **Check:** Look at your last Telegram analyst report — what regime was reported?
+- **In TRANSITION:** Signals pass through but position sizes are cut by 50%
+- **In RISK_OFF:** All BUY signals are hard-blocked at the execution gate
+
+**Step 5: Is the RSI gate blocking signals?**
+- The bot blocks BUY signals when RSI < 30 (deeply oversold — potential falling knife)
+- During extreme sell-offs, this gate can trigger frequently
+- **Check:** Your Telegram should show `🚧 RSI GATE BLOCK` messages if this is the cause
+
+**Step 6: Is the Pine Script strategy generating signals at all?**
+- Open your TradingView chart and look at the strategy's equity curve
+- If no new triangles (buy/sell markers) appear on recent bars, the strategy hasn't fired
+- This means market conditions don't match the entry rules — the bot is working as intended, just patiently waiting
+- **What to do:** See "Course of Action" section below
+
+---
+
+### Course of action — if no signals and you want to stay active
+
+The regime and RSI gates exist for a reason: forcing trades in bad market conditions destroys capital. If conditions aren't right, the correct action is **not** to bypass the gates. Instead:
+
+**Option A: Use the Options Signal Generator (available now)**
+The options signaler runs independently on a background thread every 30 minutes (configurable). It does not need TradingView. It generates advisory Telegram alerts automatically once the engine is running. During RISK_OFF regimes, long premium signals are suppressed but income strategies (cash-secured puts, covered calls) are still generated — these actually benefit from high volatility. See the Options Signal Generator section below.
+
+**Option B: Verify and reconnect TradingView**
+1. Check TradingView alert status (Step 1 above)
+2. If the strategy isn't firing, look at the Pine Script conditions — the EMA crossover + volume filter may not have triggered in the current market structure
+3. Consider adjusting the strategy timeframe or adding the strategy to more tickers (the webhook payload just needs a `ticker` field — it's not hardcoded to SPY)
+
+**Option C: Use paper trading to develop new signals**
+If you want to build new strategies without risking real capital:
+1. Set `ALPACA_BASE_URL=https://paper-api.alpaca.markets` in your `.env`
+2. Test new TradingView strategies by pointing alerts at the paper endpoint
+3. Run for 30–60 days to validate the signal quality before switching to live
+
+**Option D: Monitor regime and wait**
+Check the analyst Telegram report daily. When regime returns to RISK_ON and VIX drops below 35, the gates open and signals will execute normally. During TRANSITION, smaller signals still go through at 50% size.
+
+---
+
+## Options Signal Generator
+
+This is a new self-contained advisory system built into the execution engine. Unlike equity signals, **it does not need TradingView**. It runs on a timer and sends Telegram alerts to you directly.
+
+### What it does
+
+Every 30 minutes (configurable), it scans a watchlist of tickers and generates options trade ideas based on:
+- **Technicals** on the underlying: RSI, ATR, 20-SMA, 50-SMA from Yahoo Finance
+- **IV Rank**: how expensive/cheap options are right now vs. the past year
+- **Macro regime**: same VIX + SPY regime gate the equity bot uses
+
+### Understanding the capital tiers
+
+The generator automatically adjusts which strategies it recommends based on your account size:
+
+| Tier | Capital | What you get |
+|------|---------|-------------|
+| **STARTER** | Under $5k | Long calls and puts only. Defined risk — you can only lose what you pay |
+| **STANDARD** | $5k – $30k | + Cash-secured puts and covered calls. Income strategies that work with what you own |
+| **ADVANCED** | $30k – $75k | + Vertical spreads, straddles, strangles. Defined risk with better capital efficiency |
+| **FREE_CAPITAL** | $75k+ OR custom | All strategies unlocked. Math uses your specified capital amount |
+
+The tier is read from your live Alpaca equity automatically. If you want to ring-fence a separate pool of capital (say $10k just for options, separate from the bot's money), set `OPTIONS_FREE_CAPITAL_AMOUNT=10000` in your `.env` — this overrides the Alpaca equity check entirely for the options signaler.
+
+### Free Capital mode
+
+Free Capital mode is designed for when you want to run the signal generator against a specific dollar amount you control, not the bot's broker balance. Use cases:
+- You have money in a separate account (TD, IBKR, Robinhood) that you trade manually
+- You want to paper-trade options ideas with a hypothetical $20k while your real bot has $5k
+- You have $100k+ and want full strategy access without tying it to the bot's Alpaca balance
+
+To enable it: add `OPTIONS_FREE_CAPITAL_AMOUNT=<your amount>` to `.env` and restart.
+
+### How to read an options signal alert
+
+```
+📊 OPTIONS SIGNAL — AAPL [STANDARD]
+────────────────────────────────────
+🎯 Strategy: Bull Call Spread
+📅 Expiry: 2026-08-15 (53 DTE)
+💵 Strikes: $195 / $200 Call
+💰 Entry: $1.85 | Max Risk: $185 | Max Gain: $315
+📊 R:R Ratio: 1.7:1
+⚖️ Breakeven: $196.85
+
+📐 Greeks
+• Delta: +0.42 | Gamma: 0.019
+• Theta: -$0.04/day | Vega: +0.31
+• IV Rank: 24% ← LOW (buy premium zone ✅)
+
+📈 Technicals — AAPL
+• RSI(14): 52 | ATR(14): $2.31
+• Price vs 20-SMA: ✅ above | vs 50-SMA: ✅ above
+
+🌐 Macro Regime: RISK_ON ✅ (VIX 16.4, SPY > 200-SMA)
+🎯 Signal Confidence: 87%
+
+⚠️ Advisory only — manual execution required.
+```
+
+**What each field means:**
+
+| Field | What it tells you |
+|-------|------------------|
+| **Strategy** | What kind of options trade this is |
+| **Expiry / DTE** | When the options expire. DTE = Days To Expiration |
+| **Strikes** | The price(s) you would trade at |
+| **Entry / Max Risk / Max Gain** | The cost and limits of the trade. Max Risk is the most you can lose |
+| **R:R Ratio** | Reward-to-risk. 1.7:1 means you can make $1.70 for every $1 risked |
+| **Breakeven** | The price the stock needs to reach for you to not lose money |
+| **Delta** | How much the option moves per $1 move in the stock. +0.42 = gains $0.42 per $1 stock rise |
+| **Theta** | Daily time decay — how much the option loses per day just from time passing |
+| **Vega** | Sensitivity to volatility. Positive = benefits from vol rising |
+| **IV Rank** | How cheap or expensive options are right now (0–100). Low = cheap; high = expensive |
+| **Confidence** | Regime-adjusted score. Below 50% means conditions are uncertain |
+
+### IV Rank — the most important number
+
+- **IV Rank < 30%** → Options are **cheap** → Buy premium (calls, puts, spreads, straddles)
+- **IV Rank > 50%** → Options are **expensive** → Sell premium (CSPs, covered calls, strangles)
+- **IV Rank 30–50%** → Neutral zone → Spreads or wait
+
+During RISK_OFF (high VIX), IV Rank is typically high. This is a good time for income strategies — you collect large premiums.
+
+### Strategy glossary
+
+| Strategy | What it is | When it's used |
+|----------|-----------|---------------|
+| **Long Call** | Buy the right to buy 100 shares at the strike | Bullish, cheap options |
+| **Long Put** | Buy the right to sell 100 shares at the strike | Bearish, cheap options |
+| **Cash-Secured Put (CSP)** | Sell a put and hold cash to buy the stock | Bullish/neutral, expensive options. Good income strategy |
+| **Covered Call (CC)** | Sell a call against shares you own | Neutral/slightly bearish, expensive options. Reduces cost basis |
+| **Bull Call Spread** | Buy a call, sell a higher-strike call | Bullish, defined risk and cost |
+| **Bear Put Spread** | Buy a put, sell a lower-strike put | Bearish, defined risk and cost |
+| **Long Straddle** | Buy a call AND a put at the same strike | Neutral — expecting a big move either way. Cheap vol |
+| **Long Strangle** | Buy OTM call AND OTM put | Neutral — same as straddle but cheaper and needs a bigger move |
+
+### Configuration
+
+These go in your `.env` file:
+
+| Variable | Default | What it does |
+|----------|---------|-------------|
+| `OPTIONS_WATCHLIST` | `SPY,QQQ,AAPL,TSLA,NVDA` | Tickers to scan. Comma-separated |
+| `OPTIONS_SCAN_INTERVAL_MINUTES` | `30` | How often to run a scan |
+| `OPTIONS_FREE_CAPITAL_AMOUNT` | _(off)_ | Dollar amount for Free Capital mode. Set to a number to enable |
+
+### Important: advisory only
+
+These signals are **for your manual review and execution**. The bot will not automatically place these options trades. You decide whether to act on each signal, when to enter, and how to manage the position.
+
+The signal gives you the trade idea backed by quantitative analysis. You decide if it fits your view, your broker, and your schedule.
+
+---
+
+## Developing Your Own Signals
+
+If you want to build new trading strategies and feed them to the bot:
+
+### Using TradingView + Pine Script (equity trades)
+
+1. Write or find a Pine Script strategy on TradingView
+2. Test it on the chart — look for consistent signals without excessive whipsawing
+3. Add an alert: `Condition: Order fills` → Webhook URL: your server
+4. The webhook payload must match this format:
+```json
+{
+  "secret_key": "your_WEBHOOK_SECRET_TOKEN",
+  "ticker": "AAPL",
+  "action": "BUY",
+  "price": 195.50,
+  "rsi": 54.2,
+  "atr": 2.31,
+  "vol": 45000000,
+  "stop_loss_atr_multiplier": 2.0,
+  "risk_tier": 0,
+  "vix": 16.4,
+  "spy_price": 580.0,
+  "spy_200_sma": 565.0
+}
+```
+5. The bot validates, sizes, and executes. You get a Telegram confirmation.
+
+### Using paper trading to validate
+
+Before going live with any new strategy:
+1. Set `ALPACA_BASE_URL=https://paper-api.alpaca.markets`
+2. Run the strategy on TradingView pointing to your server
+3. Monitor Telegram for signals and check Alpaca paper dashboard
+4. After 30–60 trading days, check the win rate and P&L
+5. Only switch to live if the paper results are solid
+
+### The signal pipeline is open
+
+The `/webhook` endpoint accepts signals from any source — not just TradingView. You could send signals from a Python script, a Jupyter notebook, another service, or anything that can make an HTTP POST request. The only requirement is the correct `secret_key` and the fields above.
