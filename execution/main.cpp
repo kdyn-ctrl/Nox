@@ -179,12 +179,9 @@ private:
     RegimeStateMachine regimeMachine;
     std::string last_analyst_report_time;
 
-    // Options signal generator config
-    std::vector<std::string> optionsWatchlist_;
-    int                      optionsScanIntervalMin_;
-    double                   optionsFreeCapitalAmount_;
-    bool                     optionsAutoExecute_;
-    int                      optionsQtyContracts_;
+    // Options signal generator profiles (personal + bot)
+    nox::options_signal::RiskProfile optionsBotProfile_;
+    nox::options_signal::RiskProfile optionsPersonalProfile_;
 
     // CN-RULE-002: T+1 position state — maps ticker → entry date.
     // Written on confirmed BUY, read & evicted on confirmed SELL.
@@ -779,50 +776,71 @@ public:
         Logger::log("INFO", "[CN-RULE-002] T+1 positions persistence path: " + cnPositionsPath);
         load_china_positions();
 
-        // ── Options signal generator (all optional — safe defaults) ────────────
+        // ── Options signal generator profiles (all env vars optional) ──────────
         {
-            const char* wl = std::getenv("OPTIONS_WATCHLIST");
-            std::string wl_str = (wl && std::string(wl) != "")
-                ? std::string(wl) : "SPY,QQQ,AAPL,TSLA,NVDA";
+            // Helper: parse a comma-separated watchlist string into a vector
+            auto parseWatchlist = [](const std::string& s) {
+                std::vector<std::string> v;
+                std::istringstream ss(s);
+                std::string tok;
+                while (std::getline(ss, tok, ','))
+                    if (!tok.empty()) v.push_back(tok);
+                return v;
+            };
+            auto envStr  = [](const char* k, const std::string& def) -> std::string {
+                const char* v = std::getenv(k);
+                return (v && std::string(v) != "") ? std::string(v) : def;
+            };
+            auto envBool = [](const char* k) -> bool {
+                const char* v = std::getenv(k);
+                return v && (std::string(v) == "true" || std::string(v) == "1");
+            };
+            auto envInt  = [](const char* k, int def) -> int {
+                const char* v = std::getenv(k);
+                if (!v || std::string(v).empty()) return def;
+                try { return std::max(1, std::stoi(std::string(v))); } catch (...) { return def; }
+            };
+            auto envDbl  = [](const char* k, double def) -> double {
+                const char* v = std::getenv(k);
+                if (!v || std::string(v).empty()) return def;
+                try { return std::stod(std::string(v)); } catch (...) { return def; }
+            };
 
-            std::istringstream ss(wl_str);
-            std::string token;
-            while (std::getline(ss, token, ',')) {
-                if (!token.empty()) optionsWatchlist_.push_back(token);
-            }
+            // ── BOT profile — conservative automated trading ──────────────────
+            optionsBotProfile_ = nox::options_signal::RiskProfile::bot();
+            optionsBotProfile_.watchlist = parseWatchlist(
+                envStr("OPTIONS_BOT_WATCHLIST", "SPY,QQQ,AAPL,TSLA,NVDA"));
+            optionsBotProfile_.scan_interval_minutes =
+                envInt("OPTIONS_BOT_SCAN_INTERVAL_MINUTES", 30);
+            optionsBotProfile_.auto_execute =
+                envBool("OPTIONS_BOT_AUTO_EXECUTE");
+            optionsBotProfile_.qty_contracts =
+                envInt("OPTIONS_BOT_QTY_CONTRACTS", 1);
+            optionsBotProfile_.free_capital_amount =
+                envDbl("OPTIONS_BOT_FREE_CAPITAL_AMOUNT", 0.0);
 
-            optionsScanIntervalMin_ = 30;
-            const char* interval_env = std::getenv("OPTIONS_SCAN_INTERVAL_MINUTES");
-            if (interval_env && std::string(interval_env) != "") {
-                try { optionsScanIntervalMin_ = std::stoi(std::string(interval_env)); }
-                catch (...) {}
-            }
+            // ── PERSONAL profile — high-risk-tolerance advisory signals ────────
+            optionsPersonalProfile_ = nox::options_signal::RiskProfile::personal();
+            optionsPersonalProfile_.watchlist = parseWatchlist(
+                envStr("OPTIONS_PERSONAL_WATCHLIST", "SPY,QQQ,AAPL,TSLA,NVDA,AMZN,META"));
+            optionsPersonalProfile_.scan_interval_minutes =
+                envInt("OPTIONS_PERSONAL_SCAN_INTERVAL_MINUTES", 30);
+            optionsPersonalProfile_.auto_execute = false; // personal signals are advisory only
+            optionsPersonalProfile_.qty_contracts =
+                envInt("OPTIONS_PERSONAL_QTY_CONTRACTS", 1);
+            optionsPersonalProfile_.free_capital_amount =
+                envDbl("OPTIONS_PERSONAL_FREE_CAPITAL_AMOUNT", 0.0);
 
-            optionsFreeCapitalAmount_ = 0.0;
-            const char* fc_env = std::getenv("OPTIONS_FREE_CAPITAL_AMOUNT");
-            if (fc_env && std::string(fc_env) != "") {
-                try { optionsFreeCapitalAmount_ = std::stod(std::string(fc_env)); }
-                catch (...) {}
-            }
-
-            optionsAutoExecute_ = false;
-            const char* ae_env = std::getenv("OPTIONS_AUTO_EXECUTE");
-            if (ae_env && (std::string(ae_env) == "true" || std::string(ae_env) == "1"))
-                optionsAutoExecute_ = true;
-
-            optionsQtyContracts_ = 1;
-            const char* qty_env = std::getenv("OPTIONS_QTY_CONTRACTS");
-            if (qty_env && std::string(qty_env) != "") {
-                try { optionsQtyContracts_ = std::max(1, std::stoi(std::string(qty_env))); }
-                catch (...) {}
-            }
-
-            Logger::log("INFO", "[OPTIONS_SIGNAL] Watchlist: " + wl_str
-                + " | Interval: " + std::to_string(optionsScanIntervalMin_) + " min"
-                + " | AutoExecute: " + (optionsAutoExecute_ ? "ON" : "OFF (advisory)")
-                + " | Qty: " + std::to_string(optionsQtyContracts_) + " contract(s)"
-                + (optionsFreeCapitalAmount_ > 0.0
-                    ? " | Free Capital: $" + std::to_string(optionsFreeCapitalAmount_)
+            Logger::log("INFO", "[OPTIONS_SIGNAL] BOT profile: AutoExecute="
+                + std::string(optionsBotProfile_.auto_execute ? "ON" : "OFF (advisory)")
+                + " | Watchlist=" + std::to_string(optionsBotProfile_.watchlist.size()) + " tickers"
+                + " | Interval=" + std::to_string(optionsBotProfile_.scan_interval_minutes) + "min");
+            Logger::log("INFO", "[OPTIONS_SIGNAL] PERSONAL profile: always advisory"
+                + std::string(" | Watchlist=")
+                + std::to_string(optionsPersonalProfile_.watchlist.size()) + " tickers"
+                + " | Interval=" + std::to_string(optionsPersonalProfile_.scan_interval_minutes) + "min"
+                + (optionsPersonalProfile_.free_capital_amount > 0.0
+                    ? " | FreeCapital=$" + std::to_string(optionsPersonalProfile_.free_capital_amount)
                     : ""));
         }
 
@@ -1030,34 +1048,37 @@ public:
             res.set_content("Processed " + std::to_string(success_count) + " signal(s)", "text/plain");
         }); // This perfectly closes the svr.Post router lambda
 
-        // ── Options signal scanner background thread ────────────────────────
-        std::thread options_thread([this]() {
-            std::string tg_token  = std::getenv("TELEGRAM_BOT_TOKEN")  ? std::getenv("TELEGRAM_BOT_TOKEN")  : "";
-            std::string tg_chat   = std::getenv("TELEGRAM_CHAT_ID")    ? std::getenv("TELEGRAM_CHAT_ID")    : "";
+        // ── Options signal scanner — two threads, one per profile ──────────────
+        auto launchOptionsThread = [this](nox::options_signal::RiskProfile profile) {
+            std::thread t([this, profile]() {
+                std::string tg_token = std::getenv("TELEGRAM_BOT_TOKEN") ? std::getenv("TELEGRAM_BOT_TOKEN") : "";
+                std::string tg_chat  = std::getenv("TELEGRAM_CHAT_ID")   ? std::getenv("TELEGRAM_CHAT_ID")   : "";
 
-            nox::options_signal::OptionsSignalGenerator generator(
-                alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat,
-                optionsFreeCapitalAmount_,
-                optionsAutoExecute_,
-                optionsQtyContracts_
-            );
+                nox::options_signal::OptionsSignalGenerator generator(
+                    alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat, profile);
 
-            while (true) {
-                try {
-                    double equity = fetch_account_equity();
-                    if (equity > 0.0) {
-                        generator.run_scan(optionsWatchlist_, equity);
-                    } else {
-                        Logger::log("WARN", "[OPTIONS_SIGNAL] Skipping scan — equity unavailable.");
+                while (true) {
+                    try {
+                        double equity = fetch_account_equity();
+                        if (equity > 0.0) {
+                            generator.run_scan(equity);
+                        } else {
+                            Logger::log("WARN", "[OPTIONS_SIGNAL][" + profile.name +
+                                        "] Skipping scan — equity unavailable.");
+                        }
+                    } catch (const std::exception& e) {
+                        Logger::log("WARN", "[OPTIONS_SIGNAL][" + profile.name +
+                                    "] Scan exception: " + std::string(e.what()));
                     }
-                } catch (const std::exception& e) {
-                    Logger::log("WARN", "[OPTIONS_SIGNAL] Scan exception: " + std::string(e.what()));
+                    std::this_thread::sleep_for(
+                        std::chrono::minutes(profile.scan_interval_minutes));
                 }
-                std::this_thread::sleep_for(
-                    std::chrono::minutes(optionsScanIntervalMin_));
-            }
-        });
-        options_thread.detach();
+            });
+            t.detach();
+        };
+
+        launchOptionsThread(optionsBotProfile_);
+        launchOptionsThread(optionsPersonalProfile_);
         // ────────────────────────────────────────────────────────────────────
 
         Logger::log("INFO", "Nox Execution Engine listening on 0.0.0.0:8080...");
