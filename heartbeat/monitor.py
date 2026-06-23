@@ -512,10 +512,12 @@ def send_status(message):
         try:
             start_time = time.time()
             exec_res = requests.get("http://execution-engine:8080/health", timeout=HTTP_TIMEOUT)
-            if exec_res.status_code == 200 and exec_res.json().get("status") == "healthy":
-                exec_status = "ONLINE"
-                exec_ping = int((time.time() - start_time) * 1000)
-        except requests.RequestException:
+            if exec_res.status_code == 200:
+                data = exec_res.json()
+                if data.get("status") == "healthy":
+                    exec_status = "ONLINE"
+                    exec_ping = int((time.time() - start_time) * 1000)
+        except (requests.RequestException, ValueError):
             pass  # Status remains OFFLINE
 
         data_status, data_cache_age = "OFFLINE", "N/A"
@@ -530,7 +532,7 @@ def send_status(message):
                         last_updated = datetime.fromisoformat(last_updated_str.replace("Z", "+00:00"))
                         age = datetime.now(ZoneInfo("UTC")) - last_updated
                         data_cache_age = f"{int(age.total_seconds() // 60)}m ago"
-        except requests.RequestException:
+        except (requests.RequestException, ValueError):
             pass # Status remains OFFLINE
 
         america_data_status, america_data_cache_age = "OFFLINE", "N/A"
@@ -545,7 +547,7 @@ def send_status(message):
                         last_updated = datetime.fromisoformat(last_updated_str.replace("Z", "+00:00"))
                         age = datetime.now(ZoneInfo("UTC")) - last_updated
                         america_data_cache_age = f"{int(age.total_seconds() // 60)}m ago"
-        except requests.RequestException:
+        except (requests.RequestException, ValueError):
             pass # Status remains OFFLINE
 
         # --- 2. Query Memory Bank ---
