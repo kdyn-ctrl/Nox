@@ -85,6 +85,7 @@ services:
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
     volumes:
       - ./data:/app/data
+    command: sh -c "chown -R root:root /app/data && python -u monitor.py"
     networks:
       - nox_net
 
