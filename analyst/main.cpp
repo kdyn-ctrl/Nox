@@ -322,7 +322,7 @@ int main() {
                 };
 
                 // Hit the execution container directly over the shared Docker bridge network
-                httplib::Client cli("execution", 8080);
+                httplib::Client cli("execution-engine", 8080);
                 cli.set_connection_timeout(std::chrono::seconds(5));
                 cli.set_read_timeout(std::chrono::seconds(10));
 
