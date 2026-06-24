@@ -35,7 +35,15 @@ struct UnderlyingData {
     double sma50    = 0.0;
     double rsi14    = 0.0;
     double atr14    = 0.0;
+    double hrv30    = 0.20; // 30-day historical realized volatility (annualized)
     bool   valid    = false;
+};
+
+// Returned by fetchIVData — actual IV level from Alpaca snapshot + display rank
+struct IVData {
+    double iv_level = 0.20; // annualized implied volatility (use in Black-Scholes)
+    double iv_rank  = 50.0; // within-snapshot relative position (display only)
+    bool   vol_rich = false; // iv_level > hrv30 * 1.20 — sell-premium environment
 };
 
 
@@ -264,15 +272,23 @@ private:
             sma20 /= 20.0;
             sma50 /= 50.0;
 
-            // RSI-14
-            double gain = 0.0, loss = 0.0;
-            size_t rsi_start = closes.size() - 15;
-            for (size_t i = rsi_start + 1; i < closes.size(); ++i) {
+            // RSI-14 (Wilder's smoothed — seed on bars [-50,-37], smooth over [-36,-1])
+            // Requires closes.size() >= 50, which is already enforced above.
+            double avg_gain = 0.0, avg_loss = 0.0;
+            size_t rsi_seed = closes.size() - 50;
+            for (size_t i = rsi_seed + 1; i <= rsi_seed + 14; ++i) {
                 double diff = closes[i] - closes[i - 1];
-                if (diff > 0) gain += diff; else loss -= diff;
+                if (diff > 0) avg_gain += diff; else avg_loss -= diff;
             }
-            gain /= 14.0; loss /= 14.0;
-            double rsi = (loss < 1e-9) ? 100.0 : 100.0 - (100.0 / (1.0 + gain / loss));
+            avg_gain /= 14.0; avg_loss /= 14.0;
+            for (size_t i = rsi_seed + 15; i < closes.size(); ++i) {
+                double diff = closes[i] - closes[i - 1];
+                double g = (diff > 0) ? diff : 0.0;
+                double l = (diff < 0) ? -diff : 0.0;
+                avg_gain = (avg_gain * 13.0 + g) / 14.0;
+                avg_loss = (avg_loss * 13.0 + l) / 14.0;
+            }
+            double rsi = (avg_loss < 1e-9) ? 100.0 : 100.0 - (100.0 / (1.0 + avg_gain / avg_loss));
 
             // ATR-14: average of true range over last 14 bars
             double atr_sum = 0.0;
@@ -284,23 +300,42 @@ private:
                 atr_sum += std::max({hl, hpc, lpc});
             }
 
+            // HRV-30: annualized close-to-close realized volatility (mean=0 assumption)
+            double hrv_sq_sum = 0.0;
+            size_t hrv_start  = closes.size() - 31; // 31 prices → 30 log-returns
+            for (size_t i = hrv_start + 1; i < closes.size(); ++i) {
+                double r = std::log(closes[i] / closes[i - 1]);
+                hrv_sq_sum += r * r;
+            }
+            double hrv30 = std::sqrt(hrv_sq_sum / 30.0 * 252.0);
+
             UnderlyingData d;
             d.price  = closes.back();
             d.sma20  = sma20;
             d.sma50  = sma50;
             d.rsi14  = rsi;
             d.atr14  = atr_sum / 14.0;
+            d.hrv30  = hrv30;
             d.valid  = true;
             return d;
         } catch (...) {}
         return {};
     }
 
-    // ── IV Rank via Alpaca options snapshot (falls back to VIX proxy) ─────────
+    // ── IV data via Alpaca options snapshot (falls back to VIX proxy) ───────────
+    //
+    // Returns:
+    //   iv_level — actual annualized implied volatility from the snapshot average.
+    //              Use this as σ in Black-Scholes; it is the real market vol estimate.
+    //   iv_rank  — where the snapshot average sits within the snapshot's own IV
+    //              spread (display only; NOT a 52-week percentile rank).
+    //   vol_rich — true when iv_level > hrv30 * 1.20, meaning options are pricing in
+    //              ~20% more vol than the stock recently realized → sell-premium edge.
 
-    double fetchIVRank(const std::string& symbol, double vix_fallback) const {
+    IVData fetchIVData(const std::string& symbol, double vix_fallback, double hrv30) const {
+        IVData result;
+
         try {
-            // Alpaca options snapshot endpoint (requires market data subscription)
             httplib::Client cli(alpacaUrl_);
             cli.set_connection_timeout(std::chrono::seconds(5));
             cli.set_read_timeout(std::chrono::seconds(10));
@@ -323,23 +358,35 @@ private:
                 const auto& snap = it.value();
                 if (snap.contains("greeks") && !snap["greeks"]["iv"].is_null()) {
                     double iv = snap["greeks"]["iv"].get<double>();
-                    iv_min    = std::min(iv_min, iv);
-                    iv_max    = std::max(iv_max, iv);
-                    iv_sum   += iv;
-                    ++iv_count;
+                    if (iv > 0.0 && iv < 5.0) { // sanity: reject clearly bad values
+                        iv_min  = std::min(iv_min, iv);
+                        iv_max  = std::max(iv_max, iv);
+                        iv_sum += iv;
+                        ++iv_count;
+                    }
                 }
             }
-            if (iv_count == 0 || (iv_max - iv_min) < 1e-6) throw std::runtime_error("no IV data");
+            if (iv_count == 0) throw std::runtime_error("no IV data");
 
-            double iv_current = iv_sum / iv_count;
-            return (iv_current - iv_min) / (iv_max - iv_min) * 100.0;
+            result.iv_level = iv_sum / iv_count; // actual annualized IV (use in BS)
+            result.iv_rank  = ((iv_max - iv_min) > 1e-6)
+                              ? (result.iv_level - iv_min) / (iv_max - iv_min) * 100.0
+                              : 50.0;
 
         } catch (...) {
-            // VIX proxy: VIX < 15 → ~20% rank, VIX 15–25 → mid, VIX > 30 → high
-            if (vix_fallback < 15.0)  return 15.0;
-            if (vix_fallback > 30.0)  return 70.0;
-            return (vix_fallback - 15.0) / 15.0 * 55.0 + 15.0;
+            // VIX proxy: equity IV is typically VIX * 1.3 (single-stock vol premium)
+            double vix_sigma   = vix_fallback / 100.0;
+            result.iv_level    = vix_sigma * 1.30;
+            result.iv_rank     = (vix_fallback < 15.0) ? 20.0
+                               : (vix_fallback > 30.0) ? 70.0
+                               : (vix_fallback - 15.0) / 15.0 * 50.0 + 20.0;
         }
+
+        // Vol richness: IV priced in at least 20% more than recently realized
+        if (hrv30 > 0.01)
+            result.vol_rich = (result.iv_level > hrv30 * 1.20);
+
+        return result;
     }
 
     // ── Directional bias from technicals ─────────────────────────────────────
@@ -359,35 +406,48 @@ private:
 
     // ── Strategy selection ────────────────────────────────────────────────────
     //
-    // Matrix: bias × iv_rank → strategy candidates (in preference order)
-    // Long premium preferred when IV Rank < 30 (cheap vol)
-    // Short premium preferred when IV Rank > 50 (expensive vol)
+    // Two complementary signals drive buy-premium vs sell-premium preference:
+    //
+    //   vol_rich  — IV > HRV * 1.20: options pricing in 20%+ more vol than was
+    //               recently realized. Sell premium: receive the variance risk
+    //               premium and let theta decay work in your favour.
+    //
+    //   vol_cheap — IV < HRV * 0.90: options are underpricing actual vol. Buy
+    //               premium: implied vol is likely to mean-revert upward.
+    //
+    //   iv_rank   — snapshot-relative position (secondary confirmation).
+    //               prefer_sell fires when rank ≥ sell_min OR vol_rich.
+    //               prefer_buy  fires when rank ≤ buy_max  OR vol_cheap.
+    //               When both fire, prefer_sell wins (variance premium is the
+    //               more theoretically grounded signal).
 
-    std::string selectStrategy(DirectionalBias bias, double iv_rank,
-                               const std::string& tier) const {
+    std::string selectStrategy(DirectionalBias bias, double iv_rank, double iv_level,
+                               double hrv, const std::string& tier) const {
         const double buy_max  = profile_.iv_rank_buy_max;
         const double sell_min = profile_.iv_rank_sell_min;
 
+        bool vol_rich  = (hrv > 0.01) && (iv_level > hrv * 1.20);
+        bool vol_cheap = (hrv > 0.01) && (iv_level < hrv * 0.90);
+
+        bool prefer_sell = vol_rich  || (iv_rank >= sell_min);
+        bool prefer_buy  = vol_cheap || (iv_rank <= buy_max);
+
+        // When conflicting: variance premium is more reliable → sell wins
+        if (prefer_sell && prefer_buy) prefer_buy = false;
+        // Default: buy premium if no signal fires
+        if (!prefer_sell && !prefer_buy) prefer_buy = true;
+
         if (bias == DirectionalBias::Bullish) {
-            if (iv_rank <= buy_max) {
-                if (strategyAllowed("BULL_CALL_SPREAD", tier)) return "BULL_CALL_SPREAD";
-                return "LONG_CALL";
-            }
-            if (iv_rank >= sell_min) {
+            if (prefer_sell) {
                 if (strategyAllowed("CSP", tier)) return "CSP";
-                return "LONG_CALL";
+                return "LONG_CALL"; // fallback if tier doesn't permit CSP
             }
-            // neutral zone between buy_max and sell_min
             if (strategyAllowed("BULL_CALL_SPREAD", tier)) return "BULL_CALL_SPREAD";
             return "LONG_CALL";
         }
 
         if (bias == DirectionalBias::Bearish) {
-            if (iv_rank <= buy_max) {
-                if (strategyAllowed("BEAR_PUT_SPREAD", tier)) return "BEAR_PUT_SPREAD";
-                return "LONG_PUT";
-            }
-            if (iv_rank >= sell_min) {
+            if (prefer_sell) {
                 if (strategyAllowed("CC", tier)) return "CC";
                 return "LONG_PUT";
             }
@@ -395,12 +455,13 @@ private:
             return "LONG_PUT";
         }
 
-        // Neutral — vol expansion play or income
-        if (iv_rank < buy_max * 0.8) { // well below buy threshold → straddle
-            if (strategyAllowed("STRADDLE", tier)) return "STRADDLE";
+        // Neutral — vol play
+        if (prefer_sell) {
+            if (strategyAllowed("STRANGLE", tier)) return "STRANGLE"; // defined-risk income
+            if (strategyAllowed("CSP", tier))      return "CSP";
         }
-        if (iv_rank >= sell_min) {
-            if (strategyAllowed("STRANGLE", tier)) return "STRANGLE";
+        if (prefer_buy) {
+            if (strategyAllowed("STRADDLE", tier)) return "STRADDLE"; // vol expansion play
         }
         if (strategyAllowed("CSP", tier)) return "CSP";
         return "LONG_CALL";
@@ -435,12 +496,15 @@ private:
         p.expiry = target_dte / 365.0;
 
         // Approximate expiry date string (calendar days from today)
+        // Use gmtime_r — thread-safe reentrant variant (POSIX); std::gmtime uses a
+        // shared static buffer that would be corrupted by concurrent scan threads.
         auto now    = std::chrono::system_clock::now();
         auto exp_tp = now + std::chrono::hours(24 * target_dte);
         auto exp_t  = std::chrono::system_clock::to_time_t(exp_tp);
-        std::tm* tm_ptr = std::gmtime(&exp_t);
+        std::tm tm_buf{};
+        gmtime_r(&exp_t, &tm_buf);
         std::ostringstream oss;
-        oss << std::put_time(tm_ptr, "%Y-%m-%d");
+        oss << std::put_time(&tm_buf, "%Y-%m-%d");
         p.expiry_date = oss.str();
 
         // Target strikes via delta search
@@ -450,11 +514,16 @@ private:
 
         auto findStrikeForDelta = [&](double target_delta,
                                       nox::options::OptionType opt_type) -> double {
-            // Walk strikes in $1 increments from deep OTM toward ATM
-            double best_strike = spot;
+            // Use standard listed-option strike increments:
+            //   $0.50 for stocks priced below $25, $1.00 for $25–$200, $5.00 above $200.
+            // This avoids generating strikes that don't exist on any exchange.
+            double step = (spot < 25.0) ? 0.50 : (spot < 200.0) ? 1.0 : 5.0;
+            double atm  = std::round(spot / step) * step;
+
+            double best_strike = atm;
             double best_diff   = 1e9;
-            for (int offset = -50; offset <= 50; ++offset) {
-                double s = std::round(spot / atr) * atr + offset * (atr * 0.5);
+            for (int offset = -30; offset <= 30; ++offset) {
+                double s = atm + offset * step;
                 if (s <= 0) continue;
                 nox::options::OptionContract c;
                 c.underlying     = spot;
@@ -510,7 +579,8 @@ private:
                                  double iv_rank, double iv_sigma,
                                  double rfr, double confidence,
                                  const std::string& tier,
-                                 bool fc_mode, double allocated_capital) const
+                                 bool fc_mode, double allocated_capital,
+                                 double hrv30) const
     {
         using namespace nox::options;
 
@@ -521,6 +591,8 @@ private:
         sig.strike            = cp.strike;
         sig.strike2           = cp.strike2;
         sig.iv_rank           = iv_rank;
+        sig.iv_level          = iv_sigma;
+        sig.hrv30             = hrv30;
         sig.rsi               = d.rsi14;
         sig.atr               = d.atr14;
         sig.confidence        = confidence;
@@ -626,21 +698,25 @@ private:
         }
 
         // Rationale
-        sig.rationale    = buildRationale(strategy, d, iv_rank);
+        sig.rationale    = buildRationale(strategy, d, iv_rank, iv_sigma, hrv30);
         sig.profile_name = profile_.name;
         return sig;
     }
 
     static std::string buildRationale(const std::string& strategy,
-                                      const UnderlyingData& d, double iv_rank)
+                                      const UnderlyingData& d,
+                                      double iv_rank, double iv_level, double hrv30)
     {
         std::string r = strategy + " on " +
                         (d.price > d.sma20 ? "bullish" : "bearish") + " bias. ";
         r += "RSI=" + fmt(d.rsi14) + ", ATR=" + fmt(d.atr14) + ". ";
-        r += "IV Rank=" + fmt(iv_rank, 0) + "% — ";
-        r += (iv_rank < 30) ? "cheap vol, buy premium."
-           : (iv_rank > 50) ? "expensive vol, sell premium."
-           : "neutral vol zone.";
+        r += "IV=" + fmt(iv_level * 100.0, 1) + "% (rank " + fmt(iv_rank, 0) +
+             "%) vs HRV=" + fmt(hrv30 * 100.0, 1) + "% — ";
+        bool rich  = (hrv30 > 0.01) && (iv_level > hrv30 * 1.20);
+        bool cheap = (hrv30 > 0.01) && (iv_level < hrv30 * 0.90);
+        r += rich  ? "vol RICH — variance premium favours sellers."
+           : cheap ? "vol CHEAP — mean-reversion favours buyers."
+           : "vol near fair value.";
         return r;
     }
 
@@ -686,6 +762,15 @@ private:
                             : (s.iv_rank > 50) ? "HIGH — sell premium zone ✅"
                             : "NEUTRAL";
 
+        bool vol_rich  = (s.hrv30 > 0.01) && (s.iv_level > s.hrv30 * 1.20);
+        bool vol_cheap = (s.hrv30 > 0.01) && (s.iv_level < s.hrv30 * 0.90);
+        std::string hrv_tag = vol_rich  ? "RICH (sellers edge ✅)"
+                            : vol_cheap ? "CHEAP (buyers edge ✅)"
+                            : "FAIR";
+        std::string hrv_line = "\n• IV: " + fmt(s.iv_level * 100.0, 1) +
+                               "% | HRV-30: " + fmt(s.hrv30 * 100.0, 1) +
+                               "% → " + hrv_tag;
+
         std::string alert =
             "📊 *OPTIONS SIGNAL — " + s.underlying + "* [" + s.profile_name + " · " + s.capital_tier + "]\n"
             "────────────────────────────────────\n"
@@ -702,7 +787,8 @@ private:
             " | Gamma: "  + fmt(s.greeks.gamma, 4) + "\n"
             "• Theta: $" + fmt(s.greeks.theta, 4) + "/day"
             " | Vega: "  + fmt(s.greeks.vega, 3) + "\n"
-            "• IV Rank: " + fmt(s.iv_rank, 0) + "% ← " + iv_zone + "\n"
+            "• IV Rank: " + fmt(s.iv_rank, 0) + "% ← " + iv_zone +
+            hrv_line + "\n"
             "\n📈 *Technicals — " + s.underlying + "*\n"
             "• RSI(14): " + fmt(s.rsi) +
             " | ATR(14): $" + fmt(s.atr) + "\n"
@@ -725,20 +811,16 @@ private:
             cli.set_connection_timeout(std::chrono::seconds(5));
             cli.set_read_timeout(std::chrono::seconds(10));
 
-            const size_t MAX_LEN = 4000;
-            size_t offset = 0;
-            while (offset < message.size()) {
-                std::string chunk = message.substr(offset, MAX_LEN);
-                offset += MAX_LEN;
-
-                json body = {
-                    {"chat_id",    tgChatId_},
-                    {"text",       chunk},
-                    {"parse_mode", "Markdown"}
-                };
-                std::string path = "/bot" + tgToken_ + "/sendMessage";
-                cli.Post(path.c_str(), body.dump(), "application/json");
-            }
+            // Send as a single message — options alerts are <1500 bytes, well within
+            // Telegram's 4096-byte hard limit. Byte-boundary chunking would split
+            // multi-byte UTF-8 emoji sequences and unclosed Markdown spans.
+            json body = {
+                {"chat_id",    tgChatId_},
+                {"text",       message},
+                {"parse_mode", "Markdown"}
+            };
+            std::string path = "/bot" + tgToken_ + "/sendMessage";
+            cli.Post(path.c_str(), body.dump(), "application/json");
         } catch (...) {
             log("WARN", "[OPTIONS_SIGNAL] Telegram delivery failed.");
         }
@@ -759,16 +841,14 @@ private:
             return;
         }
 
-        double iv_rank  = fetchIVRank(ticker, vix);
-
-        // IV sigma for Black-Scholes: convert IV rank to approximate σ
-        // Heuristic: IV rank 0→0.15 σ, rank 50→0.25, rank 100→0.45
-        double iv_sigma = 0.15 + (iv_rank / 100.0) * 0.30;
+        IVData iv_data  = fetchIVData(ticker, vix, d.hrv30);
+        double iv_rank  = iv_data.iv_rank;
+        double iv_sigma = iv_data.iv_level; // actual market IV — use directly in BS
 
         double rfr = 0.05; // US risk-free rate (approximate)
 
         DirectionalBias bias     = computeBias(d);
-        std::string     strategy = selectStrategy(bias, iv_rank, tier);
+        std::string     strategy = selectStrategy(bias, iv_rank, iv_sigma, d.hrv30, tier);
 
         double conf = regimeConfidence(regime.current_regime, strategy);
         if (conf < 1e-6) {
@@ -785,7 +865,8 @@ private:
 
         OptionsSignal sig = assembleSignal(ticker, d, strategy, cp,
                                            iv_rank, iv_sigma, rfr, conf,
-                                           tier, fc_mode, effective_capital);
+                                           tier, fc_mode, effective_capital,
+                                           d.hrv30);
 
         std::string alert = formatAlert(sig, vix, regime);
         sendTelegram(alert);
@@ -800,11 +881,27 @@ private:
     // ── Live order execution via OptionsOrderRouter ───────────────────────────
 
     void executeSignal(const OptionsSignal& sig) const {
-        // Include the router here (inside the function) to break the forward-declaration
-        // dependency. OptionsOrderRouter.hpp must be included in main.cpp before this
-        // header for ODR compliance; the router is instantiated per-signal, which is
-        // fine given the low frequency of options scans.
         nox::options_router::OptionsOrderRouter router(alpacaUrl_, apiKey_, apiSec_);
+
+        // Covered calls require 100 shares per contract as collateral.
+        // Without them Alpaca would receive a naked short call — uncapped downside.
+        // Abort and notify rather than let an unintended naked position through.
+        if (sig.strategy == "CC") {
+            if (!router.validateCCPosition(sig.underlying, profile_.qty_contracts)) {
+                log("WARN", "[OPTIONS_EXEC] CC aborted — need " +
+                    std::to_string(profile_.qty_contracts * 100) +
+                    " shares of " + sig.underlying + ", none found.");
+                sendTelegram(
+                    "⚠️ *CC ORDER SKIPPED — " + sig.underlying + "*\n"
+                    "────────────────────────\n"
+                    "Need " + std::to_string(profile_.qty_contracts * 100) +
+                    " shares for a covered call. No position found.\n"
+                    "_Advisory signal still valid — execute manually if you hold the shares._"
+                );
+                return;
+            }
+        }
+
         auto result = router.route(sig, profile_.qty_contracts);
 
         if (result.success) {

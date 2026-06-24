@@ -26,6 +26,8 @@ struct OptionsSignal {
     double breakeven    = 0.0;
     nox::options::OptionGreeks greeks{};
     double iv_rank      = 50.0;
+    double iv_level     = 0.20; // actual implied volatility (annualized sigma from snapshot)
+    double hrv30        = 0.20; // 30-day historical realized volatility
     double rsi          = 50.0;
     double atr          = 0.0;
     double confidence   = 1.0; // 0–1, regime-adjusted

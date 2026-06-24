@@ -61,6 +61,22 @@ public:
         , apiSec_(apiSec)
     {}
 
+    // Verify the account holds enough shares for a covered call (100 per contract).
+    // Returns true if shares are confirmed; false if the position is absent or the
+    // API call fails. Callers should abort CC execution if this returns false.
+    bool validateCCPosition(const std::string& underlying, int qty_contracts) const {
+        try {
+            auto cli = makeClient();
+            auto res = cli.Get(("/v2/positions/" + underlying).c_str(), authHeaders());
+            if (!res || res->status != 200) return false;
+            json body  = json::parse(res->body);
+            double qty = body.value("qty", 0.0);
+            return qty >= static_cast<double>(qty_contracts) * 100.0;
+        } catch (...) {
+            return false;
+        }
+    }
+
     // Main entry point. Takes a fully assembled OptionsSignal and routes it.
     // Returns an OrderResult — caller logs and Telegrams based on outcome.
     OrderResult route(const nox::options_signal::OptionsSignal& sig, int qty_contracts = 1) {
@@ -227,11 +243,12 @@ private:
         std::string side = is_short ? "sell" : "buy";
 
         json order = {
-            {"symbol",        contract.occ_symbol},
-            {"qty",           std::to_string(qty_contracts)},
-            {"side",          side},
-            {"type",          "market"},
-            {"time_in_force", "day"}
+            {"symbol",          contract.occ_symbol},
+            {"qty",             std::to_string(qty_contracts)},
+            {"side",            side},
+            {"type",            "market"},
+            {"time_in_force",   "day"},
+            {"position_effect", "open"}
         };
 
         return submitOrder(order, contract.occ_symbol);
