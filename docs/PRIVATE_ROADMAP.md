@@ -134,10 +134,10 @@ A tighter stop usually hurts win rate but improves expected value by capping los
 ### 2a. True IV Rank (52-week percentile) — ✅ IMPLEMENTED
 
 > Live: the Historical IV Dataset System collects EOD IV snapshots and computes a
-> rolling IV Rank, consumed by the signal generator's vol-richness gates
-> (`iv_rank_sell_min` / `iv_rank_buy_max` per profile). NOTE: confirm the
-> generator reads the historical rank rather than the legacy snapshot-relative
-> value in every path — see "Suggested next polish".
+> rolling IV Rank. NOTE: this lives in the `heartbeat` Python subsystem and is
+> NOT yet consumed by the C++ signal generator (which gates on the HRV-based
+> variance-premium signal instead). Wiring it into C++ is tracked under
+> "Still open" below.
 
 The single most important data upgrade. Real IV rank compares today's IV to
 the full 52-week range of daily IV, not just the current snapshot.
@@ -256,17 +256,27 @@ Interactive Brokers TWS API (headless IB Gateway, paper 4002 / live 4001):
 Status: prototype lives in the private development branch; not wired into the
 public showcase engine.
 
-### Suggested next polish (small, high-signal)
+### Recently fixed (small, high-signal)
 
-- **PositionManager shutdown latency:** `stop_monitoring()` joins a thread that may
-  be mid-`sleep_for(30 min)`, so shutdown can hang up to 30 minutes. Replace the
-  bare sleep with a `std::condition_variable::wait_for` on the stop flag for an
-  interruptible wait. (The flag itself is now `std::atomic<bool>` — the data race
-  is fixed.)
-- **IV Rank wiring audit:** confirm `selectStrategy`/signal assembly consume the
-  historical IV Rank everywhere; the legacy snapshot-relative `iv_rank`
-  (`display only`) comment in `OptionsSignalGenerator` suggests at least one path
-  may still use the snapshot value.
+- ✅ **PositionManager shutdown latency:** the inter-cycle wait is now a
+  `condition_variable::wait_for` on the stop flag, woken by `stop_monitoring()`,
+  so shutdown is immediate instead of hanging up to 30 minutes. (The flag is also
+  `std::atomic<bool>` — the prior data race is fixed.)
+- ✅ **Snapshot IV-rank gating removed:** `selectStrategy` no longer triggers
+  buy/sell-premium on the snapshot-relative `iv_rank` (which measured intra-chain
+  skew dispersion, not vol richness). It now gates purely on the HRV-based
+  variance-premium signal; snapshot `iv_rank` is display-only.
+- ✅ **Earnings-fetch compile fix:** `headers.insert(k, v)` → `headers.emplace(k, v)`
+  (`httplib::Headers` is an `unordered_multimap` with no 2-arg insert; the prior
+  call did not compile).
+
+### Still open
+
+- **True historical IV Rank → C++:** the real 52-week rank lives in the `heartbeat`
+  Python subsystem (`calculate_iv_rank`, EOD SQLite store) and is NOT consumed by
+  the C++ signal path. Wire it in via a new heartbeat HTTP endpoint (or shared-DB
+  read) so the profile `iv_rank_buy_max` / `iv_rank_sell_min` thresholds gate on a
+  real percentile. Until then those thresholds are reserved (unused by the gate).
 
 ---
 
