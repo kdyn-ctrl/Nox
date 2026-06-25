@@ -102,8 +102,17 @@ double get_option_price_from_alpaca(const OptionPosition& position,
 
 void PositionManager::monitor_positions() {
     while (run_monitoring_) {
-        // Sleep for 30 minutes between monitoring cycles (RULE-008: respects Alpaca timeouts)
-        std::this_thread::sleep_for(std::chrono::minutes(30));
+        // Wait 30 minutes between monitoring cycles (RULE-008: respects Alpaca
+        // timeouts), but wake early if stop_monitoring() is called so shutdown is
+        // immediate. wait_for returns true when the predicate (stop requested)
+        // becomes true → break the loop; false on timeout → run the next cycle.
+        {
+            std::unique_lock<std::mutex> lock(monitor_lock_);
+            if (monitor_cv_.wait_for(lock, std::chrono::minutes(30),
+                                     [this] { return !run_monitoring_.load(); })) {
+                break;
+            }
+        }
 
         auto open_positions = get_open_positions();
         if (open_positions.empty()) {
