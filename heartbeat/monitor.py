@@ -9,7 +9,8 @@ import time
 import threading
 import xml.etree.ElementTree as ET
 import sqlite3
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from telebot.util import smart_split
 from bs4 import BeautifulSoup
@@ -37,6 +38,13 @@ print("[INFO] [HEARTBEAT] All required environment variables validated.", flush=
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 claude = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+# Configure logging for IV collection pipeline
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(levelname)s] [HEARTBEAT] %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 DB_PATH = '/app/data/memory_bank.db'
 
@@ -92,6 +100,20 @@ def init_db():
                         sizing_kelly_ratio REAL,
                         pnl REAL
                     )
+                ''')
+                c.execute('''
+                    CREATE TABLE IF NOT EXISTS historical_volatility (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ticker TEXT NOT NULL,
+                        date DATE NOT NULL,
+                        implied_volatility REAL NOT NULL,
+                        snapshot_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(ticker, date)
+                    )
+                ''')
+                c.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_iv_ticker_date
+                    ON historical_volatility(ticker, date)
                 ''')
                 conn.commit()
     except Exception as e:
@@ -408,6 +430,249 @@ def run_scout_protocol():
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] Scout protocol failed: {e}", flush=True)
 
+# --- 2.7 HISTORICAL IMPLIED VOLATILITY COLLECTION ---
+
+def fetch_options_chain_iv(ticker: str) -> float | None:
+    """
+    Fetches the options chain for a ticker and calculates a weighted-average
+    implied volatility (IV) from both call and put options.
+
+    Uses Alpaca's /v1beta3/options/chains endpoint for end-of-day snapshot.
+    Weights by open interest to reflect market conviction.
+
+    Returns: weighted average IV as a float, or None if fetch fails.
+    """
+    headers = {
+        'APCA-API-KEY-ID': ALPACA_API,
+        'APCA-API-SECRET-KEY': ALPACA_SEC
+    }
+
+    try:
+        # Alpaca options chains endpoint — paper trading API
+        url = f"https://paper-api.alpaca.markets/v1beta3/options/chains/{ticker}"
+        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+
+        if resp.status_code != 200:
+            logger.warning(f"Alpaca options chain request failed for {ticker}: HTTP {resp.status_code}")
+            return None
+
+        data = resp.json()
+        if not data or 'chains' not in data:
+            logger.warning(f"No options chain data returned for {ticker}")
+            return None
+
+        # Collect all IV values weighted by open interest
+        iv_values = []
+        total_oi = 0
+
+        chains = data.get('chains', [])
+        for chain_entry in chains:
+            if 'iv' in chain_entry and chain_entry.get('iv') is not None:
+                iv = float(chain_entry['iv'])
+                oi = float(chain_entry.get('open_interest', 0))
+                if oi > 0:
+                    iv_values.append((iv, oi))
+                    total_oi += oi
+
+        if not iv_values or total_oi == 0:
+            logger.warning(f"No liquid options (with open interest) found for {ticker}")
+            return None
+
+        # Weighted average IV
+        weighted_iv = sum(iv * oi for iv, oi in iv_values) / total_oi
+        logger.info(f"Fetched IV for {ticker}: {weighted_iv:.4f} (from {len(iv_values)} contracts, OI: {total_oi})")
+        return weighted_iv
+
+    except Exception as e:
+        logger.error(f"Exception fetching options chain for {ticker}: {e}")
+        return None
+
+
+def store_iv_snapshot(ticker: str, iv: float, date_str: str) -> bool:
+    """
+    Writes an IV snapshot to the historical_volatility table.
+    Uses db_lock to prevent concurrent writes.
+
+    Args:
+        ticker: Stock symbol
+        iv: Implied volatility as a decimal (e.g., 0.35 for 35%)
+        date_str: Date string in YYYY-MM-DD format
+
+    Returns: True if successful, False otherwise.
+    """
+    try:
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute(
+                    """
+                    INSERT OR REPLACE INTO historical_volatility
+                    (ticker, date, implied_volatility, snapshot_timestamp)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (ticker, date_str, iv)
+                )
+                conn.commit()
+        logger.info(f"Stored IV snapshot: {ticker} on {date_str} = {iv:.4f}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to store IV snapshot for {ticker}: {e}")
+        return False
+
+
+def collect_eod_iv_snapshots():
+    """
+    Post-market collection task (runs at 16:30 ET).
+    Iterates through the watchlist, fetches current IV from Alpaca,
+    and writes each snapshot to the historical_volatility table.
+
+    Failures on individual tickers don't block the full task.
+    """
+    logger.info("Starting end-of-day IV snapshot collection...")
+    et_tz = ZoneInfo('America/New_York')
+    today = datetime.now(et_tz).strftime('%Y-%m-%d')
+
+    successful = 0
+    failed = 0
+
+    for ticker in WATCHLIST:
+        iv = fetch_options_chain_iv(ticker)
+        if iv is not None:
+            if store_iv_snapshot(ticker, iv, today):
+                successful += 1
+            else:
+                failed += 1
+        else:
+            failed += 1
+
+    logger.info(f"EOD IV collection complete: {successful} succeeded, {failed} failed")
+
+
+def calculate_iv_rank(ticker: str, current_iv: float | None = None) -> dict:
+    """
+    Calculates a ticker's IV Rank by comparing today's IV against accumulated
+    historical records in the historical_volatility table.
+
+    IV Rank = (Current IV - 52-week low) / (52-week high - 52-week low)
+    Result is clamped to [0, 1] representing percentile in the recent range.
+
+    If fewer than 30 days of data exist, falls back to a snapshot-relative
+    calculation (Current IV - Average IV) / Average IV and logs a warning.
+
+    Args:
+        ticker: Stock symbol
+        current_iv: Optional current IV value. If None, fetches from Alpaca.
+
+    Returns: Dictionary with keys:
+        - iv_rank: Percentile float in [0, 1], or None if calculation fails
+        - current_iv: Current IV value used
+        - method: "full_history" or "snapshot_relative" or "error"
+        - data_points: Number of historical data points used
+        - days_available: Number of distinct trading days in history
+    """
+    try:
+        # Fetch current IV if not provided
+        if current_iv is None:
+            current_iv = fetch_options_chain_iv(ticker)
+            if current_iv is None:
+                return {
+                    'iv_rank': None,
+                    'current_iv': None,
+                    'method': 'error',
+                    'data_points': 0,
+                    'days_available': 0,
+                    'error': f'Could not fetch current IV for {ticker}'
+                }
+
+        # Query historical IV data
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute(
+                    """
+                    SELECT implied_volatility, date
+                    FROM historical_volatility
+                    WHERE ticker = ?
+                    ORDER BY date DESC
+                    LIMIT 252
+                    """,
+                    (ticker,)
+                )
+                rows = c.fetchall()
+
+        if not rows:
+            logger.warning(f"No historical IV data found for {ticker}; cannot calculate rank")
+            return {
+                'iv_rank': None,
+                'current_iv': current_iv,
+                'method': 'error',
+                'data_points': 0,
+                'days_available': 0,
+                'error': 'No historical data'
+            }
+
+        iv_history = [row[0] for row in rows]
+        unique_dates = len(set(row[1] for row in rows))
+
+        # Full history method: 30+ days available
+        if unique_dates >= 30:
+            iv_min = min(iv_history)
+            iv_max = max(iv_history)
+
+            if iv_max == iv_min:
+                # All IVs identical — clamp to 0.5 (middle of range)
+                iv_rank = 0.5
+            else:
+                iv_rank = (current_iv - iv_min) / (iv_max - iv_min)
+                iv_rank = max(0.0, min(1.0, iv_rank))  # Clamp to [0, 1]
+
+            logger.info(
+                f"IV Rank for {ticker}: {iv_rank:.2%} "
+                f"(Current={current_iv:.4f}, Min={iv_min:.4f}, Max={iv_max:.4f}, Points={len(iv_history)})"
+            )
+            return {
+                'iv_rank': iv_rank,
+                'current_iv': current_iv,
+                'method': 'full_history',
+                'data_points': len(iv_history),
+                'days_available': unique_dates,
+                'iv_min': iv_min,
+                'iv_max': iv_max
+            }
+        else:
+            # Fallback: snapshot-relative percentile
+            logger.warning(
+                f"Insufficient data for {ticker}: only {unique_dates} days (need 30+). "
+                f"Falling back to snapshot-relative calculation."
+            )
+            avg_iv = sum(iv_history) / len(iv_history)
+            if avg_iv > 0:
+                iv_rank = (current_iv - avg_iv) / avg_iv
+                iv_rank = max(0.0, min(1.0, iv_rank))  # Clamp to [0, 1]
+            else:
+                iv_rank = 0.5
+
+            return {
+                'iv_rank': iv_rank,
+                'current_iv': current_iv,
+                'method': 'snapshot_relative',
+                'data_points': len(iv_history),
+                'days_available': unique_dates,
+                'average_iv': avg_iv
+            }
+
+    except Exception as e:
+        logger.error(f"Exception calculating IV Rank for {ticker}: {e}")
+        return {
+            'iv_rank': None,
+            'current_iv': None,
+            'method': 'error',
+            'data_points': 0,
+            'days_available': 0,
+            'error': str(e)
+        }
+
+
 def schedule_checker():
     # RULE-006: Daily Scout MUST fire at 10:00 AM Eastern Time (ET), not UTC.
     #
@@ -460,9 +725,40 @@ def schedule_checker():
     # --- Initial registration at startup ---
     _reschedule_scout()
 
-    # Recompute the UTC equivalent each night so DST transitions are handled
-    # automatically without any container restart.
-    schedule.every().day.at("00:01").do(_reschedule_scout)
+    # --- IV Collection Scheduler (Post-Market) ---
+    # RULE-006 applies here too: schedule 16:30 ET, which varies by DST offset.
+    # We reschedule at 00:01 UTC each day to maintain the correct wall clock time.
+
+    def _reschedule_iv_collection():
+        """
+        Clear any existing 'iv_collection' job, compute the UTC wall-clock time that
+        corresponds to 4:30 PM ET (market close + buffer) *today*, and register a new job.
+        Called once at startup and then nightly at 00:01 UTC.
+        """
+        schedule.clear("iv_collection")
+
+        now_et     = datetime.now(tz=ET)
+        # 16:30 ET = 4:30 PM ET (market close is 16:00, so this gives 30 min buffer)
+        target_et  = now_et.replace(hour=16, minute=30, second=0, microsecond=0)
+        target_utc = target_et.astimezone(UTC)
+        utc_hhmm   = target_utc.strftime("%H:%M")
+
+        schedule.every().day.at(utc_hhmm).do(collect_eod_iv_snapshots).tag("iv_collection")
+        logger.info(
+            f"EOD IV collection (re)scheduled: "
+            f"4:30 PM ET (post-market) = {utc_hhmm} UTC "
+            f"({'EDT UTC-4' if target_et.utcoffset().total_seconds() == -14400 else 'EST UTC-5'})."
+        )
+
+    _reschedule_iv_collection()
+
+    # Reschedule IV collection each night along with the scout
+    def _combined_reschedule():
+        _reschedule_scout()
+        _reschedule_iv_collection()
+
+    schedule.clear("reschedule")
+    schedule.every().day.at("00:01").do(_combined_reschedule).tag("reschedule")
 
     while True:
         # Patch C: Catch any exception thrown by run_scout_protocol() (e.g.,
