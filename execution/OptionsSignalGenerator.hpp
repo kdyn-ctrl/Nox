@@ -273,7 +273,7 @@ private:
             }
 
             httplib::Headers headers;
-            headers.insert("X-Nox-Token", webhook_secret);
+            headers.emplace("X-Nox-Token", webhook_secret);
 
             auto res = cli.Get("/earnings/calendar", headers);
             if (!res || res->status != 200) {
@@ -553,22 +553,25 @@ private:
     //   vol_cheap — IV < HRV * 0.90: options are underpricing actual vol. Buy
     //               premium: implied vol is likely to mean-revert upward.
     //
-    //   iv_rank   — snapshot-relative position (secondary confirmation).
-    //               prefer_sell fires when rank ≥ sell_min OR vol_rich.
-    //               prefer_buy  fires when rank ≤ buy_max  OR vol_cheap.
-    //               When both fire, prefer_sell wins (variance premium is the
-    //               more theoretically grounded signal).
+    //   iv_rank   — snapshot-relative position only (display/secondary context).
+    //               NOT used to gate strategy selection: it measures where the
+    //               average IV sits within the current chain's own min/max spread
+    //               (intra-chain skew dispersion), which is unrelated to whether
+    //               vol is rich versus what the stock actually realizes. Gating on
+    //               it would flip trades on a meaningless number. The profile
+    //               iv_rank_buy_max / iv_rank_sell_min thresholds are reserved for
+    //               the true 52-week historical IV Rank (heartbeat subsystem),
+    //               pending the C++ ↔ heartbeat integration (see private roadmap).
 
-    std::string selectStrategy(DirectionalBias bias, double iv_rank, double iv_level,
+    std::string selectStrategy(DirectionalBias bias, double /*iv_rank*/, double iv_level,
                                double hrv, const std::string& tier) const {
-        const double buy_max  = profile_.iv_rank_buy_max;
-        const double sell_min = profile_.iv_rank_sell_min;
-
         bool vol_rich  = (hrv > 0.01) && (iv_level > hrv * 1.20);
         bool vol_cheap = (hrv > 0.01) && (iv_level < hrv * 0.90);
 
-        bool prefer_sell = vol_rich  || (iv_rank >= sell_min);
-        bool prefer_buy  = vol_cheap || (iv_rank <= buy_max);
+        // Gate purely on the HRV-based variance-premium signal (the documented
+        // primary edge). Snapshot iv_rank is intentionally not a trigger.
+        bool prefer_sell = vol_rich;
+        bool prefer_buy  = vol_cheap;
 
         // When conflicting: variance premium is more reliable → sell wins
         if (prefer_sell && prefer_buy) prefer_buy = false;

@@ -7,6 +7,7 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <condition_variable>
 #include <sqlite3.h>
 #include <stdexcept>
 #include <chrono>
@@ -50,7 +51,13 @@ public:
     }
 
     void stop_monitoring() {
-        run_monitoring_ = false;
+        {
+            std::lock_guard<std::mutex> lock(monitor_lock_);
+            run_monitoring_ = false;
+        }
+        // Wake the monitoring thread immediately so shutdown doesn't block for up
+        // to a full 30-minute sleep cycle before join() can return.
+        monitor_cv_.notify_all();
         if (monitoring_thread_.joinable()) {
             monitoring_thread_.join();
         }
@@ -94,6 +101,10 @@ private:
     // Written by stop_monitoring() (caller thread), read by monitor_positions()
     // (monitoring thread) — must be atomic to avoid a data race / hoisted read.
     std::atomic<bool> run_monitoring_{true};
+    // Guards the interruptible inter-cycle wait so stop_monitoring() can wake the
+    // monitoring thread out of its sleep instead of waiting up to 30 minutes.
+    std::mutex monitor_lock_;
+    std::condition_variable monitor_cv_;
 
     void initialize_database() {
         std::lock_guard<std::mutex> lock(db_lock_);
