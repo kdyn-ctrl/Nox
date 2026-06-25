@@ -28,7 +28,12 @@ guides. All forward development lives here.
 
 ## Priority 1 — Things you can do without buying data
 
-### 1a. Earnings avoidance filter
+### 1a. Earnings avoidance filter — ✅ IMPLEMENTED
+
+> Live: `OptionsSignalGenerator` fetches an earnings calendar from the
+> america-data-engine each scan cycle and skips any ticker with earnings within
+> 5 days (`[EARNINGS_GATE]`). Gate fails open (disabled) if the feed is
+> unavailable.
 
 The single biggest cause of unexpected large moves that destroy spreads and CSPs.
 Alpaca provides earnings dates via:
@@ -51,7 +56,13 @@ bool nearEarnings(const std::string& symbol, int days_threshold = 3) {
 Even a simple filter (skip if earnings within 5 days) substantially improves
 the win rate on spreads and income strategies.
 
-### 1b. Proper exit rules in the live engine
+### 1b. Proper exit rules in the live engine — ✅ IMPLEMENTED
+
+> Live: `PositionManager` persists open positions to SQLite and runs a monitoring
+> thread (30-min cycle) that re-prices each position off the Alpaca options quote
+> feed and applies the 50% profit rule, 21-DTE rule (income trades), and stop
+> loss, closing via `OptionsOrderRouter::closePosition` with a Telegram alert.
+> (See "Suggested next polish" at the end for the remaining shutdown-latency item.)
 
 Currently the live engine has no exit logic after entry. The backtester showed
 that holding to expiry is the main source of losses. Add:
@@ -120,7 +131,13 @@ A tighter stop usually hurts win rate but improves expected value by capping los
 
 ## Priority 2 — Requires external data (low cost or free)
 
-### 2a. True IV Rank (52-week percentile)
+### 2a. True IV Rank (52-week percentile) — ✅ IMPLEMENTED
+
+> Live: the Historical IV Dataset System collects EOD IV snapshots and computes a
+> rolling IV Rank, consumed by the signal generator's vol-richness gates
+> (`iv_rank_sell_min` / `iv_rank_buy_max` per profile). NOTE: confirm the
+> generator reads the historical rank rather than the legacy snapshot-relative
+> value in every path — see "Suggested next polish".
 
 The single most important data upgrade. Real IV rank compares today's IV to
 the full 52-week range of daily IV, not just the current snapshot.
@@ -149,7 +166,10 @@ When you have real IV rank, the variance premium signal becomes:
 - IV Rank > 50% AND IV > HRV × 1.15 → strong sell premium
 - IV Rank < 30% AND IV < HRV × 0.90 → buy premium
 
-### 2b. Accumulate your own IV history
+### 2b. Accumulate your own IV history — ✅ IMPLEMENTED
+
+> Live: EOD collection persists daily IV snapshots (part of the Historical IV
+> Dataset System), which is what feeds 2a.
 
 Start now: every scan cycle, save the IV snapshot to a file.
 
@@ -221,6 +241,32 @@ The current backtester uses BS re-pricing with an HRV proxy for IV. Once you
 have Polygon.io or another historical chain, replace `valuePosition()` with
 actual historical option mid-prices. This removes the IV proxy bias entirely
 and gives you real P&L estimates including bid/ask spread effects.
+
+### 3e. Native execution-venue migration (Alpaca → IBKR)
+
+Alpaca's options support is REST-only with market-order-biased fills and a single
+US-equity-options venue. The forward path is a native socket integration with the
+Interactive Brokers TWS API (headless IB Gateway, paper 4002 / live 4001):
+
+- Persistent TCP connection with asynchronous `EWrapper` callbacks
+- Lock-free tick ingestion + mutex-guarded order/exec state (thread-safe by design)
+- Direct multi-leg/limit order routing and richer execution reporting
+- Path to futures/index options and non-US venues
+
+Status: prototype lives in the private development branch; not wired into the
+public showcase engine.
+
+### Suggested next polish (small, high-signal)
+
+- **PositionManager shutdown latency:** `stop_monitoring()` joins a thread that may
+  be mid-`sleep_for(30 min)`, so shutdown can hang up to 30 minutes. Replace the
+  bare sleep with a `std::condition_variable::wait_for` on the stop flag for an
+  interruptible wait. (The flag itself is now `std::atomic<bool>` — the data race
+  is fixed.)
+- **IV Rank wiring audit:** confirm `selectStrategy`/signal assembly consume the
+  historical IV Rank everywhere; the legacy snapshot-relative `iv_rank`
+  (`display only`) comment in `OptionsSignalGenerator` suggests at least one path
+  may still use the snapshot value.
 
 ---
 
