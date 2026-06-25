@@ -4,6 +4,7 @@
 #include "../shared/RegimeStateMachine.hpp"
 #include "OptionEngine.hpp"
 #include "OptionsSignalGenerator.hpp"
+#include "PositionManager.hpp"
 #include <iostream>
 #include <string>
 #include <cmath>
@@ -179,9 +180,9 @@ private:
     RegimeStateMachine regimeMachine;
     std::string last_analyst_report_time;
 
-    // Options signal generator profiles (personal + bot)
-    nox::options_signal::RiskProfile optionsBotProfile_;
-    nox::options_signal::RiskProfile optionsPersonalProfile_;
+    // Position Manager (for options)
+    std::unique_ptr<PositionManager> positionManager_;
+
 
     // CN-RULE-002: T+1 position state — maps ticker → entry date.
     // Written on confirmed BUY, read & evicted on confirmed SELL.
@@ -844,7 +845,22 @@ public:
                     : ""));
         }
 
-        Logger::log("INFO", "[EXECUTION] All required environment variables validated.");
+        // Initialize and start the Position Manager
+        try {
+            // NOTE: This assumes OptionsOrderRouter can be instantiated here.
+            // In a larger system, this might be injected or retrieved from a service locator.
+            auto order_router = std::make_shared<nox::options_router::OptionsOrderRouter>(
+                alpacaBaseUrl, apiKey, apiSec
+            );
+            positionManager_ = std::make_unique<PositionManager>("./memory_bank.db", *order_router);
+            positionManager_->start_monitoring();
+            Logger::log("INFO", "[POS_MANAGER] Position Manager initialized and monitoring thread started.");
+        } catch (const std::exception& e) {
+            std::cerr << "[FATAL] [POS_MANAGER] Failed to initialize Position Manager: " 
+                      << e.what() << ". Refusing to start." << std::endl;
+            std::exit(1);
+        }
+
     }
 
     void run() {

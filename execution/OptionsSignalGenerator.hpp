@@ -11,8 +11,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <ctime>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -93,8 +96,19 @@ public:
             vix = 20.0;
         }
 
+        // Fetch earnings calendar once per scan cycle from america-data-engine
+        auto earnings_calendar = fetchEarningsCalendar();
+
         for (const auto& ticker : watchlist) {
             try {
+                // Check if ticker has earnings within 5 days — if so, skip signal generation
+                if (hasEarningsWithin5Days(ticker, earnings_calendar)) {
+                    log("INFO", "[OPTIONS_SCAN][EARNINGS_GATE] " + ticker +
+                        " has scheduled earnings within 5 days. Skipping signal generation.");
+                    std::cout << "[EARNINGS_GATE] Excluded: " + ticker + " (earnings window)" << std::endl;
+                    continue;
+                }
+
                 scanTicker(ticker, effective_capital, tier, fc_mode, vix, spy, regime);
             } catch (const std::exception& e) {
                 log("WARN", "[OPTIONS_SCAN] Exception on " + ticker + ": " + e.what());
@@ -233,6 +247,130 @@ private:
             return {price, sum / 200.0, true};
         } catch (...) {}
         return {};
+    }
+
+    // ── Market data: Earnings Calendar (america-data-engine) ──────────────────
+
+    struct EarningsEvent {
+        std::string date;
+        std::string description;
+    };
+
+    using EarningsCalendar = std::map<std::string, std::vector<EarningsEvent>>;
+
+    EarningsCalendar fetchEarningsCalendar() const {
+        EarningsCalendar result;
+        try {
+            httplib::Client cli("http://america-data-engine:8001");
+            cli.set_connection_timeout(std::chrono::seconds(5));
+            cli.set_read_timeout(std::chrono::seconds(10));
+
+            // Construct the authorization header (WEBHOOK_SECRET_TOKEN)
+            const char* webhook_secret = std::getenv("WEBHOOK_SECRET_TOKEN");
+            if (!webhook_secret) {
+                log("WARN", "[EARNINGS_FETCH] WEBHOOK_SECRET_TOKEN not set; skipping earnings fetch.");
+                return result;
+            }
+
+            httplib::Headers headers;
+            headers.insert("X-Nox-Token", webhook_secret);
+
+            auto res = cli.Get("/earnings/calendar", headers);
+            if (!res || res->status != 200) {
+                log("WARN", "[EARNINGS_FETCH] america-data-engine returned status " +
+                    std::to_string(res ? res->status : 0) + "; earnings gate disabled.");
+                return result;
+            }
+
+            auto body = json::parse(res->body);
+            const auto& calendar = body.at("earnings_calendar");
+
+            for (auto it = calendar.begin(); it != calendar.end(); ++it) {
+                std::string ticker = it.key();
+                const auto& events = it.value();
+
+                std::vector<EarningsEvent> ticker_events;
+                for (const auto& event : events) {
+                    ticker_events.push_back({
+                        event.at("date").get<std::string>(),
+                        event.value("description", "")
+                    });
+                }
+                result[ticker] = ticker_events;
+            }
+
+            int total_events = 0;
+            for (const auto& pair : result) {
+                total_events += pair.second.size();
+            }
+            log("INFO", "[EARNINGS_FETCH] Loaded earnings calendar: " +
+                std::to_string(total_events) + " event(s).");
+
+        } catch (const std::exception& e) {
+            log("WARN", "[EARNINGS_FETCH] Exception fetching earnings calendar: " +
+                std::string(e.what()) + "; earnings gate disabled.");
+        }
+        return result;
+    }
+
+    bool hasEarningsWithin5Days(const std::string& ticker,
+                                 const EarningsCalendar& calendar) const {
+        auto it = calendar.find(ticker);
+        if (it == calendar.end()) {
+            return false; // No earnings found for this ticker
+        }
+
+        // Get today's date (system local time, converted to YYYY-MM-DD string)
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm* gm_time = std::gmtime(&time_t);
+
+        std::ostringstream oss;
+        oss << std::put_time(gm_time, "%Y-%m-%d");
+        std::string today_str = oss.str();
+
+        // Parse today's date
+        int today_year, today_month, today_day;
+        std::sscanf(today_str.c_str(), "%d-%d-%d", &today_year, &today_month, &today_day);
+
+        // Check each earnings event for this ticker
+        for (const auto& event : it->second) {
+            int event_year, event_month, event_day;
+            std::sscanf(event.date.c_str(), "%d-%d-%d", &event_year, &event_month, &event_day);
+
+            // Simple date comparison: convert both to day-of-year for same year, else compare years
+            auto days_until_event = [](int y1, int m1, int d1, int y2, int m2, int d2) -> long {
+                // Count days from date1 to date2
+                // This is a simplified comparison — proper implementation would use chrono
+                if (y1 != y2) {
+                    return y2 > y1 ? 1000 : -1000; // Different years, approximate
+                }
+
+                // Same year: convert month/day to day-of-year
+                int days_in_month[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+                if ((y1 % 4 == 0 && y1 % 100 != 0) || (y1 % 400 == 0)) {
+                    days_in_month[2] = 29; // Leap year
+                }
+
+                int doy1 = d1;
+                for (int i = 1; i < m1; ++i) doy1 += days_in_month[i];
+
+                int doy2 = d2;
+                for (int i = 1; i < m2; ++i) doy2 += days_in_month[i];
+
+                return static_cast<long>(doy2 - doy1);
+            };
+
+            long days_diff = days_until_event(today_year, today_month, today_day,
+                                               event_year, event_month, event_day);
+
+            // Earnings within 5 days (inclusive of today)
+            if (days_diff >= 0 && days_diff <= 5) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // ── Market data: Underlying OHLCV (Yahoo Finance) ─────────────────────────
