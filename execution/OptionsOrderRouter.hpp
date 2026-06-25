@@ -107,6 +107,20 @@ public:
         return {false, "", "Unknown strategy: " + strategy};
     }
 
+    // PositionManager: public contract lookup and position close methods
+    AlpacaContract lookupContract(const std::string& underlying,
+                                  double             target_strike,
+                                  const std::string& expiry_yyyy_mm_dd,
+                                  const std::string& opt_type) const
+    {
+        return lookupContractImpl(underlying, target_strike, expiry_yyyy_mm_dd, opt_type);
+    }
+
+    OrderResult closePosition(const std::string& occ_symbol, int quantity, bool is_short_premium) const
+    {
+        return closePositionImpl(occ_symbol, quantity, is_short_premium);
+    }
+
 private:
     std::string alpacaUrl_;
     std::string apiKey_;
@@ -158,15 +172,13 @@ private:
         return padded_root + yy + mm + dd + type_char + strike_oss.str();
     }
 
-    // ── Contract lookup — finds the closest real Alpaca contract ─────────────
-    //
-    // Searches Alpaca's /v2/options/contracts for the closest match to the
-    // requested strike and expiry. Returns the best match or invalid if none found.
-
-    AlpacaContract lookupContract(const std::string& underlying,
-                                  double             target_strike,
-                                  const std::string& expiry_yyyy_mm_dd,
-                                  const std::string& opt_type) const
+    // Alpaca contract lookup (for PositionManager and internal routing).
+    // Searches for options contracts matching the given underlying, strike, expiry, and type.
+    // Returns the best match (closest strike, then nearest expiry).
+    AlpacaContract lookupContractImpl(const std::string& underlying,
+                                     double             target_strike,
+                                     const std::string& expiry_yyyy_mm_dd,
+                                     const std::string& opt_type) const
     {
         auto cli = makeClient();
 
@@ -222,6 +234,22 @@ private:
         return best;
     }
 
+    // Closes an open option position by submitting a market order.
+    // is_short_premium=true: BUY to close (short position); false: SELL to close (long position).
+    OrderResult closePositionImpl(const std::string& occ_symbol, int quantity, bool is_short_premium) const {
+        std::string side = is_short_premium ? "buy" : "sell"; // Buy to close short, sell to close long
+        json order = {
+            {"symbol",          occ_symbol},
+            {"qty",             std::to_string(quantity)},
+            {"side",            side},
+            {"type",            "market"},
+            {"time_in_force",   "day"},
+            {"position_effect", "close"}
+        };
+        return submitOrder(order, "CLOSE " + occ_symbol);
+    }
+
+
     // ── Single-leg order (LONG_CALL, LONG_PUT, CSP, CC) ──────────────────────
 
     OrderResult routeSingleLeg(const nox::options_signal::OptionsSignal& sig,
@@ -232,8 +260,8 @@ private:
 
         AlpacaContract contract;
         try {
-            contract = lookupContract(sig.underlying, sig.strike,
-                                      sig.expiry_date, opt_type);
+            contract = lookupContractImpl(sig.underlying, sig.strike,
+                                         sig.expiry_date, opt_type);
         } catch (const std::exception& e) {
             return {false, "", std::string("Contract lookup failed: ") + e.what()};
         }
