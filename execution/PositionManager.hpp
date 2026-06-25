@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <atomic>
+#include <thread>
 #include <sqlite3.h>
 #include <stdexcept>
 #include <chrono>
@@ -89,7 +91,9 @@ private:
     std::mutex db_lock_;
     OptionsOrderRouter& order_router_;
     std::thread monitoring_thread_;
-    bool run_monitoring_ = true;
+    // Written by stop_monitoring() (caller thread), read by monitor_positions()
+    // (monitoring thread) — must be atomic to avoid a data race / hoisted read.
+    std::atomic<bool> run_monitoring_{true};
 
     void initialize_database() {
         std::lock_guard<std::mutex> lock(db_lock_);
