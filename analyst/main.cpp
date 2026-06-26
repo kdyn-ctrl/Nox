@@ -237,19 +237,10 @@ int main() {
     }
     std::string secret_token = env_token;
 
-    const char* env_api_key = std::getenv("ALPACA_API_KEY");
-    if (!env_api_key) {
-        std::cerr << "[FATAL] [ANALYST] ALPACA_API_KEY not set. Refusing to start." << std::endl;
-        return 1;
-    }
-    std::string alpaca_api_key = env_api_key;
-
-    const char* env_api_secret = std::getenv("ALPACA_SECRET_KEY");
-    if (!env_api_secret) {
-        std::cerr << "[FATAL] [ANALYST] ALPACA_SECRET_KEY not set. Refusing to start." << std::endl;
-        return 1;
-    }
-    std::string alpaca_api_secret = env_api_secret;
+    // NOTE: The analyst sources all market data from Yahoo Finance and never
+    // authenticates to Alpaca, so ALPACA_API_KEY/ALPACA_SECRET_KEY are deliberately
+    // NOT required here. Demanding them would block startup over credentials this
+    // process never uses. (They remain required by the execution engine, which does.)
 
     const char* env_tg_token = std::getenv("TELEGRAM_BOT_TOKEN");
     const char* env_tg_chat_id = std::getenv("TELEGRAM_CHAT_ID");

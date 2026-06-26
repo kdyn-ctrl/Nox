@@ -111,7 +111,11 @@ def example_iv_heatmap():
             filled = int(rank * 20)
             bar = "█" * filled + "░" * (20 - filled)
 
-        print(f"{ticker:6} {bar:24} {result.get('iv_rank', '?'):.1%}")
+        # iv_rank may be None (unknown) or absent (error) — only percent-format a
+        # real number, otherwise show a placeholder instead of crashing.
+        rank_val = result.get('iv_rank')
+        rank_str = f"{rank_val:.1%}" if isinstance(rank_val, (int, float)) else "?"
+        print(f"{ticker:6} {bar:24} {rank_str}")
 
 
 # ============================================================================

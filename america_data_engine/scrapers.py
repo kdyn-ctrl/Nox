@@ -7,6 +7,11 @@ from typing import Dict, Any, List
 # RULE-008: All HTTP calls use a (connect_timeout, read_timeout) tuple.
 HTTP_TIMEOUT = (5, 10)
 
+# Module-level Session for connection pooling / keep-alive — the earnings refresh
+# makes one request per watchlisted ticker, so reusing connections avoids a fresh
+# TCP/TLS handshake on every call.
+_SESSION = requests.Session()
+
 def _require_env(name: str) -> str:
     val = os.getenv(name)
     if not val:
@@ -35,7 +40,7 @@ def fetch_alpaca_news() -> List[Dict[str, Any]]:
         "sort": "desc",
     }
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
+        response = _SESSION.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
         response.raise_for_status()
         news_data = response.json().get("news", [])
 
@@ -91,7 +96,7 @@ def fetch_earnings_calendar(tickers: List[str]) -> Dict[str, List[Dict[str, Any]
                 "end": end_date,
             }
 
-            response = requests.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
+            response = _SESSION.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
             response.raise_for_status()
 
             data = response.json()

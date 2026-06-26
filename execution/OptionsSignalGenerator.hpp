@@ -6,6 +6,7 @@
 #include "OptionEngine.hpp"
 #include "OptionsSignalTypes.hpp"
 #include "OptionsOrderRouter.hpp"
+#include "PositionManager.hpp"
 #include "../shared/RegimeStateMachine.hpp"
 
 #include <algorithm>
@@ -60,13 +61,15 @@ public:
                            const std::string& apiSec,
                            const std::string& tgToken,
                            const std::string& tgChatId,
-                           RiskProfile        profile)
+                           RiskProfile        profile,
+                           PositionManager*   position_manager = nullptr)
         : alpacaUrl_(alpacaUrl)
         , apiKey_(apiKey)
         , apiSec_(apiSec)
         , tgToken_(tgToken)
         , tgChatId_(tgChatId)
         , profile_(std::move(profile))
+        , position_manager_(position_manager)
     {}
 
     // Entry point — called once per scan cycle from the engine's background thread.
@@ -127,6 +130,11 @@ private:
     std::string tgChatId_;
     RiskProfile profile_;
     RegimeStateMachine regimeMachine_;
+    // Non-owning handle to the engine's PositionManager. When auto-execute places
+    // a real single-leg order, the filled position is recorded here so the
+    // monitoring thread can manage its profit-target / stop / DTE exits. Null in
+    // advisory-only contexts (e.g. the personal profile or the backtester).
+    PositionManager* position_manager_ = nullptr;
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -138,6 +146,19 @@ private:
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(decimals) << v;
         return oss.str();
+    }
+
+    // Serial day count (days since 1970-01-01) for a civil Y-M-D date.
+    // Howard Hinnant's algorithm — exact across month/year boundaries, so the
+    // earnings gate measures real calendar distance instead of the old ±1000
+    // cross-year approximation that silently failed near year-end.
+    static long civilDays(int y, int m, int d) {
+        y -= m <= 2;
+        const long era = (y >= 0 ? y : y - 399) / 400;
+        const unsigned yoe = static_cast<unsigned>(y - era * 400);
+        const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+        const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        return era * 146097L + static_cast<long>(doe) - 719468L;
     }
 
     // ── Capital / tier logic ──────────────────────────────────────────────────
@@ -320,49 +341,28 @@ private:
             return false; // No earnings found for this ticker
         }
 
-        // Get today's date (system local time, converted to YYYY-MM-DD string)
+        // Get today's date in UTC. gmtime_r is the reentrant POSIX variant —
+        // std::gmtime returns a shared static tm that the two concurrent profile
+        // scan threads (bot + personal) would race on.
         auto now = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
-        std::tm* gm_time = std::gmtime(&time_t);
-
-        std::ostringstream oss;
-        oss << std::put_time(gm_time, "%Y-%m-%d");
-        std::string today_str = oss.str();
-
-        // Parse today's date
-        int today_year, today_month, today_day;
-        std::sscanf(today_str.c_str(), "%d-%d-%d", &today_year, &today_month, &today_day);
+        std::tm tm_buf{};
+        gmtime_r(&time_t, &tm_buf);
+        int today_year  = tm_buf.tm_year + 1900;
+        int today_month = tm_buf.tm_mon + 1;
+        int today_day   = tm_buf.tm_mday;
+        long today_serial = civilDays(today_year, today_month, today_day);
 
         // Check each earnings event for this ticker
         for (const auto& event : it->second) {
             int event_year, event_month, event_day;
-            std::sscanf(event.date.c_str(), "%d-%d-%d", &event_year, &event_month, &event_day);
+            if (std::sscanf(event.date.c_str(), "%d-%d-%d",
+                            &event_year, &event_month, &event_day) != 3) {
+                continue; // unparseable date — skip rather than misfire the gate
+            }
 
-            // Simple date comparison: convert both to day-of-year for same year, else compare years
-            auto days_until_event = [](int y1, int m1, int d1, int y2, int m2, int d2) -> long {
-                // Count days from date1 to date2
-                // This is a simplified comparison — proper implementation would use chrono
-                if (y1 != y2) {
-                    return y2 > y1 ? 1000 : -1000; // Different years, approximate
-                }
-
-                // Same year: convert month/day to day-of-year
-                int days_in_month[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-                if ((y1 % 4 == 0 && y1 % 100 != 0) || (y1 % 400 == 0)) {
-                    days_in_month[2] = 29; // Leap year
-                }
-
-                int doy1 = d1;
-                for (int i = 1; i < m1; ++i) doy1 += days_in_month[i];
-
-                int doy2 = d2;
-                for (int i = 1; i < m2; ++i) doy2 += days_in_month[i];
-
-                return static_cast<long>(doy2 - doy1);
-            };
-
-            long days_diff = days_until_event(today_year, today_month, today_day,
-                                               event_year, event_month, event_day);
+            // Exact calendar-day distance (works across month/year boundaries).
+            long days_diff = civilDays(event_year, event_month, event_day) - today_serial;
 
             // Earnings within 5 days (inclusive of today)
             if (days_diff >= 0 && days_diff <= 5) {
@@ -757,7 +757,13 @@ private:
         OptionGreeks g1 = compute_greeks(primary);
 
         double max_risk   = computeMaxRisk(allocated_capital, tier);
-        double contracts  = std::max(1.0, std::floor(max_risk / (g1.price * 100.0)));
+        // Guard against a near-zero Black-Scholes premium (deep-OTM strike or
+        // degenerate inputs): dividing max_risk by ~0 would yield an astronomical
+        // contract count and overflow the displayed risk/reward figures.
+        double premium_per_contract = g1.price * 100.0;
+        double contracts  = (premium_per_contract > 1.0)
+                            ? std::max(1.0, std::floor(max_risk / premium_per_contract))
+                            : 1.0;
 
         // Per-contract P&L geometry
         if (strategy == "LONG_CALL" || strategy == "LONG_PUT") {
@@ -1047,6 +1053,7 @@ private:
 
         if (result.success) {
             log("INFO", "[OPTIONS_EXEC] Order placed — " + result.message);
+            recordExecutedPosition(sig);
             sendTelegram(
                 "✅ *OPTIONS ORDER PLACED*\n"
                 "────────────────────────\n"
@@ -1065,6 +1072,54 @@ private:
                 "• *Strategy:* " + sig.strategy + "\n"
                 "• *Reason:* `" + result.message + "`"
             );
+        }
+    }
+
+    // Persists a freshly executed position into the PositionManager so the
+    // monitoring thread will apply the profit-target / stop / DTE exit rules.
+    // The monitor only understands single-leg "long" and "short_premium"
+    // positions, so multi-leg strategies are logged as unmanaged rather than
+    // recorded with a single-leg basis that the monitor would mis-close.
+    void recordExecutedPosition(const OptionsSignal& sig) const {
+        if (!position_manager_) return;
+
+        std::string profile_type;
+        if (sig.strategy == "LONG_CALL" || sig.strategy == "LONG_PUT") {
+            profile_type = "long";
+        } else if (sig.strategy == "CSP" || sig.strategy == "CC") {
+            profile_type = "short_premium";
+        } else {
+            log("WARN", "[OPTIONS_EXEC] " + sig.strategy + " on " + sig.underlying +
+                " is multi-leg — not tracked by the single-leg position monitor. "
+                "Manage manually.");
+            return;
+        }
+
+        std::string option_type =
+            (sig.option_type == nox::options::OptionType::Call) ? "call" : "put";
+
+        // Entry date (UTC, YYYY-MM-DD) — gmtime_r for thread safety.
+        auto now    = std::chrono::system_clock::now();
+        auto now_tt = std::chrono::system_clock::to_time_t(now);
+        std::tm tm_buf{};
+        gmtime_r(&now_tt, &tm_buf);
+        std::ostringstream date_oss;
+        date_oss << std::put_time(&tm_buf, "%Y-%m-%d");
+
+        try {
+            position_manager_->add_position(
+                sig.underlying,
+                option_type,
+                sig.strike,
+                profile_.qty_contracts,
+                sig.entry_price,
+                date_oss.str(),
+                profile_type,
+                sig.expiry_date);
+            log("INFO", "[OPTIONS_EXEC] Recorded " + profile_type + " position for " +
+                sig.underlying + " — now under monitor management.");
+        } catch (const std::exception& e) {
+            log("WARN", std::string("[OPTIONS_EXEC] Failed to record position: ") + e.what());
         }
     }
 };

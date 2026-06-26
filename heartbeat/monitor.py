@@ -10,7 +10,7 @@ import threading
 import xml.etree.ElementTree as ET
 import sqlite3
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from telebot.util import smart_split
 from bs4 import BeautifulSoup
@@ -125,12 +125,16 @@ def init_db():
 # block indefinitely. The tuple form enforces both independently.
 HTTP_TIMEOUT = (5, 10)  # (connect seconds, read seconds)
 
+# Module-level Session for connection pooling / keep-alive across the many
+# repeated HTTP calls this process makes (Alpaca, SEC EDGAR, internal engines).
+_SESSION = requests.Session()
+
 def get_alpaca_portfolio():
     headers = {'APCA-API-KEY-ID': ALPACA_API, 'APCA-API-SECRET-KEY': ALPACA_SEC}
     try:
-        acc_resp = requests.get('https://paper-api.alpaca.markets/v2/account',
+        acc_resp = _SESSION.get('https://paper-api.alpaca.markets/v2/account',
                                 headers=headers, timeout=HTTP_TIMEOUT)
-        pos_resp = requests.get('https://paper-api.alpaca.markets/v2/positions',
+        pos_resp = _SESSION.get('https://paper-api.alpaca.markets/v2/positions',
                                 headers=headers, timeout=HTTP_TIMEOUT)
         
         if acc_resp.status_code != 200 or pos_resp.status_code != 200:
@@ -182,7 +186,7 @@ def get_latest_sec_filing(ticker: str) -> str:
     )
     headers = {'User-Agent': 'Nox/1.0 openclaw@vanhellsing.tech'}
     try:
-        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        resp = _SESSION.get(url, headers=headers, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200:
             return f"SEC feed returned {resp.status_code} for {ticker}."
 
@@ -204,7 +208,7 @@ def get_latest_sec_filing(ticker: str) -> str:
         if not primary_url:
             return f"Could not resolve primary {filing_type} document for {ticker}."
 
-        doc_res = requests.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
+        doc_res = _SESSION.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
         if doc_res.status_code != 200:
             return f"Primary document fetch returned {doc_res.status_code} for {ticker}."
 
@@ -240,7 +244,7 @@ def query_data_engine(endpoint: str, base_url: str = "http://china-data-engine:8
     url = f"{base_url}{endpoint}"
     headers = {"X-Nox-Token": WEBHOOK_SECRET}
     try:
-        res = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        res = _SESSION.get(url, headers=headers, timeout=HTTP_TIMEOUT)
         if res.status_code == 200:
             return res.json()
         print(
@@ -448,9 +452,10 @@ def fetch_options_chain_iv(ticker: str) -> float | None:
     }
 
     try:
-        # Alpaca options chains endpoint — paper trading API
-        url = f"https://paper-api.alpaca.markets/v1beta3/options/chains/{ticker}"
-        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        # Alpaca options market data lives on the DATA host (data.alpaca.markets),
+        # NOT the paper-trading host. Snapshots/chains are under /v1beta1/options/.
+        url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{ticker}"
+        resp = _SESSION.get(url, headers=headers, timeout=HTTP_TIMEOUT)
 
         if resp.status_code != 200:
             logger.warning(f"Alpaca options chain request failed for {ticker}: HTTP {resp.status_code}")
@@ -801,7 +806,7 @@ def send_status(message):
         exec_status, exec_ping = "OFFLINE", -1
         try:
             start_time = time.time()
-            exec_res = requests.get("http://execution-engine:8080/health", timeout=HTTP_TIMEOUT)
+            exec_res = _SESSION.get("http://execution-engine:8080/health", timeout=HTTP_TIMEOUT)
             print(f"[STATUS CMD] Execution Engine response: {exec_res.status_code}", flush=True)
             if exec_res.status_code == 200:
                 data = exec_res.json()
@@ -815,7 +820,7 @@ def send_status(message):
 
         data_status, data_cache_age = "OFFLINE", "N/A"
         try:
-            data_res = requests.get("http://china-data-engine:8000/health", timeout=HTTP_TIMEOUT)
+            data_res = _SESSION.get("http://china-data-engine:8000/health", timeout=HTTP_TIMEOUT)
             print(f"[STATUS CMD] China Data Engine response: {data_res.status_code}", flush=True)
             if data_res.status_code == 200:
                 health_data = data_res.json()
@@ -833,7 +838,7 @@ def send_status(message):
 
         america_data_status, america_data_cache_age = "OFFLINE", "N/A"
         try:
-            america_data_res = requests.get("http://america-data-engine:8001/health", timeout=HTTP_TIMEOUT)
+            america_data_res = _SESSION.get("http://america-data-engine:8001/health", timeout=HTTP_TIMEOUT)
             print(f"[STATUS CMD] America Data Engine response: {america_data_res.status_code}", flush=True)
             if america_data_res.status_code == 200:
                 health_data = america_data_res.json()
@@ -852,7 +857,7 @@ def send_status(message):
         # --- 2. Query Analyst Heartbeat from Execution Engine ---
         analyst_heartbeat = "Never"
         try:
-            analyst_res = requests.get("http://execution-engine:8080/last-report", timeout=HTTP_TIMEOUT)
+            analyst_res = _SESSION.get("http://execution-engine:8080/last-report", timeout=HTTP_TIMEOUT)
             print(f"[STATUS CMD] Analyst heartbeat response: {analyst_res.status_code}", flush=True)
             if analyst_res.status_code == 200:
                 analyst_data = analyst_res.json()
@@ -876,8 +881,10 @@ def send_status(message):
                 last_audit_row = c.fetchone()
                 last_audit_age = "Never"
                 if last_audit_row:
-                    last_audit = datetime.fromisoformat(last_audit_row[0])
-                    age = datetime.now() - last_audit
+                    # SQLite CURRENT_TIMESTAMP is naive UTC; attach UTC tzinfo and
+                    # compare against an aware UTC now so the math is correct.
+                    last_audit = datetime.fromisoformat(last_audit_row[0]).replace(tzinfo=timezone.utc)
+                    age = datetime.now(timezone.utc) - last_audit
                     last_audit_age = f"{int(age.total_seconds() // 3600)}h ago"
                 
                 c.execute("SELECT COUNT(*) FROM daily_audits")
@@ -1028,7 +1035,7 @@ def poll_sec_edgar():
     while True:
         for feed_type, sec_url in SEC_FEEDS:
             try:
-                response = requests.get(sec_url, headers=headers, timeout=HTTP_TIMEOUT)
+                response = _SESSION.get(sec_url, headers=headers, timeout=HTTP_TIMEOUT)
                 if response.status_code != 200:
                     print(f"[WARN] [HEARTBEAT] SEC {feed_type} feed returned {response.status_code}.", flush=True)
                     continue
@@ -1055,6 +1062,11 @@ def poll_sec_edgar():
                     if is_filing_processed(filing_id):
                         continue
 
+                    # Mark this entry processed exactly once, regardless of
+                    # whether it matches a watchlist ticker. Otherwise non-matching
+                    # entries are never recorded and get re-scanned every poll forever.
+                    mark_filing_processed(filing_id)
+
                     for ticker in WATCHLIST:
                         # Only act if the feed type matches what this ticker
                         # should be filing. This prevents a 6-K hit on a
@@ -1074,7 +1086,9 @@ def poll_sec_edgar():
                                 flush=True
                             )
                             process_automated_filing(ticker, link, feed_type)
-                            mark_filing_processed(filing_id)
+                            # Stop after the first ticker match so a multi-ticker
+                            # title isn't processed/alerted multiple times.
+                            break
 
             except Exception as e:
                 print(f"⚠️ SEC Radar Error ({feed_type} feed): {e}", flush=True)
@@ -1094,7 +1108,7 @@ def resolve_primary_document(index_url: str, headers: dict, filing_type: str = "
     document's href. Falls back to the first .htm file if no typed match.
     """
     try:
-        idx_res = requests.get(index_url, headers=headers, timeout=HTTP_TIMEOUT)
+        idx_res = _SESSION.get(index_url, headers=headers, timeout=HTTP_TIMEOUT)
         if idx_res.status_code != 200:
             print(f"[WARN] [HEARTBEAT] Index page returned {idx_res.status_code}: {index_url}", flush=True)
             return None
@@ -1234,7 +1248,7 @@ def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8
             return
 
         print(f"[INFO] [HEARTBEAT] Fetching primary {filing_type} doc for {ticker}: {primary_url}", flush=True)
-        doc_res = requests.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
+        doc_res = _SESSION.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
         if doc_res.status_code != 200:
             return
 

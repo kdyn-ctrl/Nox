@@ -104,6 +104,10 @@ std::vector<Bar> fetchBars(const std::string& symbol, const std::string& range) 
         std::vector<Bar> bars;
         bars.reserve(ts.size());
         for (size_t i = 0; i < ts.size(); ++i) {
+            // Yahoo can return quote arrays shorter than the timestamp array.
+            // nlohmann operator[] on an array is unchecked (UB), not a throw, so
+            // guard explicitly rather than relying on the surrounding try/catch.
+            if (i >= C.size() || i >= H.size() || i >= L.size()) break;
             if (C[i].is_null()) continue;
             time_t t = ts[i].get<time_t>();
             std::tm buf{};
@@ -632,13 +636,29 @@ int main(int argc, char* argv[]) {
             while (std::getline(ss, tok, ','))
                 if (!tok.empty()) cfg.watchlist.push_back(tok);
         } else if (key == "range")   { cfg.range               = val; }
-        else if (key == "scan")      { cfg.scan_every_n_days    = std::stoi(val); }
-        else if (key == "profit")    { cfg.profit_target_pct    = std::stod(val); }
-        else if (key == "stop")      { cfg.stop_loss_mult       = std::stod(val); }
-        else if (key == "capital")   { cfg.initial_capital      = std::stod(val); }
+        else if (key == "scan" || key == "profit" || key == "stop" || key == "capital") {
+            // std::stoi/std::stod throw on non-numeric input; catch so a typo in
+            // one arg doesn't abort the whole run with an uncaught exception.
+            try {
+                if      (key == "scan")   cfg.scan_every_n_days = std::stoi(val);
+                else if (key == "profit") cfg.profit_target_pct = std::stod(val);
+                else if (key == "stop")   cfg.stop_loss_mult    = std::stod(val);
+                else                      cfg.initial_capital   = std::stod(val);
+            } catch (const std::exception&) {
+                std::cerr << "[WARN] Invalid numeric value for '" << key
+                          << "': '" << val << "' — keeping default.\n";
+            }
+        }
         else if (key == "profile" && val == "personal") {
             cfg.profile = RiskProfile::personal();
         }
+    }
+
+    // scan_every_n_days is the loop step in runBacktest; 0 would spin forever and
+    // a negative value underflows the size_t step. Clamp to a sane minimum.
+    if (cfg.scan_every_n_days < 1) {
+        std::cerr << "[WARN] scan must be >= 1; using 1.\n";
+        cfg.scan_every_n_days = 1;
     }
 
     std::cerr << "\nFetching historical OHLCV...\n";

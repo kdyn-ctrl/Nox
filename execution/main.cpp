@@ -183,6 +183,10 @@ private:
     // Position Manager (for options)
     std::unique_ptr<PositionManager> positionManager_;
 
+    // Options signal generator profiles (configured in the ctor, consumed by run()).
+    nox::options_signal::RiskProfile optionsBotProfile_;
+    nox::options_signal::RiskProfile optionsPersonalProfile_;
+
 
     // CN-RULE-002: T+1 position state — maps ticker → entry date.
     // Written on confirmed BUY, read & evicted on confirmed SELL.
@@ -1071,7 +1075,8 @@ public:
                 std::string tg_chat  = std::getenv("TELEGRAM_CHAT_ID")   ? std::getenv("TELEGRAM_CHAT_ID")   : "";
 
                 nox::options_signal::OptionsSignalGenerator generator(
-                    alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat, profile);
+                    alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat, profile,
+                    positionManager_.get());
 
                 while (true) {
                     try {
