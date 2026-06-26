@@ -8,6 +8,19 @@ from typing import Dict, Any, List
 HTTP_TIMEOUT = (5, 10)
 
 
+def _first_present(*candidates, default):
+    """Return the first candidate that is not None.
+
+    Using `a or b or default` would discard a legitimate 0 / 0.0 (both falsy),
+    e.g. a stock that is exactly flat (change_pct == 0) or priced at 0. Explicit
+    None checks preserve real zero values.
+    """
+    for value in candidates:
+        if value is not None:
+            return value
+    return default
+
+
 def fetch_eastmoney_hot_board() -> List[Dict[str, Any]]:
     """
     Pulls the top 10 most-watched retail sentiment stocks on the A-share market
@@ -40,12 +53,12 @@ def fetch_eastmoney_hot_board() -> List[Dict[str, Any]]:
             for _, row in top.iterrows():
                 # Gracefully resolve column names — different endpoints use
                 # slightly different Chinese headers for the same fields.
-                rank   = row.get('排名')   or row.get('序号')   or 0
+                rank   = _first_present(row.get('排名'),   row.get('序号'),     default=0)
                 ticker = row.get('代码')   or row.get('股票代码') or ''
                 name   = row.get('股票名称') or row.get('名称')   or ''
-                price  = row.get('最新价')  or row.get('现价')   or 0.0
-                chg    = row.get('涨跌幅')  or row.get('涨跌额')  or 0.0
-                turn   = row.get('换手率')  or 0.0
+                price  = _first_present(row.get('最新价'),  row.get('现价'),    default=0.0)
+                chg    = _first_present(row.get('涨跌幅'),  row.get('涨跌额'),   default=0.0)
+                turn   = _first_present(row.get('换手率'),                      default=0.0)
                 result.append({
                     "rank":          int(rank),
                     "ticker":        str(ticker),

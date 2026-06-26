@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 from datetime import datetime, timezone
@@ -81,24 +82,30 @@ def _refresh_cache() -> None:
     """
     print("[INFO] [DATA-ENGINE] Starting scheduled scrape cycle...", flush=True)
 
-    hot_board = fetch_eastmoney_hot_board()
-    if hot_board:
-        _CACHE["hot_board"] = hot_board
+    # Guard the whole cycle: a failing cycle must log and return, never raise,
+    # so the recurring APScheduler job is not killed by a single bad run.
+    try:
+        hot_board = fetch_eastmoney_hot_board()
+        if hot_board:
+            _CACHE["hot_board"] = hot_board
 
-    pmi = fetch_china_pmi()
-    if pmi:
-        _CACHE["pmi"] = pmi
+        pmi = fetch_china_pmi()
+        if pmi:
+            _CACHE["pmi"] = pmi
 
-    lpr = fetch_pboc_lpr()
-    if lpr:
-        _CACHE["lpr"] = lpr
+        lpr = fetch_pboc_lpr()
+        if lpr:
+            _CACHE["lpr"] = lpr
 
-    news_cn = fetch_cailian_news()
-    if news_cn:
-        _CACHE["news_cn"] = news_cn
+        news_cn = fetch_cailian_news()
+        if news_cn:
+            _CACHE["news_cn"] = news_cn
 
-    _CACHE["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
-    print(f"[INFO] [DATA-ENGINE] Scrape cycle complete. Cache updated at {_CACHE['last_updated']}.", flush=True)
+        _CACHE["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
+        print(f"[INFO] [DATA-ENGINE] Scrape cycle complete. Cache updated at {_CACHE['last_updated']}.", flush=True)
+    except Exception as e:
+        print(f"[ERROR] [DATA-ENGINE] Scrape cycle failed: {e}", flush=True)
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +117,9 @@ def _refresh_cache() -> None:
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     # Warm the cache immediately so the very first request after startup never
-    # returns empty data due to the scheduler not having fired yet.
-    _refresh_cache()
+    # returns empty data due to the scheduler not having fired yet. Run the
+    # (slow, blocking) scrape in a worker thread so we don't block the event loop.
+    await asyncio.to_thread(_refresh_cache)
 
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(_refresh_cache, "interval", minutes=15, id="cache_refresh")

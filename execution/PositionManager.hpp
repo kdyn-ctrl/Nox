@@ -15,7 +15,7 @@
 #include <iomanip>
 
 // Forward declaration
-class OptionsOrderRouter;
+namespace nox { namespace options_router { class OptionsOrderRouter; } }
 class TelegramNotifier;
 
 struct OptionPosition {
@@ -32,7 +32,7 @@ struct OptionPosition {
 
 class PositionManager {
 public:
-    PositionManager(const std::string& db_path, OptionsOrderRouter& order_router)
+    PositionManager(const std::string& db_path, nox::options_router::OptionsOrderRouter& order_router)
         : db_path_(db_path), order_router_(order_router), db_(nullptr) {
         if (sqlite3_open(db_path.c_str(), &db_)) {
             throw std::runtime_error("Can't open database: " + std::string(sqlite3_errmsg(db_)));
@@ -96,7 +96,7 @@ private:
     std::string db_path_;
     sqlite3* db_;
     std::mutex db_lock_;
-    OptionsOrderRouter& order_router_;
+    nox::options_router::OptionsOrderRouter& order_router_;
     std::thread monitoring_thread_;
     // Written by stop_monitoring() (caller thread), read by monitor_positions()
     // (monitoring thread) — must be atomic to avoid a data race / hoisted read.
@@ -136,7 +136,7 @@ private:
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, 0) == SQLITE_OK) {
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 OptionPosition pos;
-                pos.id = sqlite3_column_int(stmt, 0);
+                pos.id = sqlite3_column_int64(stmt, 0);
                 pos.ticker = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
                 pos.option_type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
                 pos.strike = sqlite3_column_double(stmt, 3);
@@ -157,7 +157,7 @@ private:
         const char* sql = "DELETE FROM open_positions WHERE id = ?;";
         sqlite3_stmt* stmt;
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, 0) == SQLITE_OK) {
-            sqlite3_bind_int(stmt, 1, position_id);
+            sqlite3_bind_int64(stmt, 1, position_id);
             sqlite3_step(stmt);
         }
         sqlite3_finalize(stmt);

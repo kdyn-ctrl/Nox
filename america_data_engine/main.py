@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 from datetime import datetime, timezone
@@ -66,13 +67,19 @@ def _refresh_cache() -> None:
     """
     print("[INFO] [AMERICA-DATA-ENGINE] Starting scheduled news scrape...", flush=True)
 
-    news_us = fetch_alpaca_news()
-    if news_us:
-        _CACHE["news_us"] = news_us
+    # Guard the whole cycle: a failing cycle must log and return, never raise,
+    # so the recurring APScheduler job is not killed by a single bad run.
+    try:
+        news_us = fetch_alpaca_news()
+        if news_us:
+            _CACHE["news_us"] = news_us
 
-    _CACHE["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
-    print(f"[INFO] [AMERICA-DATA-ENGINE] News refresh complete at {_CACHE['last_updated']}.",
-          flush=True)
+        _CACHE["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
+        print(f"[INFO] [AMERICA-DATA-ENGINE] News refresh complete at {_CACHE['last_updated']}.",
+              flush=True)
+    except Exception as e:
+        print(f"[ERROR] [AMERICA-DATA-ENGINE] News refresh failed: {e}", flush=True)
+        return
 
 
 def _refresh_earnings_cache() -> None:
@@ -83,16 +90,20 @@ def _refresh_earnings_cache() -> None:
     """
     print("[INFO] [AMERICA-DATA-ENGINE] Starting 24-hour earnings calendar refresh...", flush=True)
 
-    earnings = fetch_earnings_calendar(WATCHLIST)
-    if earnings:
-        _CACHE["earnings_calendar"] = earnings
-        total_events = sum(len(events) for events in earnings.values())
-        print(f"[INFO] [AMERICA-DATA-ENGINE] Earnings calendar updated: {total_events} event(s) found.",
-              flush=True)
+    try:
+        earnings = fetch_earnings_calendar(WATCHLIST)
+        if earnings:
+            _CACHE["earnings_calendar"] = earnings
+            total_events = sum(len(events) for events in earnings.values())
+            print(f"[INFO] [AMERICA-DATA-ENGINE] Earnings calendar updated: {total_events} event(s) found.",
+                  flush=True)
 
-    _CACHE["last_earnings_update"] = datetime.now(tz=timezone.utc).isoformat()
-    print(f"[INFO] [AMERICA-DATA-ENGINE] Earnings refresh complete at {_CACHE['last_earnings_update']}.",
-          flush=True)
+        _CACHE["last_earnings_update"] = datetime.now(tz=timezone.utc).isoformat()
+        print(f"[INFO] [AMERICA-DATA-ENGINE] Earnings refresh complete at {_CACHE['last_earnings_update']}.",
+              flush=True)
+    except Exception as e:
+        print(f"[ERROR] [AMERICA-DATA-ENGINE] Earnings refresh failed: {e}", flush=True)
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -100,9 +111,11 @@ def _refresh_earnings_cache() -> None:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    # Startup: refresh both news and earnings immediately
-    _refresh_cache()
-    _refresh_earnings_cache()
+    # Startup: refresh both news and earnings immediately. Run the (slow,
+    # blocking) scrapes in a worker thread so we don't block the event loop
+    # while the very first request waits on startup.
+    await asyncio.to_thread(_refresh_cache)
+    await asyncio.to_thread(_refresh_earnings_cache)
 
     scheduler = BackgroundScheduler(timezone="UTC")
     # News: refresh every 15 minutes
