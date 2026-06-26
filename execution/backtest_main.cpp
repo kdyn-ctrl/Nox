@@ -318,7 +318,11 @@ Trade simulateTrade(const std::string& ticker,
         if (K2 >= K1) K2 = K1 - ((spot0 < 200.0) ? 1.0 : 5.0);
         leg1_type = OptionType::Put;
     } else if (strat == "STRADDLE") {
-        K1 = std::round(spot0);
+        // ATM strike on the real listed increment ($0.50 / $1 / $5), matching
+        // findStrikeForDelta — round(spot) alone can pick a strike that doesn't
+        // exist for sub-$25 or >$200 names.
+        double step = (spot0 < 25.0) ? 0.50 : (spot0 < 200.0) ? 1.0 : 5.0;
+        K1 = std::round(spot0 / step) * step;
         leg1_type = OptionType::Call;
     } else if (strat == "STRANGLE") {
         K1 = findStrikeForDelta(spot0, expiry_yrs, iv_entry, prof.delta_income, OptionType::Call, rfr);
@@ -385,8 +389,12 @@ Trade simulateTrade(const std::string& ticker,
     if (bias_bullish)      t.bias_right = t.spot_exit > t.spot_entry;
     else if (bias_bearish) t.bias_right = t.spot_exit < t.spot_entry;
     else {
-        // Vol play: right if actual move > expected one-SD move
-        double expected_move = hrv_entry * t.spot_entry * std::sqrt(dte / 252.0);
+        // Vol play: right if actual move > expected one-SD move.
+        // hrv_entry is an annualized vol, so the horizon must be in years —
+        // use expiry_yrs (dte/365), the same calendar basis the pricing uses,
+        // not a trading-day count (dte/252), which mixed conventions and
+        // overstated the expected move.
+        double expected_move = hrv_entry * t.spot_entry * std::sqrt(expiry_yrs);
         t.bias_right = std::abs(t.spot_exit - t.spot_entry) > expected_move;
     }
 

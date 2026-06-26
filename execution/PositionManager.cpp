@@ -217,12 +217,22 @@ void PositionManager::monitor_positions() {
                 auto result = order_router_.closePosition(occ_symbol, pos.quantity, is_short);
 
                 if (result.success) {
-                    std::cout << "[POS_MANAGER] Successfully closed position " << pos.id 
+                    std::cout << "[POS_MANAGER] Successfully closed position " << pos.id
                               << ". Order ID: " << result.order_id << std::endl;
-                    
-                    // Log transaction (placeholder)
-                    std::cout << "LOG: " << pos.ticker << " " << pos.strike << " " << pos.option_type 
-                              << " closed for " << exit_reason << ". Price: " << current_price << std::endl;
+
+                    // Realized P&L (per contract = 100 shares). Long premium profits
+                    // when the option appreciates; short premium profits when it decays.
+                    double pnl = (is_short
+                                  ? (pos.entry_price - current_price)
+                                  : (current_price - pos.entry_price))
+                                 * pos.quantity * 100.0;
+
+                    // Persist to the closed-trade ledger for performance review.
+                    log_closed_trade(pos, current_price, pnl, get_current_date(),
+                                     exit_reason, result.order_id);
+                    std::cout << "LOG: " << pos.ticker << " " << pos.strike << " " << pos.option_type
+                              << " closed for " << exit_reason << ". Exit: " << current_price
+                              << " | P&L: $" << pnl << std::endl;
 
                     // Fire Telegram alert
                     std::stringstream tg_msg;
@@ -233,6 +243,7 @@ void PositionManager::monitor_positions() {
                            << "• *Reason:* " << exit_reason << "\n"
                            << "• *Entry Price:* " << pos.entry_price << "\n"
                            << "• *Exit Price:* " << current_price << "\n"
+                           << "• *Realized P&L:* $" << pnl << "\n"
                            << "• *Order ID:* `" << result.order_id << "`\n"
                            << "• *Quantity:* " << pos.quantity;
                     TelegramNotifier::sendMessage(tg_msg.str());
