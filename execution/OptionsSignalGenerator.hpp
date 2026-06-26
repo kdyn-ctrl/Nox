@@ -1028,6 +1028,28 @@ private:
     // ── Live order execution via OptionsOrderRouter ───────────────────────────
 
     void executeSignal(const OptionsSignal& sig) const {
+        // Auto-execute is restricted to single-leg strategies. The position
+        // monitor can only price/manage single-leg "long" and "short_premium"
+        // positions, so auto-placing a multi-leg order would leave it unmanaged
+        // (no profit-target / stop / DTE exit). Such signals remain advisory:
+        // the Telegram alert already fired in scanTicker — execute manually.
+        const bool is_single_leg =
+            (sig.strategy == "LONG_CALL" || sig.strategy == "LONG_PUT" ||
+             sig.strategy == "CSP"       || sig.strategy == "CC");
+        if (!is_single_leg) {
+            log("WARN", "[OPTIONS_EXEC] Auto-execute skipped for multi-leg strategy " +
+                sig.strategy + " on " + sig.underlying +
+                " — advisory only (monitor cannot yet manage multi-leg). Execute manually.");
+            sendTelegram(
+                "⚠️ *AUTO-EXECUTE SKIPPED (multi-leg) — " + sig.underlying + "*\n"
+                "────────────────────────\n"
+                "• *Strategy:* " + sig.strategy + "\n"
+                "_Multi-leg positions aren't auto-managed yet. Signal is advisory —"
+                " execute manually if you want it._"
+            );
+            return;
+        }
+
         nox::options_router::OptionsOrderRouter router(alpacaUrl_, apiKey_, apiSec_);
 
         // Covered calls require 100 shares per contract as collateral.

@@ -30,14 +30,21 @@ public:
     void send(const std::string& message) {
         if (!is_enabled_) return;
 
-        std::string encoded_message = url_encode(message);
-
         httplib::Client cli("https://api.telegram.org");
         cli.set_connection_timeout(std::chrono::seconds(10));
-        
-        std::string path = "/bot" + bot_token_ + "/sendMessage?chat_id=" + chat_id_ + "&text=" + encoded_message;
+        cli.set_read_timeout(std::chrono::seconds(10));
 
-        auto res = cli.Get(path.c_str());
+        // POST with a JSON body instead of GET-with-query: avoids Telegram's URL
+        // length limit on long audit reports and keeps the message text out of
+        // any URL-style logging. (The bot token is in the path regardless — that
+        // is unavoidable with Telegram's API.)
+        nlohmann::json body = {
+            {"chat_id", chat_id_},
+            {"text",    message}
+        };
+        std::string path = "/bot" + bot_token_ + "/sendMessage";
+
+        auto res = cli.Post(path.c_str(), body.dump(), "application/json");
 
         if (!res || res->status != 200) {
             std::cerr << "❌ [TELEGRAM] Failed to send message. Status: "
@@ -47,21 +54,6 @@ public:
     }
 
 private:
-    std::string url_encode(const std::string& value) {
-        std::ostringstream escaped;
-        escaped.fill('0');
-        escaped << std::hex;
-
-        for (char c : value) {
-            if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-                escaped << c;
-            } else {
-                escaped << '%' << std::setw(2) << std::uppercase << (int)(unsigned char)c;
-            }
-        }
-        return escaped.str();
-    }
-
     std::string bot_token_;
     std::string chat_id_;
     bool is_enabled_ = false;
