@@ -14,8 +14,8 @@
 #include <sstream>
 #include <iomanip>
 
-// Forward declaration
-class OptionsOrderRouter;
+// Forward declarations
+namespace nox::options_router { class OptionsOrderRouter; }
 class TelegramNotifier;
 
 struct OptionPosition {
@@ -32,7 +32,7 @@ struct OptionPosition {
 
 class PositionManager {
 public:
-    PositionManager(const std::string& db_path, OptionsOrderRouter& order_router)
+    PositionManager(const std::string& db_path, nox::options_router::OptionsOrderRouter& order_router)
         : db_path_(db_path), order_router_(order_router), db_(nullptr) {
         if (sqlite3_open(db_path.c_str(), &db_)) {
             throw std::runtime_error("Can't open database: " + std::string(sqlite3_errmsg(db_)));
@@ -96,7 +96,7 @@ private:
     std::string db_path_;
     sqlite3* db_;
     std::mutex db_lock_;
-    OptionsOrderRouter& order_router_;
+    nox::options_router::OptionsOrderRouter& order_router_;
     std::thread monitoring_thread_;
     // Written by stop_monitoring() (caller thread), read by monitor_positions()
     // (monitoring thread) — must be atomic to avoid a data race / hoisted read.

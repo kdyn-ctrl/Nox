@@ -17,6 +17,7 @@
 #include <iostream>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -29,6 +30,20 @@ namespace nox::options_signal {
 // ─── Enumerations ─────────────────────────────────────────────────────────────
 
 enum class DirectionalBias { Bullish, Bearish, Neutral };
+
+// ─── ScoredSignal — internal ranking wrapper ──────────────────────────────────
+// run_scan() collects these, sorts by quality_score descending, then dispatches
+// only the top max_signals_per_scan. The score is venue-agnostic: it measures
+// setup conviction regardless of strategy type.
+struct ScoredSignal {
+    OptionsSignal signal;
+    std::string   formatted_alert;
+    double        quality_score = 0.0;
+    // Raw components (logged for transparency)
+    double sma_distance_atrs = 0.0; // how far price is from SMA20 in ATR units
+    double vol_deviation     = 0.0; // abs(IV/HRV - 1.0)
+    double rsi_extremity     = 0.0; // abs(RSI - 50) / 50
+};
 
 // ─── Structures ───────────────────────────────────────────────────────────────
 
@@ -71,6 +86,15 @@ public:
 
     // Entry point — called once per scan cycle from the engine's background thread.
     void run_scan(double live_equity) {
+        // ── Market hours gate ─────────────────────────────────────────────────
+        // Options markets are only open Mon–Fri 9:30–16:00 ET. Scanning on
+        // weekends produces stale signals from Friday's closing data.
+        if (!isMarketHours()) {
+            log("INFO", "[OPTIONS_SCAN][" + profile_.name +
+                "] Outside market hours — scan skipped.");
+            return;
+        }
+
         const auto& watchlist = profile_.watchlist;
         double effective_capital = resolveCapital(live_equity);
         std::string tier         = computeCapitalTier(effective_capital);
@@ -78,9 +102,9 @@ public:
 
         log("INFO", "[OPTIONS_SCAN][" + profile_.name + "] Tier=" + tier +
             " | Capital=$" + fmt(effective_capital, 0) +
-            " | Tickers=" + std::to_string(watchlist.size()));
+            " | Tickers=" + std::to_string(watchlist.size()) +
+            " | MaxSignals=" + std::to_string(profile_.max_signals_per_scan));
 
-        // Fetch macro regime once per scan — reuse for all tickers
         double vix      = fetchVix();
         SpySnapshot spy = fetchSpy();
 
@@ -96,25 +120,58 @@ public:
             vix = 20.0;
         }
 
-        // Fetch earnings calendar once per scan cycle from america-data-engine
         auto earnings_calendar = fetchEarningsCalendar();
 
+        // ── Stage 1: evaluate all tickers, collect scored candidates ──────────
+        std::vector<ScoredSignal> candidates;
         for (const auto& ticker : watchlist) {
             try {
-                // Check if ticker has earnings within 5 days — if so, skip signal generation
                 if (hasEarningsWithin5Days(ticker, earnings_calendar)) {
                     log("INFO", "[OPTIONS_SCAN][EARNINGS_GATE] " + ticker +
-                        " has scheduled earnings within 5 days. Skipping signal generation.");
-                    std::cout << "[EARNINGS_GATE] Excluded: " + ticker + " (earnings window)" << std::endl;
+                        " has earnings within 5 days — skipped.");
                     continue;
                 }
-
-                scanTicker(ticker, effective_capital, tier, fc_mode, vix, spy, regime);
+                auto result = evaluateTicker(ticker, effective_capital, tier,
+                                             fc_mode, vix, spy, regime);
+                if (result) candidates.push_back(std::move(*result));
             } catch (const std::exception& e) {
                 log("WARN", "[OPTIONS_SCAN] Exception on " + ticker + ": " + e.what());
             }
-            // Brief pause between tickers to avoid rate limits
             std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        }
+
+        if (candidates.empty()) {
+            log("INFO", "[OPTIONS_SCAN][" + profile_.name +
+                "] No qualifying setups this cycle.");
+            return;
+        }
+
+        // ── Stage 2: rank by quality, dispatch top max_signals_per_scan ───────
+        std::sort(candidates.begin(), candidates.end(),
+            [](const ScoredSignal& a, const ScoredSignal& b) {
+                return a.quality_score > b.quality_score;
+            });
+
+        int limit      = profile_.max_signals_per_scan;
+        int dispatched = 0;
+
+        for (const auto& sc : candidates) {
+            if (dispatched >= limit) break;
+            sendTelegram(sc.formatted_alert);
+            if (profile_.auto_execute) executeSignal(sc.signal);
+            log("INFO", "[OPTIONS_SCAN] Dispatched #" + std::to_string(dispatched + 1) +
+                ": " + sc.signal.underlying + " / " + sc.signal.strategy +
+                " | score=" + fmt(sc.quality_score, 2) +
+                " (SMA=" + fmt(sc.sma_distance_atrs, 1) + "xATR" +
+                " vol=" + fmt(sc.vol_deviation * 100.0, 0) + "%" +
+                " RSI=" + fmt(sc.signal.rsi, 0) + ")");
+            dispatched++;
+        }
+
+        int suppressed = static_cast<int>(candidates.size()) - dispatched;
+        if (suppressed > 0) {
+            log("INFO", "[OPTIONS_SCAN][" + profile_.name + "] " +
+                std::to_string(suppressed) + " lower-quality setup(s) suppressed by cap.");
         }
     }
 
@@ -189,6 +246,45 @@ private:
         }
         if (r == Regime::TRANSITION) return 0.65;
         return 1.0; // RISK_ON
+    }
+
+    // ── Market hours gate ─────────────────────────────────────────────────────
+    // Returns true Mon–Fri between 09:00 and 16:00 ET (approximate DST handling).
+    // Prevents stale weekend / after-hours signals from firing.
+    static bool isMarketHours() {
+        auto now    = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm utc{};
+        gmtime_r(&time_t, &utc);
+
+        if (utc.tm_wday == 0 || utc.tm_wday == 6) return false; // Sat/Sun
+
+        // Approximate ET offset: Apr(3)–Oct(9) = UTC-4 (EDT), else UTC-5 (EST)
+        int offset_h = (utc.tm_mon >= 3 && utc.tm_mon <= 9) ? 4 : 5;
+        int et_mins  = ((utc.tm_hour - offset_h + 24) % 24) * 60 + utc.tm_min;
+
+        return et_mins >= 9 * 60 && et_mins < 16 * 60;
+    }
+
+    // ── Signal quality score ──────────────────────────────────────────────────
+    // Combines three independent conviction signals into a single rank value.
+    // Higher = stronger setup. Used to pick the best N per scan cycle.
+    static ScoredSignal scoreSignal(const OptionsSignal& sig,
+                                    const std::string& formatted_alert,
+                                    const UnderlyingData& d) {
+        ScoredSignal sc;
+        sc.signal          = sig;
+        sc.formatted_alert = formatted_alert;
+        sc.sma_distance_atrs = (d.atr14 > 0)
+            ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
+        sc.vol_deviation   = (sig.hrv30 > 0.01)
+            ? std::abs(sig.iv_level / sig.hrv30 - 1.0) : 0.0;
+        sc.rsi_extremity   = std::abs(sig.rsi - 50.0) / 50.0;
+        // Weights: trend conviction matters most, vol signal second, RSI third
+        sc.quality_score   = sc.sma_distance_atrs * 0.50
+                           + sc.vol_deviation      * 0.30
+                           + sc.rsi_extremity      * 0.20;
+        return sc;
     }
 
     // ── Market data: VIX ──────────────────────────────────────────────────────
@@ -935,7 +1031,8 @@ private:
             " | ATR(14): $" + fmt(s.atr) + "\n"
             "\n🌐 *Macro Regime:* " + regime.log_message + " " + regime_emoji +
             " (VIX " + fmt(vix, 1) + ")\n"
-            "🎯 *Signal Confidence:* " + std::to_string(conf_pct) + "%\n"
+            "🌡️ *Regime Clearance:* " + std::to_string(conf_pct) + "% "
+                "(100=RISK_ON · 65=TRANSITION · 0=RISK_OFF)\n"
             "\n📋 _" + s.rationale + "_" +
             fc_footer + "\n"
             "⚠️ _Advisory only — manual execution required._";
@@ -967,56 +1064,69 @@ private:
         }
     }
 
-    // ── Per-ticker scan orchestrator ──────────────────────────────────────────
+    // ── Per-ticker evaluator — returns scored signal or nullopt if no setup ───
 
-    void scanTicker(const std::string& ticker,
-                    double effective_capital, const std::string& tier, bool fc_mode,
-                    double vix, const SpySnapshot& spy,
-                    const AllocationStrategy& regime)
+    std::optional<ScoredSignal> evaluateTicker(
+        const std::string& ticker,
+        double effective_capital, const std::string& tier, bool fc_mode,
+        double vix, const SpySnapshot& spy,
+        const AllocationStrategy& regime)
     {
         log("INFO", "[OPTIONS_SCAN] Scanning " + ticker + "...");
 
         UnderlyingData d = fetchUnderlyingBars(ticker);
         if (!d.valid) {
             log("WARN", "[OPTIONS_SCAN] No bar data for " + ticker + " — skipping.");
-            return;
+            return std::nullopt;
         }
 
         IVData iv_data  = fetchIVData(ticker, vix, d.hrv30);
         double iv_rank  = iv_data.iv_rank;
-        double iv_sigma = iv_data.iv_level; // actual market IV — use directly in BS
-
-        double rfr = 0.05; // US risk-free rate (approximate)
+        double iv_sigma = iv_data.iv_level;
+        double rfr      = 0.05;
 
         DirectionalBias bias     = computeBias(d);
         std::string     strategy = selectStrategy(bias, iv_rank, iv_sigma, d.hrv30, tier);
 
-        double conf = regimeConfidence(regime.current_regime, strategy);
-        if (conf < 1e-6) {
+        double regime_clearance = regimeConfidence(regime.current_regime, strategy);
+        if (regime_clearance < 1e-6) {
             log("INFO", "[OPTIONS_SCAN] " + ticker + " / " + strategy +
                 " suppressed by RISK_OFF regime.");
-            return;
+            return std::nullopt;
+        }
+
+        // Setup quality gate — requires at least one of:
+        //   A) Price ≥1.0×ATR from SMA20 (clear trend conviction)
+        //   B) IV deviates ≥30% from HRV (strong vol signal)
+        //   C) RSI ≤35 or ≥68 (clear momentum extreme)
+        {
+            double sma_atrs  = (d.atr14 > 0) ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
+            bool strong_trend = sma_atrs >= 1.0;
+            bool strong_vol   = (d.hrv30 > 0.01) &&
+                                (iv_sigma > d.hrv30 * 1.30 || iv_sigma < d.hrv30 * 0.80);
+            bool rsi_extreme  = d.rsi14 <= 35.0 || d.rsi14 >= 68.0;
+            bool clear_bias   = (bias != DirectionalBias::Neutral);
+
+            if (!strong_trend && !strong_vol && !rsi_extreme && !clear_bias) {
+                log("INFO", "[OPTIONS_SCAN] " + ticker +
+                    " — no qualifying setup (SMA=" + fmt(sma_atrs, 2) +
+                    "xATR RSI=" + fmt(d.rsi14, 1) + "). Skipped.");
+                return std::nullopt;
+            }
         }
 
         ContractParams cp = buildContractParams(strategy, d.price, d.atr14, rfr, iv_sigma);
         if (cp.strike <= 0.0) {
             log("WARN", "[OPTIONS_SCAN] Could not determine valid strike for " + ticker);
-            return;
+            return std::nullopt;
         }
 
         OptionsSignal sig = assembleSignal(ticker, d, strategy, cp,
-                                           iv_rank, iv_sigma, rfr, conf,
-                                           tier, fc_mode, effective_capital,
-                                           d.hrv30);
+                                           iv_rank, iv_sigma, rfr, regime_clearance,
+                                           tier, fc_mode, effective_capital, d.hrv30);
 
         std::string alert = formatAlert(sig, vix, regime);
-        sendTelegram(alert);
-        log("INFO", "[OPTIONS_SCAN] Signal emitted: " + ticker + " / " + strategy +
-            " | conf=" + fmt(conf * 100.0, 0) + "%");
-
-        if (profile_.auto_execute) {
-            executeSignal(sig);
-        }
+        return scoreSignal(sig, alert, d);
     }
 
     // ── Live order execution via OptionsOrderRouter ───────────────────────────

@@ -62,6 +62,9 @@ services:
       - KELLY_FRACTION=${KELLY_FRACTION}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - OPTIONS_BOT_AUTO_EXECUTE=${OPTIONS_BOT_AUTO_EXECUTE:-false}
+      - OPTIONS_BOT_MAX_SIGNALS=${OPTIONS_BOT_MAX_SIGNALS:-3}
+      - OPTIONS_PERSONAL_MAX_SIGNALS=${OPTIONS_PERSONAL_MAX_SIGNALS:-2}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.execution-webhook.rule=Path(`/webhook`)"
@@ -89,9 +92,38 @@ services:
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
     volumes:
       - ./data:/app/data
-    command: sh -c "chown -R root:root /app/data && python -u monitor.py"
+      - ./reports:/app/reports
+    command: sh -c "chown -R root:root /app/data && mkdir -p /app/reports && python -u monitor.py"
     networks:
       - nox_net
+
+# ── IBKR Paper Trading Gateway (nocturnal branch only) ───────────────────────
+# Uncomment this block when ready to activate IBKR execution.
+# Requires: IBKR paper trading account credentials set in .env:
+#   IB_GATEWAY_USER=your_paper_username
+#   IB_GATEWAY_PASSWORD=your_paper_password
+# After uncommenting:
+#   1. Run: ./execution/setup_ibkr_vendor.sh
+#   2. Recompile: g++ ... -DIBKR_ENABLED ... -o execution/nox_engine_ibkr
+#      (then copy it as nox_engine before docker compose up --build)
+#   3. Set EXECUTION_VENUE=ibkr in .env
+#   4. docker compose up -d
+#
+#  ib-gateway:
+#    image: ghcr.io/gnzsnz/ib-gateway:stable
+#    container_name: nox_ib_gateway
+#    restart: unless-stopped
+#    environment:
+#      - TWS_USERID=${IB_GATEWAY_USER}
+#      - TWS_PASSWORD=${IB_GATEWAY_PASSWORD}
+#      - TRADING_MODE=paper          # paper = port 4002, live = port 4001
+#      - TWS_SETTINGS_PATH=/home/ibgateway/Jts
+#      - VNC_SERVER_PASSWORD=nox_vnc # optional: view gateway UI via VNC on port 5900
+#    ports:
+#      - "4002:4002"   # TWS API (paper) — exposed to host for debugging
+#      - "5900:5900"   # VNC optional
+#    networks:
+#      - nox_net
 
 networks:
   nox_net:
