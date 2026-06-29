@@ -141,6 +141,23 @@ def math_tanh(x: float) -> float:
     return math.tanh(x)
 
 
+def should_include_article(headline: str, summary: str) -> bool:
+    """
+    Filters out low-signal topics (sports, entertainment, etc.) to reduce noise.
+    Exclusion list configurable via EXCLUDE_TOPICS env var (comma-separated).
+    """
+    exclude_topics = os.getenv("EXCLUDE_TOPICS", "")
+    if not exclude_topics:
+        return True
+
+    text = f"{headline} {summary}".lower()
+    topics = [t.strip() for t in exclude_topics.split(",") if t.strip()]
+    for topic in topics:
+        if topic in text:
+            return False
+    return True
+
+
 def score_news_batch(news: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Attaches a `sentiment` block to each news item in place and returns the list.
@@ -390,7 +407,7 @@ def fetch_news_with_fallback() -> List[Dict[str, Any]]:
     """
     Orchestrates multi-source news fetching with fallback logic.
     Tries sources in order: Alpaca (primary) → NewsAPI → Polygon → RSS (last resort).
-    Deduplicates and scores all results uniformly.
+    Deduplicates, filters by topic, and scores all results uniformly.
 
     Returns: list of news items with sentiment scores, or empty list if all sources fail.
     """
@@ -425,9 +442,18 @@ def fetch_news_with_fallback() -> List[Dict[str, Any]]:
     # Deduplicate across all sources
     deduped = deduplicate_news(all_news)
 
-    if deduped:
-        print(f"[INFO] [SCRAPER] After dedup: {len(deduped)} unique articles", flush=True)
-        return deduped
+    # Filter by topic (exclude low-signal content)
+    filtered = [
+        item for item in deduped
+        if should_include_article(item.get("headline", ""), item.get("summary", ""))
+    ]
+    if len(filtered) < len(deduped):
+        excluded = len(deduped) - len(filtered)
+        print(f"[INFO] [SCRAPER] Topic filter excluded {excluded} article(s).", flush=True)
+
+    if filtered:
+        print(f"[INFO] [SCRAPER] After dedup + filter: {len(filtered)} unique articles", flush=True)
+        return filtered
     else:
         print(f"[ERROR] [SCRAPER] All news sources failed — returning empty batch", flush=True)
         return []

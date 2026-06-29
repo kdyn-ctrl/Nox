@@ -19,6 +19,12 @@ services:
       # Backup news sources (optional; if missing, gracefully skipped)
       - NEWSAPI_KEY=${NEWSAPI_KEY:-}
       - POLYGON_API_KEY=${POLYGON_API_KEY:-}
+      # WS1 — Advanced signal quality (optional)
+      - EXCLUDE_TOPICS=${EXCLUDE_TOPICS:-}
+      - HALFLIFE_GEOPOLITICAL_HOURS=${HALFLIFE_GEOPOLITICAL_HOURS:-6}
+      - HALFLIFE_MACRO_HOURS=${HALFLIFE_MACRO_HOURS:-48}
+      - HALFLIFE_EARNINGS_HOURS=${HALFLIFE_EARNINGS_HOURS:-72}
+      - HALFLIFE_TECHNICAL_HOURS=${HALFLIFE_TECHNICAL_HOURS:-12}
       # WS1 — Contradiction Vector: reach heartbeat's IV skew endpoint + tuning.
       - HEARTBEAT_BASE_URL=${HEARTBEAT_BASE_URL:-http://heartbeat-monitor:8002}
       - CONTRADICTION_SKEW_THRESHOLD=${CONTRADICTION_SKEW_THRESHOLD:-0.03}
