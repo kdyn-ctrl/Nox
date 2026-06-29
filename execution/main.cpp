@@ -2,13 +2,18 @@
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 #include "../shared/RegimeStateMachine.hpp"
+#include "../shared/TelegramNotifier.hpp"
 #include "OptionEngine.hpp"
 #include "OptionsSignalGenerator.hpp"
 #include "PositionManager.hpp"
+#include <atomic>
+#include <condition_variable>
+#include <csignal>
 #include <iostream>
 #include <string>
 #include <cmath>
 #include <thread>
+#include <vector>
 #include <chrono>
 #include <sstream>
 #include <iomanip>
@@ -25,46 +30,7 @@
 #endif
 
 using json = nlohmann::json;
-
-// --- 1. TELEGRAM NOTIFIER ---
-class TelegramNotifier {
-public:
-static void sendMessage(std::string message) {
-        std::string token = std::getenv("TELEGRAM_BOT_TOKEN") ? std::getenv("TELEGRAM_BOT_TOKEN") : "";
-        std::string chatId = std::getenv("TELEGRAM_CHAT_ID") ? std::getenv("TELEGRAM_CHAT_ID") : "";
-        if (token.empty() || chatId.empty()) {
-            std::cerr << "❌ [TELEGRAM] Missing Bot Token or Chat ID env variables." << std::endl;
-            return;
-        }
-
-        httplib::Client cli("https://api.telegram.org");
-        cli.set_connection_timeout(std::chrono::seconds(5));
-        cli.set_read_timeout(std::chrono::seconds(10));
-        std::string path = "/bot" + token + "/sendMessage";
-
-        // Telegram's max limit is 4096; 4000 gives us a safe buffer for formatting tags
-        const size_t MAX_LIMIT = 4000; 
-        size_t offset = 0;
-
-        // Loop and slice the report into multiple sequential messages if it's too long
-        while (offset < message.length()) {
-            std::string chunk = message.substr(offset, MAX_LIMIT);
-            offset += MAX_LIMIT;
-
-            json body = {
-                {"chat_id", chatId},
-                {"text", chunk},
-                {"parse_mode", "Markdown"}
-            };
-
-            auto res = cli.Post(path.c_str(), body.dump(), "application/json");
-            if (!res || res->status != 200) {
-                std::cerr << "❌ [TELEGRAM ERROR] Failed to deliver report chunk. Status: " 
-                          << (res ? std::to_string(res->status) : "No Response") << std::endl;
-            }
-        }
-    }
-};
+using TelegramNotifier = nox::TelegramNotifier;
 
 // --- 2. UTILITIES & DATA ---
 class Logger {
@@ -197,6 +163,29 @@ private:
     // Options signal scanner profiles (configured from env vars in the constructor)
     nox::options_signal::RiskProfile optionsBotProfile_;
     nox::options_signal::RiskProfile optionsPersonalProfile_;
+
+    // ── Graceful shutdown ─────────────────────────────────────────────────────
+    // SIGTERM sets running_ = false and calls shutdown(), which stops the HTTP
+    // server and wakes the options scanner threads so they can exit their
+    // wait_for() sleep rather than blocking until the next scan interval.
+    std::atomic<bool>       running_{true};
+    std::mutex              stop_mutex_;
+    std::condition_variable stop_cv_;
+    std::vector<std::thread> option_threads_;
+    httplib::Server*        svr_ptr_{nullptr}; // set in run() before listen()
+
+    static NoxEngine* s_instance_;
+
+    static void handle_signal(int) {
+        if (s_instance_) s_instance_->shutdown();
+    }
+
+    void shutdown() {
+        if (running_.exchange(false)) {
+            if (svr_ptr_) svr_ptr_->stop();
+            stop_cv_.notify_all();
+        }
+    }
 
     // ── Inbound signal log (last 50 authenticated signals, newest at back) ─────
     struct SignalLogEntry {
@@ -1318,15 +1307,17 @@ public:
         }); // This perfectly closes the svr.Post router lambda
 
         // ── Options signal scanner — two threads, one per profile ──────────────
+        // Threads are stored and joined on shutdown so SIGTERM drains cleanly
+        // rather than terminating mid-scan or mid-order.
         auto launchOptionsThread = [this](nox::options_signal::RiskProfile profile) {
-            std::thread t([this, profile]() {
+            option_threads_.emplace_back([this, profile]() {
                 std::string tg_token = std::getenv("TELEGRAM_BOT_TOKEN") ? std::getenv("TELEGRAM_BOT_TOKEN") : "";
                 std::string tg_chat  = std::getenv("TELEGRAM_CHAT_ID")   ? std::getenv("TELEGRAM_CHAT_ID")   : "";
 
                 nox::options_signal::OptionsSignalGenerator generator(
                     alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat, profile);
 
-                while (true) {
+                while (running_.load()) {
                     try {
                         double equity = fetch_account_equity();
                         if (equity > 0.0) {
@@ -1339,21 +1330,41 @@ public:
                         Logger::log("WARN", "[OPTIONS_SIGNAL][" + profile.name +
                                     "] Scan exception: " + std::string(e.what()));
                     }
-                    std::this_thread::sleep_for(
-                        std::chrono::minutes(profile.scan_interval_minutes));
+                    // Interruptible sleep: wakes immediately when shutdown() fires
+                    // instead of blocking for the full scan interval on SIGTERM.
+                    std::unique_lock<std::mutex> lk(stop_mutex_);
+                    stop_cv_.wait_for(lk,
+                        std::chrono::minutes(profile.scan_interval_minutes),
+                        [this] { return !running_.load(); });
                 }
+                Logger::log("INFO", "[OPTIONS_SIGNAL][" + profile.name + "] thread exiting.");
             });
-            t.detach();
         };
 
         launchOptionsThread(optionsBotProfile_);
         launchOptionsThread(optionsPersonalProfile_);
         // ────────────────────────────────────────────────────────────────────
 
+        // Install SIGTERM/SIGINT handlers now that s_instance_ is set and
+        // svr_ptr_ points at the live server.
+        s_instance_ = this;
+        svr_ptr_    = &svr;
+        std::signal(SIGTERM, NoxEngine::handle_signal);
+        std::signal(SIGINT,  NoxEngine::handle_signal);
+
         Logger::log("INFO", "Nox Execution Engine listening on 0.0.0.0:8080...");
         svr.listen("0.0.0.0", 8080);
+
+        // listen() returned — either SIGTERM fired or the server stopped internally.
+        // Ensure running_ is false and wake any threads still in wait_for().
+        shutdown();
+        for (auto& t : option_threads_)
+            if (t.joinable()) t.join();
+        Logger::log("INFO", "Nox Execution Engine shut down cleanly.");
     } // This closes void run()
 }; // This closes class NoxEngine
+
+NoxEngine* NoxEngine::s_instance_ = nullptr;
 
 int main() {
     NoxEngine engine;
