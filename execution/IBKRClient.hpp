@@ -64,6 +64,7 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -94,6 +95,23 @@ struct OrderUpdate {
     double      last_fill_price = 0.0;
     int         perm_id         = 0;
     int         client_id       = 0;
+};
+
+// WS5 — point-in-time liquidity snapshot for the microstructure gate.
+// Assembled on demand from the latest BID/ASK ticks and the L2 depth book.
+struct LiquiditySnapshot {
+    double bid        = 0.0;
+    double ask        = 0.0;
+    double mid        = 0.0;
+    double spread     = 0.0;  // absolute ask - bid
+    double rel_spread = 0.0;  // (ask - bid) / mid — the value fed to LiquidityGate
+    double bid_size   = 0.0;  // top-of-book bid size (tickSize)
+    double ask_size   = 0.0;  // top-of-book ask size (tickSize)
+    int    bid_levels = 0;    // L2: number of populated bid price levels
+    int    ask_levels = 0;    // L2: number of populated ask price levels
+    double bid_depth  = 0.0;  // L2: summed bid size across all levels
+    double ask_depth  = 0.0;  // L2: summed ask size across all levels
+    bool   valid      = false; // true once both bid and ask are known
 };
 
 // A confirmed execution (fill) from execDetails.
@@ -199,6 +217,14 @@ public:
                    const TickAttrib& attribs) override;
     void tickSize(TickerId tickerId, TickType field, int size) override;
 
+    // ── L2 market depth (WS5 liquidity gate) ─────────────────────────────────────
+    // side: 0 = ask, 1 = bid.  operation: 0 = insert, 1 = update, 2 = delete.
+    void updateMktDepth(TickerId id, int position, int operation, int side,
+                        double price, int size) override;
+    void updateMktDepthL2(TickerId id, int position, const std::string& marketMaker,
+                          int operation, int side, double price, int size,
+                          bool isSmartDepth) override;
+
     // ── Consumer-facing accessors (main execution thread) ───────────────────────
 
     // True once the gateway has handed us a valid starting order id.
@@ -217,6 +243,10 @@ public:
     // Copy the latest known status for an order, if any.
     bool latestStatus(OrderId id, OrderUpdate& out) const;
 
+    // WS5 — assemble the current liquidity snapshot for a ticker from the latest
+    // top-of-book ticks and the L2 depth book. Thread-safe (md_lock_).
+    LiquiditySnapshot getLiquidity(TickerId id) const;
+
 private:
     ExecutionLogger* logger_ = nullptr; // not owned
 
@@ -227,6 +257,17 @@ private:
 
     mutable std::mutex                         order_lock_;
     std::unordered_map<OrderId, OrderUpdate>   order_state_; // guarded by order_lock_
+
+    // ── Live microstructure state (guarded by md_lock_) ──────────────────────────
+    // Top-of-book bid/ask + sizes come from tick callbacks; the per-side depth
+    // books map an L2 position → size so insert/update/delete can be replayed.
+    struct LiquidityState {
+        double               bid = 0.0, ask = 0.0, bid_size = 0.0, ask_size = 0.0;
+        std::map<int, double> bid_book; // position → size
+        std::map<int, double> ask_book; // position → size
+    };
+    mutable std::mutex                            md_lock_;
+    std::unordered_map<TickerId, LiquidityState>  liquidity_; // guarded by md_lock_
 };
 
 // ─── IBKRConnection — EClientSocket lifecycle + message pump ─────────────────────
@@ -283,4 +324,7 @@ private:
 //   3. For TWS API ≥ 10.10 change `double filled/remaining` to `Decimal` in
 //      orderStatus and `int size` to `Decimal` in tickSize, and switch `error`
 //      to the 5-argument overload (adds time_t + advancedOrderRejectJson).
+//      Also change `int size` to `Decimal` in updateMktDepth/updateMktDepthL2
+//      (WS5). To populate L2 depth, the caller must reqMktDepth(...) on the
+//      contract; top-of-book bid/ask alone arrive via reqMktData tick callbacks.
 // ─────────────────────────────────────────────────────────────────────────────

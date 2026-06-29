@@ -174,6 +174,14 @@ void IBKRWrapper::error(int id, int errorCode, const std::string& errorString) {
     if (logger_) logger_->logError(id, errorCode, errorString);
 }
 
+// IBKR TickType field codes used by the liquidity gate (stable across versions).
+namespace {
+constexpr int kTickBidSize = 0;
+constexpr int kTickBid     = 1;
+constexpr int kTickAsk     = 2;
+constexpr int kTickAskSize = 3;
+} // namespace
+
 void IBKRWrapper::tickPrice(TickerId tickerId, TickType field, double price,
                             const TickAttrib& /*attribs*/) {
     MarketTick t;
@@ -183,6 +191,14 @@ void IBKRWrapper::tickPrice(TickerId tickerId, TickType field, double price,
     t.is_size   = false;
     // Drop on overflow rather than block the socket path; consumer fell behind.
     tick_buffer_.push(t);
+
+    // WS5 — keep the latest top-of-book bid/ask for the microstructure gate.
+    const int f = static_cast<int>(field);
+    if (f == kTickBid || f == kTickAsk) {
+        std::lock_guard<std::mutex> lock(md_lock_);
+        auto& L = liquidity_[tickerId];
+        if (f == kTickBid) L.bid = price; else L.ask = price;
+    }
 }
 
 void IBKRWrapper::tickSize(TickerId tickerId, TickType field, int size) {
@@ -192,6 +208,62 @@ void IBKRWrapper::tickSize(TickerId tickerId, TickType field, int size) {
     t.size      = size;
     t.is_size   = true;
     tick_buffer_.push(t);
+
+    // WS5 — keep the latest top-of-book sizes for the microstructure gate.
+    const int f = static_cast<int>(field);
+    if (f == kTickBidSize || f == kTickAskSize) {
+        std::lock_guard<std::mutex> lock(md_lock_);
+        auto& L = liquidity_[tickerId];
+        if (f == kTickBidSize) L.bid_size = static_cast<double>(size);
+        else                   L.ask_size = static_cast<double>(size);
+    }
+}
+
+// ── L2 market depth (WS5) ───────────────────────────────────────────────────
+// Maintain a per-side position→size book so depth can be summed on demand.
+// operation: 0 = insert, 1 = update, 2 = delete.  side: 0 = ask, 1 = bid.
+void IBKRWrapper::updateMktDepth(TickerId id, int position, int operation,
+                                 int side, double /*price*/, int size) {
+    std::lock_guard<std::mutex> lock(md_lock_);
+    auto& L    = liquidity_[id];
+    auto& book = (side == 1) ? L.bid_book : L.ask_book;
+    if (operation == 2) book.erase(position);
+    else                book[position] = static_cast<double>(size);
+}
+
+void IBKRWrapper::updateMktDepthL2(TickerId id, int position,
+                                   const std::string& /*marketMaker*/, int operation,
+                                   int side, double price, int size,
+                                   bool /*isSmartDepth*/) {
+    // L2 carries the same position/operation/side semantics plus a market-maker
+    // id we don't need for an aggregate depth read — delegate to the L1 handler.
+    updateMktDepth(id, position, operation, side, price, size);
+}
+
+LiquiditySnapshot IBKRWrapper::getLiquidity(TickerId id) const {
+    LiquiditySnapshot snap;
+    std::lock_guard<std::mutex> lock(md_lock_);
+    auto it = liquidity_.find(id);
+    if (it == liquidity_.end()) return snap;
+
+    const auto& L = it->second;
+    snap.bid      = L.bid;
+    snap.ask      = L.ask;
+    snap.bid_size = L.bid_size;
+    snap.ask_size = L.ask_size;
+
+    snap.bid_levels = static_cast<int>(L.bid_book.size());
+    snap.ask_levels = static_cast<int>(L.ask_book.size());
+    for (const auto& kv : L.bid_book) snap.bid_depth += kv.second;
+    for (const auto& kv : L.ask_book) snap.ask_depth += kv.second;
+
+    if (L.bid > 0.0 && L.ask > 0.0 && L.ask >= L.bid) {
+        snap.mid        = (L.bid + L.ask) / 2.0;
+        snap.spread     = L.ask - L.bid;
+        snap.rel_spread = (snap.mid > 0.0) ? snap.spread / snap.mid : 0.0;
+        snap.valid      = true;
+    }
+    return snap;
 }
 
 bool IBKRWrapper::latestStatus(OrderId id, OrderUpdate& out) const {

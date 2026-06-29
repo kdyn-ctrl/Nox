@@ -216,6 +216,36 @@ def example_iv_trend():
     print(f"\nTrend: {change:+.1f}% → {trend}")
 
 
+# ============================================================================
+# EXAMPLE 7: IV skew (WS1 Contradiction Vector input)
+# ============================================================================
+def example_iv_skew():
+    """
+    Compute put-vs-call IV skew for a ticker. Positive skew = puts bid up =
+    bearish options positioning; the Contradiction Vector flags bullish text
+    against a bearish skew as a signal to IGNORE.
+    """
+    from heartbeat.monitor import fetch_iv_skew
+
+    ticker = "NVDA"
+    result = fetch_iv_skew(ticker)
+
+    if result.get("method") != "live_chain":
+        print(f"✗ {ticker}: {result.get('error', 'no data')}")
+        return
+
+    skew = result["skew"]
+    direction = (
+        "🔴 BEARISH (puts bid up)" if result["skew_pct"] >= 0.03
+        else "🟢 BULLISH (calls bid up)" if result["skew_pct"] <= -0.03
+        else "⚪ NEUTRAL"
+    )
+    print(f"{ticker} IV Skew:")
+    print(f"  Call IV: {result['call_iv']:.2%}   Put IV: {result['put_iv']:.2%}")
+    print(f"  Skew: {skew:+.4f} ({result['skew_pct']:+.1%})  {direction}")
+    print(f"  Put/Call OI ratio: {result['put_call_oi_ratio']:.2f}")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -226,6 +256,7 @@ if __name__ == "__main__":
         "4": ("IV Rank heatmap", example_iv_heatmap),
         "5": ("IV divergence detection", example_iv_divergence),
         "6": ("IV trend analysis", example_iv_trend),
+        "7": ("IV skew (Contradiction Vector)", example_iv_skew),
     }
 
     if len(sys.argv) > 1:

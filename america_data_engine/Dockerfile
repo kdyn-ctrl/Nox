@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY scrapers.py main.py ./
+COPY scrapers.py main.py contradiction_vector.py insider_cluster.py alt_macro.py generate_skeptic_report.py ./
 
 EXPOSE 8001
 

@@ -12,7 +12,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -24,6 +26,133 @@
 #include <vector>
 
 using json = nlohmann::json;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WS5 — Liquidity Vacuum / Microstructure Gate.
+// ─────────────────────────────────────────────────────────────────────────────
+// Before ANY execution we read the live bid-ask spread. We keep a rolling
+// per-symbol baseline of recent (relative) spreads and abort the trade when the
+// current spread sits more than N standard deviations above that baseline —
+// the fingerprint of a liquidity vacuum (flash move, halt, news gap) where a
+// market order would be filled at a punitive price regardless of how strong the
+// alpha signal is. N and the bypass are .env-configurable.
+//
+// Venue-neutral: callers feed it a spread observed from whatever source they
+// have (Alpaca latest quote on the REST path, IBKR L2 via IBKRClient when the
+// gateway is wired in). The gate only does the statistics + the abort decision.
+namespace nox::liquidity {
+
+struct GateResult {
+    bool        allow   = true;   // false → abort the trade
+    double      spread  = 0.0;    // the observed (relative) spread
+    double      mean    = 0.0;    // baseline mean
+    double      stddev  = 0.0;    // baseline sample stddev
+    double      zscore  = 0.0;    // (spread - mean) / stddev
+    bool        warming = false;  // true while baseline is still filling
+    std::string reason;
+};
+
+class LiquidityGate {
+public:
+    LiquidityGate() { loadConfig(); }
+
+    // Evaluate a freshly observed spread for `symbol` against its rolling
+    // baseline, then record it. The observation is scored BEFORE being added so
+    // a single vacuum spike cannot inflate the baseline it is judged against.
+    GateResult evaluate(const std::string& symbol, double spread) {
+        GateResult r;
+        r.spread = spread;
+        auto& hist = history_[symbol];
+
+        if (bypass_) {
+            r.reason = "gate bypassed (.env)";
+            record(hist, spread);
+            return r;
+        }
+        // A non-positive / invalid spread means we have no usable microstructure
+        // read. Fail OPEN (allow) but flag it — blocking on missing data would
+        // halt all trading whenever a quote feed hiccups.
+        if (spread <= 0.0) {
+            r.reason = "no valid spread read — gate skipped (fail-open)";
+            return r;
+        }
+        if (hist.size() < min_samples_) {
+            r.warming = true;
+            r.reason  = "baseline warming up (" + std::to_string(hist.size()) +
+                        "/" + std::to_string(min_samples_) + " samples)";
+            record(hist, spread);
+            return r;
+        }
+
+        auto [mean, sd] = stats(hist);
+        r.mean   = mean;
+        r.stddev = sd;
+        r.zscore = (sd > 1e-12) ? (spread - mean) / sd : 0.0;
+
+        if (r.zscore > n_stddev_) {
+            r.allow  = false;
+            r.reason = "spread " + num(spread) + " is " + num(r.zscore) +
+                       "σ above baseline mean " + num(mean) +
+                       " (threshold " + num(n_stddev_) + "σ) — liquidity vacuum";
+        } else {
+            r.reason = "spread within " + num(n_stddev_) + "σ of baseline";
+        }
+        record(hist, spread);
+        return r;
+    }
+
+    bool   bypassed()  const { return bypass_; }
+    double threshold() const { return n_stddev_; }
+
+private:
+    void loadConfig() {
+        if (const char* v = std::getenv("LIQUIDITY_GATE_STDDEV")) {
+            try { n_stddev_ = std::stod(v); } catch (...) {}
+        }
+        if (const char* v = std::getenv("LIQUIDITY_GATE_WINDOW")) {
+            try { window_ = std::max<std::size_t>(5, std::stoul(v)); } catch (...) {}
+        }
+        if (const char* v = std::getenv("LIQUIDITY_GATE_MIN_SAMPLES")) {
+            try { min_samples_ = std::max<std::size_t>(3, std::stoul(v)); } catch (...) {}
+        }
+        if (const char* v = std::getenv("LIQUIDITY_GATE_BYPASS")) {
+            std::string s(v);
+            std::transform(s.begin(), s.end(), s.begin(),
+                           [](unsigned char c){ return std::tolower(c); });
+            bypass_ = (s == "true" || s == "1" || s == "yes");
+        }
+    }
+
+    void record(std::deque<double>& h, double spread) {
+        h.push_back(spread);
+        if (h.size() > window_) h.pop_front();
+    }
+
+    static std::pair<double, double> stats(const std::deque<double>& h) {
+        double mean = 0.0;
+        for (double x : h) mean += x;
+        mean /= static_cast<double>(h.size());
+        double var = 0.0;
+        for (double x : h) var += (x - mean) * (x - mean);
+        // Sample variance (n-1) — h.size() >= min_samples_ (>=3) here.
+        var /= static_cast<double>(h.size() - 1);
+        return {mean, std::sqrt(var)};
+    }
+
+    static std::string num(double v) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(4) << v;
+        return oss.str();
+    }
+
+    std::map<std::string, std::deque<double>> history_;
+    double      n_stddev_    = 3.0;  // abort beyond N sigma
+    std::size_t window_      = 50;   // rolling baseline length
+    std::size_t min_samples_ = 10;   // warm-up before the gate is active
+    bool        bypass_      = false;
+};
+
+} // namespace nox::liquidity
 
 namespace nox::options_signal {
 
@@ -158,7 +287,26 @@ public:
         for (const auto& sc : candidates) {
             if (dispatched >= limit) break;
             sendTelegram(sc.formatted_alert);
-            if (profile_.auto_execute) executeSignal(sc.signal);
+            // WS5 — microstructure gate. The advisory alert always goes out, but
+            // AUTO-EXECUTION is aborted when the live spread signals a liquidity
+            // vacuum. A great setup filled into a vacuum is a losing trade.
+            if (profile_.auto_execute) {
+                double rel_spread = fetchUnderlyingSpread(sc.signal.underlying);
+                auto gate = liquidity_gate_.evaluate(sc.signal.underlying, rel_spread);
+                if (!gate.allow) {
+                    log("WARN", "[OPTIONS_EXEC][LIQUIDITY_GATE] " + sc.signal.underlying +
+                        " execution aborted — " + gate.reason);
+                    sendTelegram(
+                        "🛑 *LIQUIDITY GATE — " + sc.signal.underlying + "*\n"
+                        "────────────────────────\n"
+                        "Auto-execution aborted: " + gate.reason + ".\n"
+                        "_Advisory signal still valid — review manually._"
+                    );
+                    dispatched++;  // counts against the cap; alert was dispatched
+                    continue;
+                }
+                executeSignal(sc.signal);
+            }
             log("INFO", "[OPTIONS_SCAN] Dispatched #" + std::to_string(dispatched + 1) +
                 ": " + sc.signal.underlying + " / " + sc.signal.strategy +
                 " | score=" + fmt(sc.quality_score, 2) +
@@ -184,6 +332,7 @@ private:
     std::string tgChatId_;
     RiskProfile profile_;
     RegimeStateMachine regimeMachine_;
+    nox::liquidity::LiquidityGate liquidity_gate_; // WS5 microstructure gate
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -285,6 +434,41 @@ private:
                            + sc.vol_deviation      * 0.30
                            + sc.rsi_extremity      * 0.20;
         return sc;
+    }
+
+    // ── Market data: live bid-ask spread (WS5 liquidity gate input) ────────────
+    //
+    // Returns the underlying's RELATIVE spread (ask-bid)/mid from Alpaca's latest
+    // quote, or -1.0 on any failure. Relative (not absolute) so the rolling
+    // baseline is scale-free and comparable across symbols and price levels.
+    // The underlying's spread is a clean liquidity proxy: a vacuum in the stock
+    // implies punitive option fills too. IBKR L2 is the richer source when wired.
+    double fetchUnderlyingSpread(const std::string& symbol) const {
+        try {
+            httplib::Client cli("https://data.alpaca.markets");
+            cli.set_connection_timeout(std::chrono::seconds(5));
+            cli.set_read_timeout(std::chrono::seconds(10));
+
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID",     apiKey_},
+                {"APCA-API-SECRET-KEY", apiSec_}
+            };
+
+            std::string path = "/v2/stocks/" + symbol + "/quotes/latest?feed=iex";
+            auto res = cli.Get(path.c_str(), headers);
+            if (!res || res->status != 200) return -1.0;
+
+            auto body = json::parse(res->body);
+            const auto& q = body.at("quote");
+            double bid = q.value("bp", 0.0);
+            double ask = q.value("ap", 0.0);
+            if (bid <= 0.0 || ask <= 0.0 || ask < bid) return -1.0;
+
+            double mid = (ask + bid) / 2.0;
+            return (mid > 0.0) ? (ask - bid) / mid : -1.0;
+        } catch (...) {
+            return -1.0;
+        }
     }
 
     // ── Market data: VIX ──────────────────────────────────────────────────────

@@ -188,6 +188,9 @@ private:
     RegimeStateMachine regimeMachine;
     std::string last_analyst_report_time;
 
+    // WS5 — pre-execution microstructure gate (rolling per-symbol spread baseline)
+    nox::liquidity::LiquidityGate liquidity_gate_;
+
     // Position Manager (for options)
     std::unique_ptr<PositionManager> positionManager_;
 
@@ -211,8 +214,9 @@ private:
     void record_signal(const TradeSignal& s) {
         auto now    = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm_buf{};
         std::ostringstream ts;
-        ts << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ");
+        ts << std::put_time(::gmtime_r(&time_t, &tm_buf), "%Y-%m-%dT%H:%M:%SZ");
         std::lock_guard<std::mutex> lock(signal_log_mutex_);
         signal_log_.push_back({ts.str(), s.ticker, s.action, s.price, s.rsi, s.vix});
         if (signal_log_.size() > SIGNAL_LOG_MAX)
@@ -351,6 +355,34 @@ private:
             "Manual review required."
         );
         return -1.0; // sentinel: caller must abort the trade
+    }
+
+    // WS5 — read the live RELATIVE bid-ask spread (ask-bid)/mid for an equity
+    // from Alpaca's latest quote. Returns -1.0 on failure; the gate fails open
+    // on -1.0 so a transient quote-feed hiccup never halts all trading.
+    double fetch_equity_spread(const std::string& symbol) const {
+        try {
+            httplib::Client cli("https://data.alpaca.markets");
+            cli.set_connection_timeout(std::chrono::seconds(5));
+            cli.set_read_timeout(std::chrono::seconds(10));
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID", apiKey},
+                {"APCA-API-SECRET-KEY", apiSec}
+            };
+            std::string path = "/v2/stocks/" + symbol + "/quotes/latest?feed=iex";
+            auto res = cli.Get(path.c_str(), headers);
+            if (!res || res->status != 200) return -1.0;
+
+            auto body = json::parse(res->body);
+            const auto& q = body.at("quote");
+            double bid = q.value("bp", 0.0);
+            double ask = q.value("ap", 0.0);
+            if (bid <= 0.0 || ask <= 0.0 || ask < bid) return -1.0;
+            double mid = (ask + bid) / 2.0;
+            return (mid > 0.0) ? (ask - bid) / mid : -1.0;
+        } catch (...) {
+            return -1.0;
+        }
     }
 
     void process(TradeSignal sig) {
@@ -649,6 +681,30 @@ private:
                 return;
             }
 
+            // WS5 — Liquidity Vacuum / Microstructure Gate (Physical Hard Gate).
+            // The final check before any order leaves the building: read the live
+            // bid-ask spread and abort if it is N standard deviations above the
+            // rolling baseline — a market order into a vacuum fills at a punitive
+            // price regardless of signal strength. Bypassable only via .env.
+            {
+                double rel_spread = fetch_equity_spread(sig.ticker);
+                auto gate = liquidity_gate_.evaluate(sig.ticker, rel_spread);
+                if (!gate.allow) {
+                    Logger::log("CRITICAL",
+                        "[WS5][LIQUIDITY_GATE] " + sig.ticker +
+                        " order aborted — " + gate.reason);
+                    TelegramNotifier::sendMessage(
+                        "🛑 *LIQUIDITY GATE — " + sig.ticker + "*\n"
+                        "────────────────────────\n"
+                        "• *Spread z-score:* " + std::to_string(gate.zscore) + "σ\n"
+                        "• *Threshold:* " + std::to_string(liquidity_gate_.threshold()) + "σ\n"
+                        "⛔ Liquidity vacuum detected between sizing and submission.\n"
+                        "Order aborted to avoid punitive fill."
+                    );
+                    return;
+                }
+            }
+
 #ifdef IBKR_ENABLED
             // ── IBKR equity BUY path ────────────────────────────────────────────
             if (execution_venue_ == "ibkr") {
@@ -892,11 +948,12 @@ public:
         Logger::log("INFO", "[CN-RULE-001] Board-lot size: " + std::to_string(cnBoardLotSize) + " shares.");
 
         // CN-RULE-002: Path for T+1 position persistence file.
-        // Override with CN_POSITIONS_PATH env var, default to /tmp/china_positions.json.
+        // Override with CN_POSITIONS_PATH env var, default to /app/data (volume-mounted).
+        // /tmp is ephemeral in Docker; losing state mid-day would clear the T+1 sell gate.
         const char* pos_path_env = std::getenv("CN_POSITIONS_PATH");
         cnPositionsPath = (pos_path_env && std::string(pos_path_env) != "")
             ? std::string(pos_path_env)
-            : "/tmp/china_positions.json";
+            : "/app/data/china_positions.json";
         Logger::log("INFO", "[CN-RULE-002] T+1 positions persistence path: " + cnPositionsPath);
         load_china_positions();
 
@@ -974,12 +1031,16 @@ public:
 
         // Initialize and start the Position Manager
         try {
-            // NOTE: This assumes OptionsOrderRouter can be instantiated here.
-            // In a larger system, this might be injected or retrieved from a service locator.
             auto order_router = std::make_shared<nox::options_router::OptionsOrderRouter>(
                 alpacaBaseUrl, apiKey, apiSec
             );
-            positionManager_ = std::make_unique<PositionManager>("./memory_bank.db", *order_router);
+            // MEMORY_BANK_PATH must point to the volume-mounted data directory so the
+            // options position DB survives container restarts. Default: /app/data.
+            const char* mb_env = std::getenv("MEMORY_BANK_PATH");
+            std::string memory_bank_path = (mb_env && std::string(mb_env) != "")
+                ? std::string(mb_env)
+                : "/app/data/memory_bank.db";
+            positionManager_ = std::make_unique<PositionManager>(memory_bank_path, *order_router);
             positionManager_->start_monitoring();
             Logger::log("INFO", "[POS_MANAGER] Position Manager initialized and monitoring thread started.");
         } catch (const std::exception& e) {
@@ -1205,8 +1266,9 @@ public:
                         if (signal.ticker == "GLOBAL_AUDIT") {
                             auto now = std::chrono::system_clock::now();
                             auto time_t = std::chrono::system_clock::to_time_t(now);
+                            std::tm tm_buf{};
                             std::stringstream ss;
-                            ss << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ");
+                            ss << std::put_time(::gmtime_r(&time_t, &tm_buf), "%Y-%m-%dT%H:%M:%SZ");
                             last_analyst_report_time = ss.str();
                         }
                         success_count++;

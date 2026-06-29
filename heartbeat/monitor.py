@@ -1054,6 +1054,111 @@ def fetch_options_chain_iv(ticker: str) -> float | None:
         return None
 
 
+def _classify_option_side(entry: dict) -> str | None:
+    """
+    Resolve whether a chain entry is a 'call' or 'put'.
+    Tries explicit fields first, then falls back to parsing the OCC symbol
+    (…YYMMDD[C|P]strike). Returns 'call', 'put', or None if undeterminable.
+    """
+    for key in ("type", "option_type", "side", "cp", "right"):
+        v = entry.get(key)
+        if isinstance(v, str):
+            low = v.strip().lower()
+            if low in ("call", "c"):
+                return "call"
+            if low in ("put", "p"):
+                return "put"
+    sym = entry.get("symbol", "") or ""
+    # OCC symbol: 6-char date followed by C or P, e.g. AAPL250620C00190000
+    m = re.search(r"\d{6}([CP])\d+", sym)
+    if m:
+        return "call" if m.group(1) == "C" else "put"
+    return None
+
+
+def fetch_iv_skew(ticker: str) -> dict:
+    """
+    WS1 — compute live IV skew and a put/call open-interest profile for a ticker.
+
+    Skew = put_iv - call_iv (both open-interest-weighted). A POSITIVE skew means
+    puts are bid up relative to calls — the options market is paying for downside
+    protection (bearish / fearful). A negative skew is bullish.
+
+    The Contradiction Vector cross-checks this against headline sentiment:
+    bullish text + bearish (positive) skew is a contradiction → IGNORE the signal.
+
+    Returns:
+        {
+            "ticker", "call_iv", "put_iv", "skew", "skew_pct",
+            "put_call_oi_ratio", "contracts", "method": "live_chain" | "error"
+        }
+    """
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_API,
+        "APCA-API-SECRET-KEY": ALPACA_SEC,
+    }
+    try:
+        url = f"https://paper-api.alpaca.markets/v1beta3/options/chains/{ticker}"
+        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            return {"ticker": ticker, "method": "error",
+                    "error": f"chain HTTP {resp.status_code}"}
+
+        data = resp.json() or {}
+        chains = data.get("chains", [])
+        if not chains:
+            return {"ticker": ticker, "method": "error", "error": "empty chain"}
+
+        call_iv_oi = call_oi = 0.0
+        put_iv_oi = put_oi = 0.0
+        contracts = 0
+
+        for entry in chains:
+            iv = entry.get("iv")
+            if iv is None:
+                continue
+            oi = float(entry.get("open_interest", 0) or 0)
+            if oi <= 0:
+                continue
+            side = _classify_option_side(entry)
+            if side == "call":
+                call_iv_oi += float(iv) * oi
+                call_oi += oi
+                contracts += 1
+            elif side == "put":
+                put_iv_oi += float(iv) * oi
+                put_oi += oi
+                contracts += 1
+
+        if call_oi == 0 or put_oi == 0:
+            return {"ticker": ticker, "method": "error",
+                    "error": "insufficient call/put open interest"}
+
+        call_iv = call_iv_oi / call_oi
+        put_iv = put_iv_oi / put_oi
+        skew = put_iv - call_iv
+        skew_pct = (skew / call_iv) if call_iv > 0 else 0.0
+
+        result = {
+            "ticker": ticker,
+            "call_iv": round(call_iv, 4),
+            "put_iv": round(put_iv, 4),
+            "skew": round(skew, 4),
+            "skew_pct": round(skew_pct, 4),
+            "put_call_oi_ratio": round(put_oi / call_oi, 4),
+            "contracts": contracts,
+            "method": "live_chain",
+        }
+        logger.info(
+            f"IV skew for {ticker}: skew={result['skew']:.4f} "
+            f"(put={put_iv:.4f}, call={call_iv:.4f}, P/C OI={result['put_call_oi_ratio']:.2f})"
+        )
+        return result
+    except Exception as e:
+        logger.error(f"fetch_iv_skew failed for {ticker}: {e}")
+        return {"ticker": ticker, "method": "error", "error": str(e)}
+
+
 def store_iv_snapshot(ticker: str, iv: float, date_str: str) -> bool:
     """
     Writes an IV snapshot to the historical_volatility table.
@@ -2186,13 +2291,71 @@ def cmd_monthly_report(message):
         bot.reply_to(message, f"⚠️ Failed: {str(e)}")
 
 
+# --- 5.5 INTERNAL IV ENDPOINT (WS1 Contradiction Vector data source) ---
+# The heartbeat already holds the Alpaca options-chain plumbing, so it is the
+# natural place to expose live IV skew. A tiny stdlib HTTP server (no Flask/
+# FastAPI dependency added to this image) serves it on nox_net, authenticated
+# with the same X-Nox-Token shared secret used elsewhere (RULE-004).
+#
+#   GET /iv/skew?ticker=NVDA   → fetch_iv_skew() JSON
+#   GET /health                → liveness (no auth)
+#
+# Internal-only: bound on the Docker network; never published to the host.
+IV_ENDPOINT_PORT = int(os.getenv("HEARTBEAT_IV_PORT", "8002"))
+
+
+def _start_iv_http_server():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse, parse_qs
+    import json as _json
+
+    class _IVHandler(BaseHTTPRequestHandler):
+        def _send(self, code: int, payload: dict):
+            body = _json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802 (stdlib naming)
+            parsed = urlparse(self.path)
+            if parsed.path == "/health":
+                self._send(200, {"status": "healthy"})
+                return
+
+            # RULE-004: every data endpoint requires the shared secret.
+            if self.headers.get("X-Nox-Token") != WEBHOOK_SECRET:
+                self._send(401, {"error": "Forbidden: invalid token"})
+                return
+
+            if parsed.path == "/iv/skew":
+                qs = parse_qs(parsed.query)
+                ticker = (qs.get("ticker", [""])[0] or "").upper().strip()
+                if not ticker:
+                    self._send(400, {"error": "missing ?ticker="})
+                    return
+                self._send(200, fetch_iv_skew(ticker))
+                return
+
+            self._send(404, {"error": "not found"})
+
+        def log_message(self, *args):  # silence default stderr access logging
+            return
+
+    server = ThreadingHTTPServer(("0.0.0.0", IV_ENDPOINT_PORT), _IVHandler)
+    print(f"[INFO] [HEARTBEAT] IV skew endpoint listening on :{IV_ENDPOINT_PORT}", flush=True)
+    server.serve_forever()
+
+
 # --- 6. CORE INITIALIZATION ENGINE ---
 if __name__ == "__main__":
     print("Nox SEC Forensic Scout Online...")
     init_db()
-    
+
     # Run backgrounds threads asynchronously above the blocking polling call
     threading.Thread(target=schedule_checker, daemon=True).start()
     threading.Thread(target=poll_sec_edgar, daemon=True).start()
-    
+    threading.Thread(target=_start_iv_http_server, daemon=True).start()
+
     bot.infinity_polling()
