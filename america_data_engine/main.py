@@ -1,4 +1,3 @@
-import asyncio
 import os
 import sys
 from datetime import datetime, timezone
@@ -13,6 +12,9 @@ from scrapers import (
     fetch_alpaca_news,
     fetch_earnings_calendar,
 )
+from contradiction_vector import run_contradiction_check
+from insider_cluster import detect_insider_clusters
+from alt_macro import run_alt_macro_check
 
 # ---------------------------------------------------------------------------
 # RULE-009: Hard-abort on missing credentials — no silent degraded starts.
@@ -53,10 +55,15 @@ def verify_token(api_key: str = Security(_api_key_header)) -> None:
 # In-memory cache — all scrapers write here; all endpoints read from here.
 # ---------------------------------------------------------------------------
 _CACHE: Dict[str, Any] = {
-    "news_us":           [],   # List[Dict] — Alpaca news
+    "news_us":           [],   # List[Dict] — Alpaca news (sentiment-scored)
     "earnings_calendar": {},   # Dict[str, List[Dict]] — ticker -> earnings dates
+    "contradiction":     {},   # WS1 — latest Contradiction Vector evaluation
+    "insider_clusters":  {},   # WS3 — latest insider cluster-buy signals
+    "alt_macro":         {},   # WS2 — latest physical-vs-political macro check
     "last_updated":      None, # ISO-8601 UTC timestamp of last successful news cycle
     "last_earnings_update": None, # ISO-8601 UTC timestamp of last earnings refresh
+    "last_insider_update": None,  # ISO-8601 UTC timestamp of last Form 4 scan
+    "last_alt_macro_update": None, # ISO-8601 UTC timestamp of last alt-macro scan
 }
 
 
@@ -67,19 +74,20 @@ def _refresh_cache() -> None:
     """
     print("[INFO] [AMERICA-DATA-ENGINE] Starting scheduled news scrape...", flush=True)
 
-    # Guard the whole cycle: a failing cycle must log and return, never raise,
-    # so the recurring APScheduler job is not killed by a single bad run.
-    try:
-        news_us = fetch_alpaca_news()
-        if news_us:
-            _CACHE["news_us"] = news_us
+    news_us = fetch_alpaca_news()
+    if news_us:
+        _CACHE["news_us"] = news_us
 
-        _CACHE["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
-        print(f"[INFO] [AMERICA-DATA-ENGINE] News refresh complete at {_CACHE['last_updated']}.",
-              flush=True)
-    except Exception as e:
-        print(f"[ERROR] [AMERICA-DATA-ENGINE] News refresh failed: {e}", flush=True)
-        return
+        # WS1 — cross-check headline sentiment against live IV skew. Wrapped so a
+        # heartbeat outage never blocks the (more critical) news cache refresh.
+        try:
+            _CACHE["contradiction"] = run_contradiction_check(news_us)
+        except Exception as e:
+            print(f"[WARN] [AMERICA-DATA-ENGINE] Contradiction check failed: {e}", flush=True)
+
+    _CACHE["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
+    print(f"[INFO] [AMERICA-DATA-ENGINE] News refresh complete at {_CACHE['last_updated']}.",
+          flush=True)
 
 
 def _refresh_earnings_cache() -> None:
@@ -90,20 +98,51 @@ def _refresh_earnings_cache() -> None:
     """
     print("[INFO] [AMERICA-DATA-ENGINE] Starting 24-hour earnings calendar refresh...", flush=True)
 
-    try:
-        earnings = fetch_earnings_calendar(WATCHLIST)
-        if earnings:
-            _CACHE["earnings_calendar"] = earnings
-            total_events = sum(len(events) for events in earnings.values())
-            print(f"[INFO] [AMERICA-DATA-ENGINE] Earnings calendar updated: {total_events} event(s) found.",
-                  flush=True)
-
-        _CACHE["last_earnings_update"] = datetime.now(tz=timezone.utc).isoformat()
-        print(f"[INFO] [AMERICA-DATA-ENGINE] Earnings refresh complete at {_CACHE['last_earnings_update']}.",
+    earnings = fetch_earnings_calendar(WATCHLIST)
+    if earnings:
+        _CACHE["earnings_calendar"] = earnings
+        total_events = sum(len(events) for events in earnings.values())
+        print(f"[INFO] [AMERICA-DATA-ENGINE] Earnings calendar updated: {total_events} event(s) found.",
               flush=True)
+
+    _CACHE["last_earnings_update"] = datetime.now(tz=timezone.utc).isoformat()
+    print(f"[INFO] [AMERICA-DATA-ENGINE] Earnings refresh complete at {_CACHE['last_earnings_update']}.",
+          flush=True)
+
+
+def _refresh_insider_cache() -> None:
+    """
+    Background worker — runs on startup and then every 6 hours via APScheduler.
+    Scans the watchlist's SEC Form 4 filings for insider buy clusters (WS3).
+    Form 4 scanning is SEC-rate-limited and filings are sporadic, so a 6-hour
+    cadence is ample — far less frequent than the 15-minute news cycle.
+    """
+    print("[INFO] [AMERICA-DATA-ENGINE] Starting insider Form 4 cluster scan...", flush=True)
+    try:
+        _CACHE["insider_clusters"] = detect_insider_clusters(WATCHLIST)
     except Exception as e:
-        print(f"[ERROR] [AMERICA-DATA-ENGINE] Earnings refresh failed: {e}", flush=True)
-        return
+        print(f"[WARN] [AMERICA-DATA-ENGINE] Insider cluster scan failed: {e}", flush=True)
+
+    _CACHE["last_insider_update"] = datetime.now(tz=timezone.utc).isoformat()
+    print(f"[INFO] [AMERICA-DATA-ENGINE] Insider scan complete at {_CACHE['last_insider_update']}.",
+          flush=True)
+
+
+def _refresh_alt_macro_cache() -> None:
+    """
+    Background worker — runs on startup and then every 2 hours via APScheduler.
+    Fuses marine insurance + AIS tanker traffic against OFAC actions (WS2) to
+    detect text-vs-physical-reality contradictions at maritime chokepoints.
+    """
+    print("[INFO] [AMERICA-DATA-ENGINE] Starting alternative-macro check...", flush=True)
+    try:
+        _CACHE["alt_macro"] = run_alt_macro_check()
+    except Exception as e:
+        print(f"[WARN] [AMERICA-DATA-ENGINE] Alt-macro check failed: {e}", flush=True)
+
+    _CACHE["last_alt_macro_update"] = datetime.now(tz=timezone.utc).isoformat()
+    print(f"[INFO] [AMERICA-DATA-ENGINE] Alt-macro check complete at {_CACHE['last_alt_macro_update']}.",
+          flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -111,21 +150,27 @@ def _refresh_earnings_cache() -> None:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    # Startup: refresh both news and earnings immediately. Run the (slow,
-    # blocking) scrapes in a worker thread so we don't block the event loop
-    # while the very first request waits on startup.
-    await asyncio.to_thread(_refresh_cache)
-    await asyncio.to_thread(_refresh_earnings_cache)
+    # Startup: refresh news, earnings, and insider clusters immediately
+    _refresh_cache()
+    _refresh_earnings_cache()
+    _refresh_insider_cache()
+    _refresh_alt_macro_cache()
 
     scheduler = BackgroundScheduler(timezone="UTC")
     # News: refresh every 15 minutes
     scheduler.add_job(_refresh_cache, "interval", minutes=15, id="cache_refresh_news")
     # Earnings: refresh once every 24 hours
     scheduler.add_job(_refresh_earnings_cache, "interval", hours=24, id="cache_refresh_earnings")
+    # Insider Form 4 clusters: refresh every 6 hours
+    scheduler.add_job(_refresh_insider_cache, "interval", hours=6, id="cache_refresh_insider")
+    # Alternative macro (physical vs political): refresh every 2 hours
+    scheduler.add_job(_refresh_alt_macro_cache, "interval", hours=2, id="cache_refresh_alt_macro")
     scheduler.start()
     print("[INFO] [AMERICA-DATA-ENGINE] APScheduler started.", flush=True)
     print("  • News cache refresh: every 15 minutes", flush=True)
     print("  • Earnings calendar refresh: every 24 hours", flush=True)
+    print("  • Insider Form 4 cluster scan: every 6 hours", flush=True)
+    print("  • Alt-macro physical/political check: every 2 hours", flush=True)
 
     yield  # Application runs here
 
@@ -176,6 +221,65 @@ def get_us_headlines() -> Dict[str, Any]:
         "last_updated": _CACHE["last_updated"],
         "count":        len(_CACHE["news_us"]),
         "news":         _CACHE["news_us"],
+    }
+
+
+@app.get(
+    "/contradiction/us",
+    summary="Latest Contradiction Vector evaluation (sentiment vs IV skew)",
+    tags=["signals"],
+    dependencies=[Security(verify_token)],
+)
+def get_contradiction_vector() -> Dict[str, Any]:
+    """
+    Returns the most recent Contradiction Vector result: per-ticker verdicts
+    (CONFIRM / CONTRADICT_* / NEUTRAL / NO_DATA) plus WS4-ready decayed-sentiment
+    records. Refreshed every 15 minutes alongside the news cache.
+    """
+    return _CACHE["contradiction"] or {
+        "generated_at": None,
+        "results": [],
+        "sentiment_scores": [],
+        "note": "Contradiction Vector has not run yet.",
+    }
+
+
+@app.get(
+    "/macro/alt",
+    summary="Alternative macro: physical supply vs political text (WS2)",
+    tags=["signals"],
+    dependencies=[Security(verify_token)],
+)
+def get_alt_macro() -> Dict[str, Any]:
+    """
+    Returns the latest alternative-macro evaluation: per-chokepoint verdicts
+    fusing marine war-risk insurance + AIS tanker traffic against OFAC actions,
+    flagging where political narrative contradicts physical reality. Refreshed
+    every 2 hours.
+    """
+    return _CACHE["alt_macro"] or {
+        "generated_at": None,
+        "regions": [],
+        "note": "Alt-macro check has not run yet.",
+    }
+
+
+@app.get(
+    "/insider/clusters",
+    summary="Latest insider Form 4 buy-cluster signals (WS3)",
+    tags=["signals"],
+    dependencies=[Security(verify_token)],
+)
+def get_insider_clusters() -> Dict[str, Any]:
+    """
+    Returns the most recent insider cluster scan: tickers where ≥2 distinct
+    officers/directors made open-market purchases within a 48-hour window
+    (Rule 10b5-1 pre-planned trades excluded). Refreshed every 6 hours.
+    """
+    return _CACHE["insider_clusters"] or {
+        "generated_at": None,
+        "signals": [],
+        "note": "Insider cluster scan has not run yet.",
     }
 
 

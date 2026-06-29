@@ -70,13 +70,7 @@ public:
             auto res = cli.Get(("/v2/positions/" + underlying).c_str(), authHeaders());
             if (!res || res->status != 200) return false;
             json body  = json::parse(res->body);
-            // Alpaca returns "qty" as a JSON string (e.g. "100"); a plain
-            // value<double> default would silently yield 0.0 and wrongly skip
-            // every covered call. Parse defensively and require a long position.
-            if (!body.contains("qty")) return false;
-            const auto& qj = body["qty"];
-            double qty = qj.is_string() ? std::stod(qj.get<std::string>())
-                                        : qj.get<double>();
+            double qty = body.value("qty", 0.0);
             return qty >= static_cast<double>(qty_contracts) * 100.0;
         } catch (...) {
             return false;
@@ -305,14 +299,6 @@ private:
             return {false, "", std::string("Spread contract lookup failed: ") + e.what()};
         }
 
-        // Both spread legs share type + expiry; if the strike-snapping resolved
-        // them to the same contract the order is a degenerate net-zero wash that
-        // Alpaca rejects. Abort rather than submit it.
-        if (!buy_leg.valid || !sell_leg.valid || buy_leg.occ_symbol == sell_leg.occ_symbol) {
-            return {false, "", "Spread legs resolved to the same/invalid contract: " +
-                               buy_leg.occ_symbol + " / " + sell_leg.occ_symbol};
-        }
-
         json order = {
             {"type",          "market"},
             {"order_class",   "mleg"},
@@ -348,11 +334,6 @@ private:
             put_leg  = lookupContract(sig.underlying, sig.strike, sig.expiry_date, "put");
         } catch (const std::exception& e) {
             return {false, "", std::string("Straddle contract lookup failed: ") + e.what()};
-        }
-
-        if (!call_leg.valid || !put_leg.valid || call_leg.occ_symbol == put_leg.occ_symbol) {
-            return {false, "", "Straddle legs resolved to the same/invalid contract: " +
-                               call_leg.occ_symbol + " / " + put_leg.occ_symbol};
         }
 
         json order = {
@@ -391,11 +372,6 @@ private:
             put_leg  = lookupContract(sig.underlying, sig.strike2, sig.expiry_date, "put");
         } catch (const std::exception& e) {
             return {false, "", std::string("Strangle contract lookup failed: ") + e.what()};
-        }
-
-        if (!call_leg.valid || !put_leg.valid || call_leg.occ_symbol == put_leg.occ_symbol) {
-            return {false, "", "Strangle legs resolved to the same/invalid contract: " +
-                               call_leg.occ_symbol + " / " + put_leg.occ_symbol};
         }
 
         json order = {

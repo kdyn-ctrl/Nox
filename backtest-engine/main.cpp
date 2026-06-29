@@ -33,7 +33,6 @@
 #include <fstream>
 #include <algorithm>
 #include <numeric>
-#include <memory>
 
 // Project-specific headers
 #include "csv_parser.hpp"
@@ -141,7 +140,7 @@ int main(int argc, char* argv[]) {
     double portfolio_balance    = params.initial_balance;
     double peak_balance         = params.initial_balance;
     double max_drawdown         = 0.0;
-    std::unique_ptr<Position> current_position;
+    Position* current_position  = nullptr;
     std::vector<Trade> trade_log;
     RegimeStateMachine state_machine;
     int cooldown_remaining = 0; // Trading days remaining before next entry is allowed
@@ -224,7 +223,8 @@ int main(int argc, char* argv[]) {
                 }
                 total_holding_days += static_cast<int>(day_index - current_position->entry_day_index);
 
-                current_position.reset();
+                delete current_position;
+                current_position = nullptr;
             }
         }
 
@@ -266,7 +266,7 @@ int main(int argc, char* argv[]) {
                 if (shares_to_buy > 0) {
                     portfolio_balance -= (shares_to_buy * entry_price); // Deduct cost
 
-                    current_position = std::make_unique<Position>();
+                    current_position = new Position();
                     current_position->entry_date       = day.date;
                     current_position->entry_price      = entry_price;
                     current_position->shares           = shares_to_buy;
@@ -353,7 +353,8 @@ int main(int argc, char* argv[]) {
             portfolio_balance = balance_at_close;
         }
 
-        current_position.reset();
+        delete current_position;
+        current_position = nullptr;
     }
 
     double final_balance = !trade_log.empty()

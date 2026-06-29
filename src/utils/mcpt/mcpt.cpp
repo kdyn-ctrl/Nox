@@ -50,18 +50,20 @@ void permute_returns_parallel(
 
     std::mutex callback_mutex;
     std::vector<std::thread> threads;
-    constexpr int TOTAL_PERMS = 1000;
-    const int per = (TOTAL_PERMS + num_threads - 1) / num_threads;
+    constexpr int PERMS_PER_THREAD = 10;
 
     for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back([&returns, &callback, &callback_mutex, seed, t, per, TOTAL_PERMS]() {
+        threads.emplace_back([&returns, &callback, &callback_mutex, seed, t]() {
             std::vector<double> permuted = returns;
             std::mt19937 rng(seed != 0 ? seed ^ (t << 16) : std::mt19937::default_seed ^ (t << 16));
 
-            int start = t * per;
-            int end = std::min(TOTAL_PERMS, start + per);
+            int start = t * PERMS_PER_THREAD;
+            int end = (t + 1) * PERMS_PER_THREAD;
+            if (t == std::thread::hardware_concurrency() - 1) {
+                end = 1000;
+            }
 
-            for (int i = start; i < end; ++i) {
+            for (int i = start; i < end && i < 1000; ++i) {
                 std::shuffle(permuted.begin(), permuted.end(), rng);
                 {
                     std::lock_guard<std::mutex> lock(callback_mutex);

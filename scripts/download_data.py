@@ -22,13 +22,8 @@ import argparse
 import os
 import shutil
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
-
-# US market timezone — handles EST/EDT (DST) transitions correctly, unlike a
-# fixed UTC offset.
-_ET = ZoneInfo("America/New_York")
 
 import pandas as pd
 import yfinance as yf
@@ -62,7 +57,7 @@ def _last_trading_day() -> date:
     so on holidays the script will attempt a pull and get the prior close, which
     is still the correct most-recent data.
     """
-    now_et = datetime.now(_ET)  # timezone-aware ET; correct across DST transitions
+    now_et = datetime.utcnow() - timedelta(hours=4)  # rough ET (ignores DST edge)
     today  = now_et.date()
 
     # Roll back from Saturday(5) and Sunday(6) to Friday
@@ -100,7 +95,7 @@ def _backup(path: Path) -> Path | None:
     """Copy path → path.YYYYMMDD_HHMMSS.bak and return the backup path."""
     if not path.exists():
         return None
-    ts     = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    ts     = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     backup = path.with_suffix(f".{ts}.bak")
     shutil.copy2(path, backup)
     return backup

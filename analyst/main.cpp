@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <sstream>
 #include <cctype>
+#include <ctime>
 #include "../shared/RegimeStateMachine.hpp"
 #include "httplib.h"               // Add this for HTTP Client capabilities
 #include "nlohmann/json.hpp"       // Add this for JSON creation
@@ -30,21 +31,14 @@ public:
     void send(const std::string& message) {
         if (!is_enabled_) return;
 
+        std::string encoded_message = url_encode(message);
+
         httplib::Client cli("https://api.telegram.org");
         cli.set_connection_timeout(std::chrono::seconds(10));
-        cli.set_read_timeout(std::chrono::seconds(10));
+        
+        std::string path = "/bot" + bot_token_ + "/sendMessage?chat_id=" + chat_id_ + "&text=" + encoded_message;
 
-        // POST with a JSON body instead of GET-with-query: avoids Telegram's URL
-        // length limit on long audit reports and keeps the message text out of
-        // any URL-style logging. (The bot token is in the path regardless — that
-        // is unavoidable with Telegram's API.)
-        nlohmann::json body = {
-            {"chat_id", chat_id_},
-            {"text",    message}
-        };
-        std::string path = "/bot" + bot_token_ + "/sendMessage";
-
-        auto res = cli.Post(path.c_str(), body.dump(), "application/json");
+        auto res = cli.Get(path.c_str());
 
         if (!res || res->status != 200) {
             std::cerr << "❌ [TELEGRAM] Failed to send message. Status: "
@@ -54,6 +48,21 @@ public:
     }
 
 private:
+    std::string url_encode(const std::string& value) {
+        std::ostringstream escaped;
+        escaped.fill('0');
+        escaped << std::hex;
+
+        for (char c : value) {
+            if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                escaped << c;
+            } else {
+                escaped << '%' << std::setw(2) << std::uppercase << (int)(unsigned char)c;
+            }
+        }
+        return escaped.str();
+    }
+
     std::string bot_token_;
     std::string chat_id_;
     bool is_enabled_ = false;
@@ -217,9 +226,129 @@ static std::string regime_to_string(Regime r) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WS4 — sentiment scaffolding.
+// A scored headline as it will arrive from the NLP layer (WS1 Contradiction
+// Vector). Stored with its emission time so its weight can be decayed on read.
+// dt_hours is computed by the caller against "now" each cycle.
+struct SentimentScore {
+    SignalCategory category = SignalCategory::GENERIC;
+    double         score_0  = 0.0;   // magnitude at emission, signed [-1, 1]
+    double         age_hours = 0.0;  // hours since emission
+};
+
+// Applies exponential half-life decay to a batch of sentiment scores and
+// returns the net (summed) decayed weight. WS1 will populate `scores`; until
+// then this runs over an empty batch and yields 0.0, a harmless no-op.
+static double apply_decay_to_sentiment(const HalfLifeDecay& decay,
+                                       const std::vector<SentimentScore>& scores) {
+    double net = 0.0;
+    for (const auto& s : scores) {
+        net += decay.decayed_score(s.category, s.score_0, s.age_hours);
+    }
+    return net;
+}
+
+// Maps a Contradiction Vector category string to the WS4 SignalCategory enum.
+static SignalCategory category_from_string(const std::string& c) {
+    if (c == "GEOPOLITICAL")   return SignalCategory::GEOPOLITICAL;
+    if (c == "MACRO_ECONOMIC") return SignalCategory::MACRO_ECONOMIC;
+    if (c == "EARNINGS")       return SignalCategory::EARNINGS;
+    if (c == "TECHNICAL")      return SignalCategory::TECHNICAL;
+    return SignalCategory::GENERIC;
+}
+
+// Hours elapsed since an ISO-8601 UTC timestamp ("2026-06-28T12:00:00Z").
+// Returns 0.0 on parse failure or future timestamps (→ no decay applied).
+static double hours_since_iso(const std::string& iso) {
+    std::tm tm{};
+    std::istringstream ss(iso);
+    ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
+    if (ss.fail()) return 0.0;
+    std::time_t emitted = timegm(&tm);   // interpret parsed fields as UTC
+    double dt = std::difftime(std::time(nullptr), emitted) / 3600.0;
+    return dt > 0.0 ? dt : 0.0;
+}
+
+// WS1→WS4 connector: pull the latest decayed-sentiment feed from the
+// america-data-engine Contradiction Vector over the shared Docker network.
+// Returns an empty batch on any failure — the analyst degrades to VIX/SPY only.
+static std::vector<SentimentScore> fetch_sentiment_scores(const std::string& secret) {
+    std::vector<SentimentScore> out;
+    try {
+        httplib::Client cli("america-data-engine", 8001);
+        cli.set_connection_timeout(std::chrono::seconds(5));
+        cli.set_read_timeout(std::chrono::seconds(10));
+        httplib::Headers headers = {{"X-Nox-Token", secret}};
+
+        auto res = cli.Get("/contradiction/us", headers);
+        if (!res || res->status != 200) {
+            std::cerr << "[WARN] [ANALYST] Contradiction feed fetch failed. Status: "
+                      << (res ? std::to_string(res->status) : "No Response") << std::endl;
+            return out;
+        }
+
+        auto body = json::parse(res->body);
+        if (!body.contains("sentiment_scores") || !body.at("sentiment_scores").is_array()) {
+            return out;
+        }
+        for (const auto& s : body.at("sentiment_scores")) {
+            SentimentScore ss;
+            if (s.contains("category") && s.at("category").is_string())
+                ss.category = category_from_string(s.at("category").get<std::string>());
+            if (s.contains("score_0") && s.at("score_0").is_number())
+                ss.score_0 = s.at("score_0").get<double>();
+            if (s.contains("emitted_at") && s.at("emitted_at").is_string())
+                ss.age_hours = hours_since_iso(s.at("emitted_at").get<std::string>());
+            out.push_back(ss);
+        }
+        std::cout << "[INFO] [ANALYST] Pulled " << out.size()
+                  << " sentiment score(s) from Contradiction Vector." << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "[WARN] [ANALYST] Contradiction feed parse error: " << e.what() << std::endl;
+    }
+    return out;
+}
+
+// Reads a boolean .env flag. Treats "true"/"1"/"yes" (any case) as true.
+static bool env_flag(const char* name, bool fallback) {
+    const char* v = std::getenv(name);
+    if (!v) return fallback;
+    std::string s(v);
+    for (char& c : s) c = static_cast<char>(std::tolower(c));
+    return s == "true" || s == "1" || s == "yes";
+}
+
+// Reads a positive double .env flag, falling back on absence or parse failure.
+static double env_double(const char* name, double fallback) {
+    const char* v = std::getenv(name);
+    if (!v) return fallback;
+    try { return std::stod(v); } catch (...) { return fallback; }
+}
+
 int main() {
     RegimeStateMachine regime_monitor;
     std::cout << "Nox Analyst Agent: ONLINE." << std::endl;
+
+    // WS4 — Information Half-Life / Regime Decay configuration.
+    // All decay/reset behaviour is bypassable ONLY via explicit .env flags so
+    // backtests can replay raw, undecayed sentiment deterministically.
+    HalfLifeDecay sentiment_decay;
+    sentiment_decay.set_half_life_hours(SignalCategory::GEOPOLITICAL,
+                                        env_double("HALFLIFE_GEOPOLITICAL_HOURS", 6.0));
+    sentiment_decay.set_half_life_hours(SignalCategory::MACRO_ECONOMIC,
+                                        env_double("HALFLIFE_MACRO_HOURS", 48.0));
+    sentiment_decay.set_half_life_hours(SignalCategory::EARNINGS,
+                                        env_double("HALFLIFE_EARNINGS_HOURS", 72.0));
+    sentiment_decay.set_half_life_hours(SignalCategory::TECHNICAL,
+                                        env_double("HALFLIFE_TECHNICAL_HOURS", 12.0));
+    sentiment_decay.set_bypass(env_flag("HALFLIFE_DECAY_BYPASS", false));
+    regime_monitor.set_reset_bypass(env_flag("REGIME_RESET_BYPASS", false));
+    const double catalyst_vix_jump = env_double("CATALYST_VIX_JUMP", 8.0);
+
+    std::cout << "[INFO] [ANALYST] WS4 decay "
+              << (sentiment_decay.is_bypassed() ? "BYPASSED" : "active")
+              << "; catalyst VIX jump threshold = " << catalyst_vix_jump << std::endl;
 
     // RULE-009 — Hard-abort on any missing credential or config variable.
     const char* env_token = std::getenv("WEBHOOK_SECRET_TOKEN");
@@ -229,10 +358,19 @@ int main() {
     }
     std::string secret_token = env_token;
 
-    // NOTE: The analyst sources all market data from Yahoo Finance and never
-    // authenticates to Alpaca, so ALPACA_API_KEY/ALPACA_SECRET_KEY are deliberately
-    // NOT required here. Demanding them would block startup over credentials this
-    // process never uses. (They remain required by the execution engine, which does.)
+    const char* env_api_key = std::getenv("ALPACA_API_KEY");
+    if (!env_api_key) {
+        std::cerr << "[FATAL] [ANALYST] ALPACA_API_KEY not set. Refusing to start." << std::endl;
+        return 1;
+    }
+    std::string alpaca_api_key = env_api_key;
+
+    const char* env_api_secret = std::getenv("ALPACA_SECRET_KEY");
+    if (!env_api_secret) {
+        std::cerr << "[FATAL] [ANALYST] ALPACA_SECRET_KEY not set. Refusing to start." << std::endl;
+        return 1;
+    }
+    std::string alpaca_api_secret = env_api_secret;
 
     const char* env_tg_token = std::getenv("TELEGRAM_BOT_TOKEN");
     const char* env_tg_chat_id = std::getenv("TELEGRAM_CHAT_ID");
@@ -271,6 +409,22 @@ int main() {
 
         double spy_price = snapshot.spy_price;
 
+        // 1b. WS4 — detect macro catalysts (VIX shock) BEFORE evaluating the
+        // regime, so a reset can force a cautious TRANSITION for this cycle.
+        bool catalyst_fired = regime_monitor.detect_volatility_catalyst(
+            snapshot.vix, catalyst_vix_jump);
+
+        // 1c. WS4 — apply half-life decay to NLP sentiment. The batch is pulled
+        // live from the WS1 Contradiction Vector (already cross-checked against
+        // IV skew); on a regime_reset the prior macro NLP weights are zeroed.
+        std::vector<SentimentScore> sentiment_scores = fetch_sentiment_scores(secret_token);
+        bool macro_reset = regime_monitor.consume_regime_reset();
+        if (macro_reset) {
+            sentiment_scores.clear(); // zero prior macro NLP weights
+            std::cout << "[ANALYST] regime_reset consumed — sentiment weights zeroed." << std::endl;
+        }
+        double net_sentiment = apply_decay_to_sentiment(sentiment_decay, sentiment_scores);
+
         // 2. Feed it to the State Machine
         AllocationStrategy current_strategy = regime_monitor.evaluate(
             snapshot.vix, snapshot.spy_price, snapshot.spy_200_sma
@@ -301,7 +455,12 @@ int main() {
                     {"report_body", current_strategy.log_message},
                     {"vix", snapshot.vix},
                     {"spy_price", snapshot.spy_price},
-                    {"spy_200_sma", snapshot.spy_200_sma}
+                    {"spy_200_sma", snapshot.spy_200_sma},
+                    // WS4 — decay/reset telemetry for downstream consumers.
+                    {"macro_reset", macro_reset},
+                    {"catalyst_fired", catalyst_fired},
+                    {"net_sentiment", net_sentiment},
+                    {"halflife_bypassed", sentiment_decay.is_bypassed()}
                 };
 
                 // Hit the execution container directly over the shared Docker bridge network

@@ -76,6 +76,9 @@ struct RiskProfile {
     double free_capital_amount   = 0.0;
     std::vector<std::string> watchlist;
     int    scan_interval_minutes = 30;
+    // Max signals dispatched per scan cycle. Scanner scores all qualifying
+    // setups and sends only the top N. Prevents signal floods.
+    int    max_signals_per_scan  = 3;
 
     // ── Factory: conservative defaults for the automated bot ────────────────
     static RiskProfile bot() {
