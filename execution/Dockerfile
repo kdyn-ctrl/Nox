@@ -4,6 +4,7 @@ FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
+    libsqlite3-0 \
     ca-certificates \
     procps \
     && rm -rf /var/lib/apt/lists/*
@@ -16,7 +17,7 @@ WORKDIR /app
 # Copy pre-built binary from execution directory
 COPY execution/nox_engine .
 
-RUN chown appuser:appuser nox_engine && chmod +x nox_engine
+RUN chown -R appuser:appuser /app && chmod +x nox_engine
 
 USER appuser
 

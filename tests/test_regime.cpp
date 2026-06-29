@@ -45,6 +45,62 @@ int main() {
     assert_regime(rsm.evaluate(999.0, 500.0, 510.0).current_regime, Regime::RISK_OFF, "EXTREME: Very High VIX triggers RISK_OFF");
     assert_regime(rsm.evaluate(1.0, 500.0, 490.0).current_regime, Regime::RISK_ON, "EXTREME: Very Low VIX, price above SMA");
 
+    // Group 5: WS4 — Half-Life Decay
+    {
+        std::cout << "Running WS4 HalfLifeDecay tests..." << std::endl;
+        HalfLifeDecay decay; // GEOPOLITICAL default half-life = 6h
+
+        // At t=0 the score is undecayed.
+        assert(std::abs(decay.decayed_score(SignalCategory::GEOPOLITICAL, 1.0, 0.0) - 1.0) < 1e-9);
+
+        // At one half-life the score should be ~half.
+        double half = decay.decayed_score(SignalCategory::GEOPOLITICAL, 1.0, 6.0);
+        assert(std::abs(half - 0.5) < 1e-6);
+
+        // Decay is monotonic: longer elapsed → smaller weight.
+        double t12 = decay.decayed_score(SignalCategory::GEOPOLITICAL, 1.0, 12.0);
+        assert(t12 < half && t12 > 0.0);
+
+        // Different categories decay at different rates (macro slower than geo).
+        double geo = decay.decayed_score(SignalCategory::GEOPOLITICAL, 1.0, 24.0);
+        double macro = decay.decayed_score(SignalCategory::MACRO_ECONOMIC, 1.0, 24.0);
+        assert(macro > geo);
+
+        // Bypass returns the raw score regardless of elapsed time.
+        decay.set_bypass(true);
+        assert(std::abs(decay.decayed_score(SignalCategory::GEOPOLITICAL, 0.8, 100.0) - 0.8) < 1e-9);
+        std::cout << "WS4 HalfLifeDecay tests passed." << std::endl;
+    }
+
+    // Group 6: WS4 — Regime Reset / Catalyst Detection
+    {
+        std::cout << "Running WS4 regime_reset tests..." << std::endl;
+        RegimeStateMachine r;
+
+        // Explicit reset forces TRANSITION and latches once.
+        r.trigger_regime_reset("unit test");
+        assert(r.regime_reset_pending());
+        assert(r.consume_regime_reset() == true);
+        assert(r.consume_regime_reset() == false); // latch cleared
+
+        // Catalyst detection: first call only seeds prev_vix (no fire).
+        RegimeStateMachine r2;
+        assert(r2.detect_volatility_catalyst(15.0, 8.0) == false);
+        // A jump >= threshold fires a reset.
+        assert(r2.detect_volatility_catalyst(25.0, 8.0) == true);
+        assert(r2.consume_regime_reset() == true);
+        // A sub-threshold move does not.
+        assert(r2.detect_volatility_catalyst(27.0, 8.0) == false);
+
+        // Bypass disables automatic resets.
+        RegimeStateMachine r3;
+        r3.set_reset_bypass(true);
+        r3.detect_volatility_catalyst(15.0, 8.0);
+        assert(r3.detect_volatility_catalyst(40.0, 8.0) == false);
+        assert(r3.consume_regime_reset() == false);
+        std::cout << "WS4 regime_reset tests passed." << std::endl;
+    }
+
     std::cout << "All tests passed!" << std::endl;
 
     return 0;

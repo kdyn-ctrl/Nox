@@ -25,6 +25,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using json = nlohmann::json;
@@ -107,6 +108,20 @@ public:
         return {false, "", "Unknown strategy: " + strategy};
     }
 
+    // PositionManager: public contract lookup and position close methods
+    AlpacaContract lookupContract(const std::string& underlying,
+                                  double             target_strike,
+                                  const std::string& expiry_yyyy_mm_dd,
+                                  const std::string& opt_type) const
+    {
+        return lookupContractImpl(underlying, target_strike, expiry_yyyy_mm_dd, opt_type);
+    }
+
+    OrderResult closePosition(const std::string& occ_symbol, int quantity, bool is_short_premium) const
+    {
+        return closePositionImpl(occ_symbol, quantity, is_short_premium);
+    }
+
 private:
     std::string alpacaUrl_;
     std::string apiKey_;
@@ -158,15 +173,13 @@ private:
         return padded_root + yy + mm + dd + type_char + strike_oss.str();
     }
 
-    // ── Contract lookup — finds the closest real Alpaca contract ─────────────
-    //
-    // Searches Alpaca's /v2/options/contracts for the closest match to the
-    // requested strike and expiry. Returns the best match or invalid if none found.
-
-    AlpacaContract lookupContract(const std::string& underlying,
-                                  double             target_strike,
-                                  const std::string& expiry_yyyy_mm_dd,
-                                  const std::string& opt_type) const
+    // Alpaca contract lookup (for PositionManager and internal routing).
+    // Searches for options contracts matching the given underlying, strike, expiry, and type.
+    // Returns the best match (closest strike, then nearest expiry).
+    AlpacaContract lookupContractImpl(const std::string& underlying,
+                                     double             target_strike,
+                                     const std::string& expiry_yyyy_mm_dd,
+                                     const std::string& opt_type) const
     {
         auto cli = makeClient();
 
@@ -222,6 +235,132 @@ private:
         return best;
     }
 
+    // ── Live options quote (bid/ask/mid) ─────────────────────────────────────
+    struct OptionsQuote {
+        double bid = 0.0;
+        double ask = 0.0;
+        double mid = 0.0;
+        bool   valid = false;
+    };
+
+    OptionsQuote fetchOptionsQuote(const std::string& occ_symbol) const {
+        try {
+            auto cli = makeClient();
+            std::string path = "/v1beta1/options/quotes/latest?symbols=" + occ_symbol;
+            auto res = cli.Get(path.c_str(), authHeaders());
+            if (!res || res->status != 200) return {};
+            json body = json::parse(res->body);
+            const auto& quotes = body.value("quotes", json::object());
+            if (!quotes.contains(occ_symbol)) return {};
+            const auto& q = quotes.at(occ_symbol);
+            double bid = q.value("bp", 0.0);
+            double ask = q.value("ap", 0.0);
+            if (bid > 0.0 && ask > 0.0 && ask >= bid)
+                return {bid, ask, (bid + ask) / 2.0, true};
+        } catch (...) {}
+        return {};
+    }
+
+    // Poll Alpaca order status. Returns "filled", "partially_filled", "cancelled", etc.
+    std::string checkOrderFill(const std::string& order_id) const {
+        try {
+            auto cli = makeClient();
+            auto res = cli.Get(("/v2/orders/" + order_id).c_str(), authHeaders());
+            if (!res || res->status != 200) return "unknown";
+            return json::parse(res->body).value("status", "unknown");
+        } catch (...) {
+            return "unknown";
+        }
+    }
+
+    void cancelAlpacaOrder(const std::string& order_id) const {
+        try {
+            auto cli = makeClient();
+            cli.Delete(("/v2/orders/" + order_id).c_str(), authHeaders());
+        } catch (...) {}
+    }
+
+    // Submit a limit order with mid → ask retry: 3 attempts stepping 10% toward ask each time.
+    // side_is_buy=true: BUY order (step price UP toward ask to attract sellers).
+    //               false: SELL order (step price DOWN toward bid to attract buyers).
+    // limit_hint: starting limit price; 0.0 → fetch live quote to determine mid.
+    OrderResult submitLimitWithRetry(json order_base,
+                                     const std::string& occ_symbol,
+                                     const std::string& label,
+                                     double             limit_hint,
+                                     bool               side_is_buy) const {
+        OptionsQuote q = fetchOptionsQuote(occ_symbol);
+
+        double mid = (q.valid) ? q.mid : limit_hint;
+        double far  = q.valid ? (side_is_buy ? q.ask : q.bid) : 0.0;
+
+        if (mid <= 0.0) {
+            // No quote and no hint — fall back to market
+            order_base["type"] = "market";
+            order_base.erase("limit_price");
+            return submitOrder(order_base, label + " [mkt fallback — no quote]");
+        }
+        if (far <= 0.0) far = side_is_buy ? mid * 1.10 : mid * 0.90;
+
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            double step_frac  = attempt * 0.10; // 0%, 10%, 20% of (far - mid)
+            double limit_price = mid + (far - mid) * step_frac;
+            limit_price = std::round(limit_price * 100.0) / 100.0;
+            limit_price = std::max(limit_price, 0.01);
+
+            std::ostringstream lp_str;
+            lp_str << std::fixed << std::setprecision(2) << limit_price;
+
+            json order = order_base;
+            order["type"]        = "limit";
+            order["limit_price"] = lp_str.str();
+
+            auto result = submitOrder(order, label + " lmt@$" + lp_str.str());
+            if (!result.success) {
+                // Alpaca rejected the limit structure (e.g., price out of range). Skip retry.
+                if (attempt == 2) return result;
+                continue;
+            }
+
+            // Poll for fill for up to 30 seconds (1-second ticks)
+            bool filled = false;
+            for (int sec = 0; sec < 30; ++sec) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                std::string status = checkOrderFill(result.order_id);
+                if (status == "filled" || status == "partially_filled") {
+                    filled = true;
+                    break;
+                }
+                if (status == "cancelled" || status == "rejected" || status == "expired") break;
+            }
+            if (filled) return result;
+
+            cancelAlpacaOrder(result.order_id);
+            if (attempt == 2) {
+                return {false, "", "Limit order unfilled after 3 attempts for " + label +
+                        " — signal skipped to avoid chasing spread"};
+            }
+        }
+        return {false, "", "Limit retry exhausted for " + label};
+    }
+
+    // Closes an open option position using a limit order (mid → fill direction retry).
+    // is_short_premium=true → BUY to close (step price toward ask).
+    // is_short_premium=false → SELL to close (step price toward bid).
+    OrderResult closePositionImpl(const std::string& occ_symbol, int quantity, bool is_short_premium) const {
+        std::string side = is_short_premium ? "buy" : "sell";
+        json order = {
+            {"symbol",          occ_symbol},
+            {"qty",             std::to_string(quantity)},
+            {"side",            side},
+            {"time_in_force",   "day"},
+            {"position_effect", "close"}
+        };
+        return submitLimitWithRetry(order, occ_symbol, "CLOSE " + occ_symbol,
+                                    0.0, is_short_premium);
+    }
+
+
     // ── Single-leg order (LONG_CALL, LONG_PUT, CSP, CC) ──────────────────────
 
     OrderResult routeSingleLeg(const nox::options_signal::OptionsSignal& sig,
@@ -232,8 +371,8 @@ private:
 
         AlpacaContract contract;
         try {
-            contract = lookupContract(sig.underlying, sig.strike,
-                                      sig.expiry_date, opt_type);
+            contract = lookupContractImpl(sig.underlying, sig.strike,
+                                         sig.expiry_date, opt_type);
         } catch (const std::exception& e) {
             return {false, "", std::string("Contract lookup failed: ") + e.what()};
         }
@@ -246,12 +385,15 @@ private:
             {"symbol",          contract.occ_symbol},
             {"qty",             std::to_string(qty_contracts)},
             {"side",            side},
-            {"type",            "market"},
             {"time_in_force",   "day"},
             {"position_effect", "open"}
         };
 
-        return submitOrder(order, contract.occ_symbol);
+        // Use limit order with mid→fill retry. entry_price is the BS theoretical mid.
+        // BUY: step toward ask; SELL (short premium): step toward bid.
+        double limit_hint = (sig.entry_price > 0.0) ? sig.entry_price : 0.0;
+        return submitLimitWithRetry(order, contract.occ_symbol, contract.occ_symbol,
+                                    limit_hint, !is_short);
     }
 
     // ── Spread order (BULL_CALL_SPREAD, BEAR_PUT_SPREAD) ─────────────────────

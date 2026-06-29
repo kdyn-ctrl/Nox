@@ -11,21 +11,169 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <deque>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <numeric>
+#include <optional>
 #include <sstream>
+#include <sqlite3.h>
 #include <string>
 #include <thread>
 #include <vector>
 
 using json = nlohmann::json;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// WS5 — Liquidity Vacuum / Microstructure Gate.
+// ─────────────────────────────────────────────────────────────────────────────
+// Before ANY execution we read the live bid-ask spread. We keep a rolling
+// per-symbol baseline of recent (relative) spreads and abort the trade when the
+// current spread sits more than N standard deviations above that baseline —
+// the fingerprint of a liquidity vacuum (flash move, halt, news gap) where a
+// market order would be filled at a punitive price regardless of how strong the
+// alpha signal is. N and the bypass are .env-configurable.
+//
+// Venue-neutral: callers feed it a spread observed from whatever source they
+// have (Alpaca latest quote on the REST path, IBKR L2 via IBKRClient when the
+// gateway is wired in). The gate only does the statistics + the abort decision.
+namespace nox::liquidity {
+
+struct GateResult {
+    bool        allow   = true;   // false → abort the trade
+    double      spread  = 0.0;    // the observed (relative) spread
+    double      mean    = 0.0;    // baseline mean
+    double      stddev  = 0.0;    // baseline sample stddev
+    double      zscore  = 0.0;    // (spread - mean) / stddev
+    bool        warming = false;  // true while baseline is still filling
+    std::string reason;
+};
+
+class LiquidityGate {
+public:
+    LiquidityGate() { loadConfig(); }
+
+    // Evaluate a freshly observed spread for `symbol` against its rolling
+    // baseline, then record it. The observation is scored BEFORE being added so
+    // a single vacuum spike cannot inflate the baseline it is judged against.
+    GateResult evaluate(const std::string& symbol, double spread) {
+        GateResult r;
+        r.spread = spread;
+        auto& hist = history_[symbol];
+
+        if (bypass_) {
+            r.reason = "gate bypassed (.env)";
+            record(hist, spread);
+            return r;
+        }
+        // A non-positive / invalid spread means we have no usable microstructure
+        // read. Fail OPEN (allow) but flag it — blocking on missing data would
+        // halt all trading whenever a quote feed hiccups.
+        if (spread <= 0.0) {
+            r.reason = "no valid spread read — gate skipped (fail-open)";
+            return r;
+        }
+        if (hist.size() < min_samples_) {
+            r.warming = true;
+            r.reason  = "baseline warming up (" + std::to_string(hist.size()) +
+                        "/" + std::to_string(min_samples_) + " samples)";
+            record(hist, spread);
+            return r;
+        }
+
+        auto [mean, sd] = stats(hist);
+        r.mean   = mean;
+        r.stddev = sd;
+        r.zscore = (sd > 1e-12) ? (spread - mean) / sd : 0.0;
+
+        if (r.zscore > n_stddev_) {
+            r.allow  = false;
+            r.reason = "spread " + num(spread) + " is " + num(r.zscore) +
+                       "σ above baseline mean " + num(mean) +
+                       " (threshold " + num(n_stddev_) + "σ) — liquidity vacuum";
+        } else {
+            r.reason = "spread within " + num(n_stddev_) + "σ of baseline";
+        }
+        record(hist, spread);
+        return r;
+    }
+
+    bool   bypassed()  const { return bypass_; }
+    double threshold() const { return n_stddev_; }
+
+private:
+    void loadConfig() {
+        if (const char* v = std::getenv("LIQUIDITY_GATE_STDDEV")) {
+            try { n_stddev_ = std::stod(v); } catch (...) {}
+        }
+        if (const char* v = std::getenv("LIQUIDITY_GATE_WINDOW")) {
+            try { window_ = std::max<std::size_t>(5, std::stoul(v)); } catch (...) {}
+        }
+        if (const char* v = std::getenv("LIQUIDITY_GATE_MIN_SAMPLES")) {
+            try { min_samples_ = std::max<std::size_t>(3, std::stoul(v)); } catch (...) {}
+        }
+        if (const char* v = std::getenv("LIQUIDITY_GATE_BYPASS")) {
+            std::string s(v);
+            std::transform(s.begin(), s.end(), s.begin(),
+                           [](unsigned char c){ return std::tolower(c); });
+            bypass_ = (s == "true" || s == "1" || s == "yes");
+        }
+    }
+
+    void record(std::deque<double>& h, double spread) {
+        h.push_back(spread);
+        if (h.size() > window_) h.pop_front();
+    }
+
+    static std::pair<double, double> stats(const std::deque<double>& h) {
+        double mean = 0.0;
+        for (double x : h) mean += x;
+        mean /= static_cast<double>(h.size());
+        double var = 0.0;
+        for (double x : h) var += (x - mean) * (x - mean);
+        // Sample variance (n-1) — h.size() >= min_samples_ (>=3) here.
+        var /= static_cast<double>(h.size() - 1);
+        return {mean, std::sqrt(var)};
+    }
+
+    static std::string num(double v) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(4) << v;
+        return oss.str();
+    }
+
+    std::map<std::string, std::deque<double>> history_;
+    double      n_stddev_    = 3.0;  // abort beyond N sigma
+    std::size_t window_      = 50;   // rolling baseline length
+    std::size_t min_samples_ = 10;   // warm-up before the gate is active
+    bool        bypass_      = false;
+};
+
+} // namespace nox::liquidity
+
 namespace nox::options_signal {
 
 // ─── Enumerations ─────────────────────────────────────────────────────────────
 
 enum class DirectionalBias { Bullish, Bearish, Neutral };
+
+// ─── ScoredSignal — internal ranking wrapper ──────────────────────────────────
+// run_scan() collects these, sorts by quality_score descending, then dispatches
+// only the top max_signals_per_scan. The score is venue-agnostic: it measures
+// setup conviction regardless of strategy type.
+struct ScoredSignal {
+    OptionsSignal signal;
+    std::string   formatted_alert;
+    double        quality_score = 0.0;
+    // Raw components (logged for transparency)
+    double sma_distance_atrs = 0.0; // how far price is from SMA20 in ATR units
+    double vol_deviation     = 0.0; // abs(IV/HRV - 1.0)
+    double rsi_extremity     = 0.0; // abs(RSI - 50) / 50
+};
 
 // ─── Structures ───────────────────────────────────────────────────────────────
 
@@ -52,22 +200,35 @@ struct IVData {
 class OptionsSignalGenerator {
 public:
     // Profile-driven constructor — all risk parameters come from the RiskProfile.
+    // db_path: optional path to the PositionManager SQLite DB for open-position
+    //          deduplication (leave empty to disable the check).
     OptionsSignalGenerator(const std::string& alpacaUrl,
                            const std::string& apiKey,
                            const std::string& apiSec,
                            const std::string& tgToken,
                            const std::string& tgChatId,
-                           RiskProfile        profile)
+                           RiskProfile        profile,
+                           const std::string& db_path = "")
         : alpacaUrl_(alpacaUrl)
         , apiKey_(apiKey)
         , apiSec_(apiSec)
         , tgToken_(tgToken)
         , tgChatId_(tgChatId)
         , profile_(std::move(profile))
+        , dedup_db_path_(db_path)
     {}
 
     // Entry point — called once per scan cycle from the engine's background thread.
     void run_scan(double live_equity) {
+        // ── Market hours gate ─────────────────────────────────────────────────
+        // Options markets are only open Mon–Fri 9:30–16:00 ET. Scanning on
+        // weekends produces stale signals from Friday's closing data.
+        if (!isMarketHours()) {
+            log("INFO", "[OPTIONS_SCAN][" + profile_.name +
+                "] Outside market hours — scan skipped.");
+            return;
+        }
+
         const auto& watchlist = profile_.watchlist;
         double effective_capital = resolveCapital(live_equity);
         std::string tier         = computeCapitalTier(effective_capital);
@@ -75,10 +236,22 @@ public:
 
         log("INFO", "[OPTIONS_SCAN][" + profile_.name + "] Tier=" + tier +
             " | Capital=$" + fmt(effective_capital, 0) +
-            " | Tickers=" + std::to_string(watchlist.size()));
+            " | Tickers=" + std::to_string(watchlist.size()) +
+            " | MaxSignals=" + std::to_string(profile_.max_signals_per_scan));
 
-        // Fetch macro regime once per scan — reuse for all tickers
-        double vix      = fetchVix();
+        // Fetch VIX term structure first — it includes spot VIX so we can reuse it.
+        VixTermStructure vts = fetchVixTermStructure();
+        double vix = (vts.valid && vts.spot > 0.0) ? vts.spot : fetchVix();
+
+        if (vts.valid) {
+            log("INFO", "[OPTIONS_SCAN] VIX term structure: " + vts.label +
+                " (VIX=" + fmt(vts.spot, 1) +
+                " VIX3M=" + fmt(vts.vix3m, 1) +
+                " ratio=" + fmt(vts.ratio, 3) + ")");
+        } else {
+            log("WARN", "[OPTIONS_SCAN] Could not fetch VIX term structure — spot VIX only.");
+        }
+
         SpySnapshot spy = fetchSpy();
 
         AllocationStrategy regime{};
@@ -93,14 +266,104 @@ public:
             vix = 20.0;
         }
 
+        auto earnings_calendar = fetchEarningsCalendar();
+
+        // ── Stage 1: evaluate all tickers, collect scored candidates ──────────
+        std::vector<ScoredSignal> candidates;
         for (const auto& ticker : watchlist) {
             try {
-                scanTicker(ticker, effective_capital, tier, fc_mode, vix, spy, regime);
+                if (hasEarningsWithin5Days(ticker, earnings_calendar)) {
+                    log("INFO", "[OPTIONS_SCAN][EARNINGS_GATE] " + ticker +
+                        " has earnings within 5 days — skipped.");
+                    continue;
+                }
+                if (hasOpenPosition(ticker)) {
+                    log("INFO", "[OPTIONS_SCAN][DEDUP] " + ticker +
+                        " already has an open position — skipped to prevent doubling in.");
+                    continue;
+                }
+                auto result = evaluateTicker(ticker, effective_capital, tier,
+                                             fc_mode, vix, spy, regime, vts);
+                if (result) candidates.push_back(std::move(*result));
             } catch (const std::exception& e) {
                 log("WARN", "[OPTIONS_SCAN] Exception on " + ticker + ": " + e.what());
             }
-            // Brief pause between tickers to avoid rate limits
             std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        }
+
+        if (candidates.empty()) {
+            log("INFO", "[OPTIONS_SCAN][" + profile_.name +
+                "] No qualifying setups this cycle.");
+            return;
+        }
+
+        // ── Stage 2: rank by quality, dispatch top max_signals_per_scan ───────
+        std::sort(candidates.begin(), candidates.end(),
+            [](const ScoredSignal& a, const ScoredSignal& b) {
+                return a.quality_score > b.quality_score;
+            });
+
+        int limit      = profile_.max_signals_per_scan;
+        int dispatched = 0;
+
+        for (const auto& sc : candidates) {
+            if (dispatched >= limit) break;
+
+            // VIX term structure gate: suppress SELL-premium auto-execution during
+            // backwardation (front vol > longer-dated vol = tail-risk regime).
+            // Advisory alerts still go out; only live execution is blocked.
+            bool is_sell_premium = (sc.signal.strategy == "CSP" || sc.signal.strategy == "CC" ||
+                                    sc.signal.strategy == "STRANGLE");
+            if (vts.valid && vts.label == "BACKWARDATION" && is_sell_premium) {
+                log("WARN", "[OPTIONS_SCAN][VIX_TERM] " + sc.signal.underlying +
+                    " SELL-premium execution suppressed — VIX backwardation (" +
+                    fmt(vts.ratio, 3) + "). Advisory alert sent.");
+                sendTelegram(
+                    "⚠️ *VIX TERM GATE — " + sc.signal.underlying + "*\n"
+                    "────────────────────────\n"
+                    "Strategy: " + sc.signal.strategy + "\n"
+                    "VIX3M/VIX = " + fmt(vts.ratio, 3) + " → *BACKWARDATION*\n"
+                    "Auto-execution suppressed — front vol > back vol signals tail risk.\n"
+                    "_Advisory signal still valid._"
+                );
+                dispatched++;
+                continue;
+            }
+
+            sendTelegram(sc.formatted_alert);
+            // WS5 — microstructure gate. The advisory alert always goes out, but
+            // AUTO-EXECUTION is aborted when the live spread signals a liquidity
+            // vacuum. A great setup filled into a vacuum is a losing trade.
+            if (profile_.auto_execute) {
+                double rel_spread = fetchUnderlyingSpread(sc.signal.underlying);
+                auto gate = liquidity_gate_.evaluate(sc.signal.underlying, rel_spread);
+                if (!gate.allow) {
+                    log("WARN", "[OPTIONS_EXEC][LIQUIDITY_GATE] " + sc.signal.underlying +
+                        " execution aborted — " + gate.reason);
+                    sendTelegram(
+                        "🛑 *LIQUIDITY GATE — " + sc.signal.underlying + "*\n"
+                        "────────────────────────\n"
+                        "Auto-execution aborted: " + gate.reason + ".\n"
+                        "_Advisory signal still valid — review manually._"
+                    );
+                    dispatched++;  // counts against the cap; alert was dispatched
+                    continue;
+                }
+                executeSignal(sc.signal);
+            }
+            log("INFO", "[OPTIONS_SCAN] Dispatched #" + std::to_string(dispatched + 1) +
+                ": " + sc.signal.underlying + " / " + sc.signal.strategy +
+                " | score=" + fmt(sc.quality_score, 2) +
+                " (SMA=" + fmt(sc.sma_distance_atrs, 1) + "xATR" +
+                " vol=" + fmt(sc.vol_deviation * 100.0, 0) + "%" +
+                " RSI=" + fmt(sc.signal.rsi, 0) + ")");
+            dispatched++;
+        }
+
+        int suppressed = static_cast<int>(candidates.size()) - dispatched;
+        if (suppressed > 0) {
+            log("INFO", "[OPTIONS_SCAN][" + profile_.name + "] " +
+                std::to_string(suppressed) + " lower-quality setup(s) suppressed by cap.");
         }
     }
 
@@ -112,7 +375,9 @@ private:
     std::string tgToken_;
     std::string tgChatId_;
     RiskProfile profile_;
+    std::string dedup_db_path_; // path to PositionManager SQLite DB for dedup
     RegimeStateMachine regimeMachine_;
+    nox::liquidity::LiquidityGate liquidity_gate_; // WS5 microstructure gate
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -124,6 +389,29 @@ private:
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(decimals) << v;
         return oss.str();
+    }
+
+    // Returns true if the PositionManager DB already has an open position for
+    // this underlying ticker. Prevents the scanner from doubling into the same
+    // underlying when a vol condition persists across multiple 30-minute cycles.
+    bool hasOpenPosition(const std::string& ticker) const {
+        if (dedup_db_path_.empty()) return false;
+        sqlite3* db = nullptr;
+        if (sqlite3_open_v2(dedup_db_path_.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+            sqlite3_close(db);
+            return false; // DB not accessible — fail open (don't block the signal)
+        }
+        const char* sql = "SELECT COUNT(*) FROM open_positions WHERE ticker = ?;";
+        sqlite3_stmt* stmt = nullptr;
+        int count = 0;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, ticker.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) == SQLITE_ROW)
+                count = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return count > 0;
     }
 
     // ── Capital / tier logic ──────────────────────────────────────────────────
@@ -177,6 +465,80 @@ private:
         return 1.0; // RISK_ON
     }
 
+    // ── Market hours gate ─────────────────────────────────────────────────────
+    // Returns true Mon–Fri between 09:00 and 16:00 ET (approximate DST handling).
+    // Prevents stale weekend / after-hours signals from firing.
+    static bool isMarketHours() {
+        auto now    = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm utc{};
+        gmtime_r(&time_t, &utc);
+
+        if (utc.tm_wday == 0 || utc.tm_wday == 6) return false; // Sat/Sun
+
+        // Approximate ET offset: Apr(3)–Oct(9) = UTC-4 (EDT), else UTC-5 (EST)
+        int offset_h = (utc.tm_mon >= 3 && utc.tm_mon <= 9) ? 4 : 5;
+        int et_mins  = ((utc.tm_hour - offset_h + 24) % 24) * 60 + utc.tm_min;
+
+        return et_mins >= 9 * 60 && et_mins < 16 * 60;
+    }
+
+    // ── Signal quality score ──────────────────────────────────────────────────
+    // Combines three independent conviction signals into a single rank value.
+    // Higher = stronger setup. Used to pick the best N per scan cycle.
+    static ScoredSignal scoreSignal(const OptionsSignal& sig,
+                                    const std::string& formatted_alert,
+                                    const UnderlyingData& d) {
+        ScoredSignal sc;
+        sc.signal          = sig;
+        sc.formatted_alert = formatted_alert;
+        sc.sma_distance_atrs = (d.atr14 > 0)
+            ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
+        sc.vol_deviation   = (sig.hrv30 > 0.01)
+            ? std::abs(sig.iv_level / sig.hrv30 - 1.0) : 0.0;
+        sc.rsi_extremity   = std::abs(sig.rsi - 50.0) / 50.0;
+        // Weights: trend conviction matters most, vol signal second, RSI third
+        sc.quality_score   = sc.sma_distance_atrs * 0.50
+                           + sc.vol_deviation      * 0.30
+                           + sc.rsi_extremity      * 0.20;
+        return sc;
+    }
+
+    // ── Market data: live bid-ask spread (WS5 liquidity gate input) ────────────
+    //
+    // Returns the underlying's RELATIVE spread (ask-bid)/mid from Alpaca's latest
+    // quote, or -1.0 on any failure. Relative (not absolute) so the rolling
+    // baseline is scale-free and comparable across symbols and price levels.
+    // The underlying's spread is a clean liquidity proxy: a vacuum in the stock
+    // implies punitive option fills too. IBKR L2 is the richer source when wired.
+    double fetchUnderlyingSpread(const std::string& symbol) const {
+        try {
+            httplib::Client cli("https://data.alpaca.markets");
+            cli.set_connection_timeout(std::chrono::seconds(5));
+            cli.set_read_timeout(std::chrono::seconds(10));
+
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID",     apiKey_},
+                {"APCA-API-SECRET-KEY", apiSec_}
+            };
+
+            std::string path = "/v2/stocks/" + symbol + "/quotes/latest?feed=iex";
+            auto res = cli.Get(path.c_str(), headers);
+            if (!res || res->status != 200) return -1.0;
+
+            auto body = json::parse(res->body);
+            const auto& q = body.at("quote");
+            double bid = q.value("bp", 0.0);
+            double ask = q.value("ap", 0.0);
+            if (bid <= 0.0 || ask <= 0.0 || ask < bid) return -1.0;
+
+            double mid = (ask + bid) / 2.0;
+            return (mid > 0.0) ? (ask - bid) / mid : -1.0;
+        } catch (...) {
+            return -1.0;
+        }
+    }
+
     // ── Market data: VIX ──────────────────────────────────────────────────────
 
     double fetchVix() const {
@@ -196,6 +558,55 @@ private:
             }
         } catch (...) {}
         return -1.0;
+    }
+
+    // ── Market data: VIX term structure (spot VIX vs 3-month VIX) ───────────
+    //
+    // VIX3M/VIX > 1.05 → normal contango → short-vol is structurally favoured
+    // VIX3M/VIX < 0.95 → backwardation → front vol spiked → avoid selling premium
+    // Between 0.95–1.05 → neutral / inconclusive
+    //
+    // The ratio is used as a secondary regime signal: backwardation reduces
+    // regime_clearance for sell-premium strategies even in RISK_ON regime.
+
+    struct VixTermStructure {
+        double spot   = -1.0; // ^VIX
+        double vix3m  = -1.0; // ^VIX3M (91-day CBOE index)
+        double ratio  = 1.0;  // vix3m / spot
+        bool   valid  = false;
+        std::string label; // "CONTANGO" | "BACKWARDATION" | "FLAT"
+    };
+
+    VixTermStructure fetchVixTermStructure() const {
+        VixTermStructure ts;
+        auto fetchSymbol = [&](const std::string& symbol) -> double {
+            try {
+                httplib::Client cli("https://query1.finance.yahoo.com");
+                cli.set_connection_timeout(std::chrono::seconds(8));
+                cli.set_read_timeout(std::chrono::seconds(12));
+                std::string path = "/v8/finance/chart/" + symbol + "?interval=1d&range=2d";
+                auto res = cli.Get(path.c_str());
+                if (!res || res->status != 200) return -1.0;
+                auto body = json::parse(res->body);
+                const auto& closes = body.at("chart").at("result").at(0)
+                                          .at("indicators").at("quote").at(0).at("close");
+                for (int i = static_cast<int>(closes.size()) - 1; i >= 0; --i)
+                    if (!closes[i].is_null()) return closes[i].get<double>();
+            } catch (...) {}
+            return -1.0;
+        };
+
+        ts.spot  = fetchSymbol("%5EVIX");
+        ts.vix3m = fetchSymbol("%5EVIX3M");
+
+        if (ts.spot > 0.0 && ts.vix3m > 0.0) {
+            ts.ratio = ts.vix3m / ts.spot;
+            ts.valid  = true;
+            if (ts.ratio > 1.05)       ts.label = "CONTANGO";
+            else if (ts.ratio < 0.95)  ts.label = "BACKWARDATION";
+            else                       ts.label = "FLAT";
+        }
+        return ts;
     }
 
     // ── Market data: SPY ──────────────────────────────────────────────────────
@@ -233,6 +644,130 @@ private:
             return {price, sum / 200.0, true};
         } catch (...) {}
         return {};
+    }
+
+    // ── Market data: Earnings Calendar (america-data-engine) ──────────────────
+
+    struct EarningsEvent {
+        std::string date;
+        std::string description;
+    };
+
+    using EarningsCalendar = std::map<std::string, std::vector<EarningsEvent>>;
+
+    EarningsCalendar fetchEarningsCalendar() const {
+        EarningsCalendar result;
+        try {
+            httplib::Client cli("http://america-data-engine:8001");
+            cli.set_connection_timeout(std::chrono::seconds(5));
+            cli.set_read_timeout(std::chrono::seconds(10));
+
+            // Construct the authorization header (WEBHOOK_SECRET_TOKEN)
+            const char* webhook_secret = std::getenv("WEBHOOK_SECRET_TOKEN");
+            if (!webhook_secret) {
+                log("WARN", "[EARNINGS_FETCH] WEBHOOK_SECRET_TOKEN not set; skipping earnings fetch.");
+                return result;
+            }
+
+            httplib::Headers headers;
+            headers.emplace("X-Nox-Token", webhook_secret);
+
+            auto res = cli.Get("/earnings/calendar", headers);
+            if (!res || res->status != 200) {
+                log("WARN", "[EARNINGS_FETCH] america-data-engine returned status " +
+                    std::to_string(res ? res->status : 0) + "; earnings gate disabled.");
+                return result;
+            }
+
+            auto body = json::parse(res->body);
+            const auto& calendar = body.at("earnings_calendar");
+
+            for (auto it = calendar.begin(); it != calendar.end(); ++it) {
+                std::string ticker = it.key();
+                const auto& events = it.value();
+
+                std::vector<EarningsEvent> ticker_events;
+                for (const auto& event : events) {
+                    ticker_events.push_back({
+                        event.at("date").get<std::string>(),
+                        event.value("description", "")
+                    });
+                }
+                result[ticker] = ticker_events;
+            }
+
+            int total_events = 0;
+            for (const auto& pair : result) {
+                total_events += pair.second.size();
+            }
+            log("INFO", "[EARNINGS_FETCH] Loaded earnings calendar: " +
+                std::to_string(total_events) + " event(s).");
+
+        } catch (const std::exception& e) {
+            log("WARN", "[EARNINGS_FETCH] Exception fetching earnings calendar: " +
+                std::string(e.what()) + "; earnings gate disabled.");
+        }
+        return result;
+    }
+
+    bool hasEarningsWithin5Days(const std::string& ticker,
+                                 const EarningsCalendar& calendar) const {
+        auto it = calendar.find(ticker);
+        if (it == calendar.end()) {
+            return false; // No earnings found for this ticker
+        }
+
+        // Get today's date (system local time, converted to YYYY-MM-DD string)
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm* gm_time = std::gmtime(&time_t);
+
+        std::ostringstream oss;
+        oss << std::put_time(gm_time, "%Y-%m-%d");
+        std::string today_str = oss.str();
+
+        // Parse today's date
+        int today_year, today_month, today_day;
+        std::sscanf(today_str.c_str(), "%d-%d-%d", &today_year, &today_month, &today_day);
+
+        // Check each earnings event for this ticker
+        for (const auto& event : it->second) {
+            int event_year, event_month, event_day;
+            std::sscanf(event.date.c_str(), "%d-%d-%d", &event_year, &event_month, &event_day);
+
+            // Simple date comparison: convert both to day-of-year for same year, else compare years
+            auto days_until_event = [](int y1, int m1, int d1, int y2, int m2, int d2) -> long {
+                // Count days from date1 to date2
+                // This is a simplified comparison — proper implementation would use chrono
+                if (y1 != y2) {
+                    return y2 > y1 ? 1000 : -1000; // Different years, approximate
+                }
+
+                // Same year: convert month/day to day-of-year
+                int days_in_month[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+                if ((y1 % 4 == 0 && y1 % 100 != 0) || (y1 % 400 == 0)) {
+                    days_in_month[2] = 29; // Leap year
+                }
+
+                int doy1 = d1;
+                for (int i = 1; i < m1; ++i) doy1 += days_in_month[i];
+
+                int doy2 = d2;
+                for (int i = 1; i < m2; ++i) doy2 += days_in_month[i];
+
+                return static_cast<long>(doy2 - doy1);
+            };
+
+            long days_diff = days_until_event(today_year, today_month, today_day,
+                                               event_year, event_month, event_day);
+
+            // Earnings within 5 days (inclusive of today)
+            if (days_diff >= 0 && days_diff <= 5) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // ── Market data: Underlying OHLCV (Yahoo Finance) ─────────────────────────
@@ -415,22 +950,25 @@ private:
     //   vol_cheap — IV < HRV * 0.90: options are underpricing actual vol. Buy
     //               premium: implied vol is likely to mean-revert upward.
     //
-    //   iv_rank   — snapshot-relative position (secondary confirmation).
-    //               prefer_sell fires when rank ≥ sell_min OR vol_rich.
-    //               prefer_buy  fires when rank ≤ buy_max  OR vol_cheap.
-    //               When both fire, prefer_sell wins (variance premium is the
-    //               more theoretically grounded signal).
+    //   iv_rank   — snapshot-relative position only (display/secondary context).
+    //               NOT used to gate strategy selection: it measures where the
+    //               average IV sits within the current chain's own min/max spread
+    //               (intra-chain skew dispersion), which is unrelated to whether
+    //               vol is rich versus what the stock actually realizes. Gating on
+    //               it would flip trades on a meaningless number. The profile
+    //               iv_rank_buy_max / iv_rank_sell_min thresholds are reserved for
+    //               the true 52-week historical IV Rank (heartbeat subsystem),
+    //               pending the C++ ↔ heartbeat integration (see private roadmap).
 
-    std::string selectStrategy(DirectionalBias bias, double iv_rank, double iv_level,
+    std::string selectStrategy(DirectionalBias bias, double /*iv_rank*/, double iv_level,
                                double hrv, const std::string& tier) const {
-        const double buy_max  = profile_.iv_rank_buy_max;
-        const double sell_min = profile_.iv_rank_sell_min;
-
         bool vol_rich  = (hrv > 0.01) && (iv_level > hrv * 1.20);
         bool vol_cheap = (hrv > 0.01) && (iv_level < hrv * 0.90);
 
-        bool prefer_sell = vol_rich  || (iv_rank >= sell_min);
-        bool prefer_buy  = vol_cheap || (iv_rank <= buy_max);
+        // Gate purely on the HRV-based variance-premium signal (the documented
+        // primary edge). Snapshot iv_rank is intentionally not a trigger.
+        bool prefer_sell = vol_rich;
+        bool prefer_buy  = vol_cheap;
 
         // When conflicting: variance premium is more reliable → sell wins
         if (prefer_sell && prefer_buy) prefer_buy = false;
@@ -723,7 +1261,8 @@ private:
     // ── Telegram formatting ───────────────────────────────────────────────────
 
     std::string formatAlert(const OptionsSignal& s, double vix,
-                            const AllocationStrategy& regime) const
+                            const AllocationStrategy& regime,
+                            const VixTermStructure& vts = VixTermStructure{}) const
     {
         std::string leg2_str = (s.strike2 > 0)
             ? " / $" + fmt(s.strike2, 0)
@@ -771,6 +1310,15 @@ private:
                                "% | HRV-30: " + fmt(s.hrv30 * 100.0, 1) +
                                "% → " + hrv_tag;
 
+        std::string vts_line;
+        if (vts.valid) {
+            std::string vts_emoji = (vts.label == "BACKWARDATION") ? "⚠️"
+                                  : (vts.label == "CONTANGO")      ? "✅" : "➖";
+            vts_line = "\n📉 *VIX Term Structure:* " + vts.label + " " + vts_emoji +
+                       " (VIX=" + fmt(vts.spot, 1) + " · VIX3M=" + fmt(vts.vix3m, 1) +
+                       " · ratio=" + fmt(vts.ratio, 3) + ")";
+        }
+
         std::string alert =
             "📊 *OPTIONS SIGNAL — " + s.underlying + "* [" + s.profile_name + " · " + s.capital_tier + "]\n"
             "────────────────────────────────────\n"
@@ -794,7 +1342,9 @@ private:
             " | ATR(14): $" + fmt(s.atr) + "\n"
             "\n🌐 *Macro Regime:* " + regime.log_message + " " + regime_emoji +
             " (VIX " + fmt(vix, 1) + ")\n"
-            "🎯 *Signal Confidence:* " + std::to_string(conf_pct) + "%\n"
+            "🌡️ *Regime Clearance:* " + std::to_string(conf_pct) + "% "
+                "(100=RISK_ON · 65=TRANSITION · 0=RISK_OFF)" +
+            vts_line + "\n"
             "\n📋 _" + s.rationale + "_" +
             fc_footer + "\n"
             "⚠️ _Advisory only — manual execution required._";
@@ -826,56 +1376,70 @@ private:
         }
     }
 
-    // ── Per-ticker scan orchestrator ──────────────────────────────────────────
+    // ── Per-ticker evaluator — returns scored signal or nullopt if no setup ───
 
-    void scanTicker(const std::string& ticker,
-                    double effective_capital, const std::string& tier, bool fc_mode,
-                    double vix, const SpySnapshot& spy,
-                    const AllocationStrategy& regime)
+    std::optional<ScoredSignal> evaluateTicker(
+        const std::string& ticker,
+        double effective_capital, const std::string& tier, bool fc_mode,
+        double vix, const SpySnapshot& spy,
+        const AllocationStrategy& regime,
+        const VixTermStructure& vts = VixTermStructure{})
     {
         log("INFO", "[OPTIONS_SCAN] Scanning " + ticker + "...");
 
         UnderlyingData d = fetchUnderlyingBars(ticker);
         if (!d.valid) {
             log("WARN", "[OPTIONS_SCAN] No bar data for " + ticker + " — skipping.");
-            return;
+            return std::nullopt;
         }
 
         IVData iv_data  = fetchIVData(ticker, vix, d.hrv30);
         double iv_rank  = iv_data.iv_rank;
-        double iv_sigma = iv_data.iv_level; // actual market IV — use directly in BS
-
-        double rfr = 0.05; // US risk-free rate (approximate)
+        double iv_sigma = iv_data.iv_level;
+        double rfr      = 0.05;
 
         DirectionalBias bias     = computeBias(d);
         std::string     strategy = selectStrategy(bias, iv_rank, iv_sigma, d.hrv30, tier);
 
-        double conf = regimeConfidence(regime.current_regime, strategy);
-        if (conf < 1e-6) {
+        double regime_clearance = regimeConfidence(regime.current_regime, strategy);
+        if (regime_clearance < 1e-6) {
             log("INFO", "[OPTIONS_SCAN] " + ticker + " / " + strategy +
                 " suppressed by RISK_OFF regime.");
-            return;
+            return std::nullopt;
+        }
+
+        // Setup quality gate — requires at least one of:
+        //   A) Price ≥1.0×ATR from SMA20 (clear trend conviction)
+        //   B) IV deviates ≥30% from HRV (strong vol signal)
+        //   C) RSI ≤35 or ≥68 (clear momentum extreme)
+        {
+            double sma_atrs  = (d.atr14 > 0) ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
+            bool strong_trend = sma_atrs >= 1.0;
+            bool strong_vol   = (d.hrv30 > 0.01) &&
+                                (iv_sigma > d.hrv30 * 1.30 || iv_sigma < d.hrv30 * 0.80);
+            bool rsi_extreme  = d.rsi14 <= 35.0 || d.rsi14 >= 68.0;
+            bool clear_bias   = (bias != DirectionalBias::Neutral);
+
+            if (!strong_trend && !strong_vol && !rsi_extreme && !clear_bias) {
+                log("INFO", "[OPTIONS_SCAN] " + ticker +
+                    " — no qualifying setup (SMA=" + fmt(sma_atrs, 2) +
+                    "xATR RSI=" + fmt(d.rsi14, 1) + "). Skipped.");
+                return std::nullopt;
+            }
         }
 
         ContractParams cp = buildContractParams(strategy, d.price, d.atr14, rfr, iv_sigma);
         if (cp.strike <= 0.0) {
             log("WARN", "[OPTIONS_SCAN] Could not determine valid strike for " + ticker);
-            return;
+            return std::nullopt;
         }
 
         OptionsSignal sig = assembleSignal(ticker, d, strategy, cp,
-                                           iv_rank, iv_sigma, rfr, conf,
-                                           tier, fc_mode, effective_capital,
-                                           d.hrv30);
+                                           iv_rank, iv_sigma, rfr, regime_clearance,
+                                           tier, fc_mode, effective_capital, d.hrv30);
 
-        std::string alert = formatAlert(sig, vix, regime);
-        sendTelegram(alert);
-        log("INFO", "[OPTIONS_SCAN] Signal emitted: " + ticker + " / " + strategy +
-            " | conf=" + fmt(conf * 100.0, 0) + "%");
-
-        if (profile_.auto_execute) {
-            executeSignal(sig);
-        }
+        std::string alert = formatAlert(sig, vix, regime, vts);
+        return scoreSignal(sig, alert, d);
     }
 
     // ── Live order execution via OptionsOrderRouter ───────────────────────────
