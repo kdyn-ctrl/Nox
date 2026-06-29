@@ -23,8 +23,8 @@
 //   - No real historical options chain: IV is proxied as HRV30 × 1.15
 //     (HRV plus a modest variance-risk-premium assumption).
 //   - All Greeks and prices are Black-Scholes European; no early-exercise value.
-//   - Slippage, commissions, and bid/ask spread are NOT modelled.
-//   - Use results to assess signal quality and strategy direction, not exact P&L.
+//   - Slippage can be modelled via entry_slippage= and exit_slippage= parameters.
+//   - Use results to assess signal quality and strategy direction.
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.h"
@@ -62,6 +62,8 @@ struct BacktestConfig {
     double stop_loss_mult                = 2.00;
     double initial_capital               = 35000.0; // ADVANCED tier by default
     double rfr                           = 0.05;
+    double entry_slippage                = 0.10;   // $ per contract at entry (typical: 0.05-0.15)
+    double exit_slippage                 = 0.10;   // $ per contract at exit (typical: 0.05-0.15)
     RiskProfile profile                  = RiskProfile::bot();
 };
 
@@ -376,7 +378,20 @@ Trade simulateTrade(const std::string& ticker,
     t.exit_price = exit_price;
     t.exit_date  = bars[exit_idx].date;
     t.spot_exit  = bars[exit_idx].close;
-    t.pnl        = is_long ? (exit_price - entry_price) : (entry_price - exit_price);
+
+    // Apply slippage: long positions pay more to enter and receive less to exit;
+    // short positions receive less on entry and pay more on exit.
+    double entry_adjusted = entry_price;
+    double exit_adjusted = exit_price;
+    if (is_long) {
+        entry_adjusted += cfg.entry_slippage;
+        exit_adjusted  -= cfg.exit_slippage;
+    } else {
+        entry_adjusted -= cfg.entry_slippage;
+        exit_adjusted  += cfg.exit_slippage;
+    }
+
+    t.pnl        = is_long ? (exit_adjusted - entry_adjusted) : (entry_adjusted - exit_adjusted);
 
     if (bias_bullish)      t.bias_right = t.spot_exit > t.spot_entry;
     else if (bias_bearish) t.bias_right = t.spot_exit < t.spot_entry;
@@ -614,9 +629,11 @@ int main(int argc, char* argv[]) {
                 "  profit=0.50                exit at X% of max profit\n"
                 "  stop=2.0                   stop loss at X× debit paid\n"
                 "  capital=35000              starting capital (sets tier gate)\n"
+                "  entry_slip=0.10            slippage at entry ($/contract)\n"
+                "  exit_slip=0.10             slippage at exit ($/contract)\n"
                 "  profile=personal           use aggressive personal profile\n"
                 "\nExample:\n"
-                "  nox_backtest watchlist=AAPL,NVDA range=2y capital=50000\n";
+                "  nox_backtest watchlist=AAPL,NVDA range=2y entry_slip=0.15 exit_slip=0.15\n";
             return 0;
         }
 
@@ -636,6 +653,8 @@ int main(int argc, char* argv[]) {
         else if (key == "profit")    { cfg.profit_target_pct    = std::stod(val); }
         else if (key == "stop")      { cfg.stop_loss_mult       = std::stod(val); }
         else if (key == "capital")   { cfg.initial_capital      = std::stod(val); }
+        else if (key == "entry_slip") { cfg.entry_slippage      = std::stod(val); }
+        else if (key == "exit_slip")  { cfg.exit_slippage       = std::stod(val); }
         else if (key == "profile" && val == "personal") {
             cfg.profile = RiskProfile::personal();
         }

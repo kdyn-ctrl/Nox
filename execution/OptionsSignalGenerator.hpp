@@ -6,6 +6,7 @@
 #include "OptionEngine.hpp"
 #include "OptionsSignalTypes.hpp"
 #include "OptionsOrderRouter.hpp"
+#include "PositionManager.hpp"
 #include "../shared/RegimeStateMachine.hpp"
 
 #include <algorithm>
@@ -194,6 +195,20 @@ struct IVData {
     bool   vol_rich = false; // iv_level > hrv30 * 1.20 — sell-premium environment
 };
 
+// VIX term structure snapshot — moved to namespace scope so it can be used as a
+// default argument in member function declarations (GCC requires the type to be
+// fully defined with default member initialisers before the class is closed).
+//
+// VIX3M/VIX > 1.05 → contango   → short-vol structurally favoured
+// VIX3M/VIX < 0.95 → backwardation → front vol spiked → avoid selling premium
+struct VixTermStructure {
+    double spot   = -1.0; // ^VIX
+    double vix3m  = -1.0; // ^VIX3M (91-day CBOE index)
+    double ratio  = 1.0;  // vix3m / spot
+    bool   valid  = false;
+    std::string label; // "CONTANGO" | "BACKWARDATION" | "FLAT"
+};
+
 
 // ─── OptionsSignalGenerator ───────────────────────────────────────────────────
 
@@ -202,13 +217,16 @@ public:
     // Profile-driven constructor — all risk parameters come from the RiskProfile.
     // db_path: optional path to the PositionManager SQLite DB for open-position
     //          deduplication (leave empty to disable the check).
+    // position_manager: pointer to the engine's PositionManager so executeSignal()
+    //                   can record fills via add_position() (Gap 1 fix).
     OptionsSignalGenerator(const std::string& alpacaUrl,
                            const std::string& apiKey,
                            const std::string& apiSec,
                            const std::string& tgToken,
                            const std::string& tgChatId,
                            RiskProfile        profile,
-                           const std::string& db_path = "")
+                           const std::string& db_path = "",
+                           PositionManager*   position_manager = nullptr)
         : alpacaUrl_(alpacaUrl)
         , apiKey_(apiKey)
         , apiSec_(apiSec)
@@ -216,6 +234,7 @@ public:
         , tgChatId_(tgChatId)
         , profile_(std::move(profile))
         , dedup_db_path_(db_path)
+        , positionManager_(position_manager)
     {}
 
     // Entry point — called once per scan cycle from the engine's background thread.
@@ -376,6 +395,7 @@ private:
     std::string tgChatId_;
     RiskProfile profile_;
     std::string dedup_db_path_; // path to PositionManager SQLite DB for dedup
+    PositionManager* positionManager_ = nullptr; // Gap 1: record fills after successful route()
     RegimeStateMachine regimeMachine_;
     nox::liquidity::LiquidityGate liquidity_gate_; // WS5 microstructure gate
 
@@ -562,20 +582,12 @@ private:
 
     // ── Market data: VIX term structure (spot VIX vs 3-month VIX) ───────────
     //
-    // VIX3M/VIX > 1.05 → normal contango → short-vol is structurally favoured
-    // VIX3M/VIX < 0.95 → backwardation → front vol spiked → avoid selling premium
-    // Between 0.95–1.05 → neutral / inconclusive
-    //
+    // VixTermStructure is defined at namespace scope (above the class) so it
+    // can be used as a default function argument without triggering GCC's
+    // "default member initializer required before end of enclosing class" error.
+    // Between 0.95–1.05 → neutral / inconclusive.
     // The ratio is used as a secondary regime signal: backwardation reduces
     // regime_clearance for sell-premium strategies even in RISK_ON regime.
-
-    struct VixTermStructure {
-        double spot   = -1.0; // ^VIX
-        double vix3m  = -1.0; // ^VIX3M (91-day CBOE index)
-        double ratio  = 1.0;  // vix3m / spot
-        bool   valid  = false;
-        std::string label; // "CONTANGO" | "BACKWARDATION" | "FLAT"
-    };
 
     VixTermStructure fetchVixTermStructure() const {
         VixTermStructure ts;
@@ -1491,7 +1503,7 @@ private:
 
     // ── Live order execution via OptionsOrderRouter ───────────────────────────
 
-    void executeSignal(const OptionsSignal& sig) const {
+    void executeSignal(const OptionsSignal& sig) {
         nox::options_router::OptionsOrderRouter router(alpacaUrl_, apiKey_, apiSec_);
 
         // Covered calls require 100 shares per contract as collateral.
@@ -1526,6 +1538,31 @@ private:
                 "• *Expiry:* " + sig.expiry_date + "\n"
                 "• *Order ID:* `" + result.order_id + "`"
             );
+
+            // Gap 1 fix: record fill in PositionManager so the 30-min exit-rule
+            // monitor has a row to act on. Without this, stop-loss / 50% profit /
+            // 21 DTE rules can never fire for options positions.
+            if (positionManager_) {
+                auto now_t = std::chrono::system_clock::to_time_t(
+                                 std::chrono::system_clock::now());
+                std::tm tm_buf{};
+                std::ostringstream today_oss;
+                today_oss << std::put_time(gmtime_r(&now_t, &tm_buf), "%Y-%m-%d");
+
+                std::string opt_type = (sig.option_type == nox::options::OptionType::Call)
+                                       ? "call" : "put";
+                bool is_short_premium = (sig.strategy == "CSP" || sig.strategy == "CC");
+                std::string profile_type = is_short_premium ? "short_premium" : "long";
+
+                positionManager_->add_position(
+                    sig.underlying, opt_type, sig.strike,
+                    profile_.qty_contracts, sig.entry_price,
+                    today_oss.str(), profile_type, sig.expiry_date
+                );
+                log("INFO", "[OPTIONS_EXEC][POS_MANAGER] Recorded: " + sig.underlying +
+                    " " + opt_type + " $" + fmt(sig.strike, 0) +
+                    " exp=" + sig.expiry_date + " profile=" + profile_type);
+            }
         } else {
             log("WARN", "[OPTIONS_EXEC] Order failed — " + result.message);
             sendTelegram(

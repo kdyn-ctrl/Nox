@@ -354,6 +354,107 @@ private:
         }
     }
 
+    // Gap 2 fix: on startup, seed any options positions open in Alpaca that aren't
+    // in the local SQLite DB. Handles positions entered before a crash or restart
+    // (including the pre-Gap-1 era when add_position() was never called).
+    // Uses avg_entry_price from Alpaca as the tracked entry so exit-rule ratios
+    // are calibrated to the real fill rather than an arbitrary current price.
+    void reconcilePositionsFromBroker() {
+        Logger::log("INFO", "[RECONCILE] Checking Alpaca for untracked options positions...");
+        try {
+            httplib::Client cli(alpacaBaseUrl);
+            cli.set_connection_timeout(std::chrono::seconds(5));
+            cli.set_read_timeout(std::chrono::seconds(10));
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID",     apiKey},
+                {"APCA-API-SECRET-KEY", apiSec}
+            };
+            auto res = cli.Get("/v2/positions", headers);
+            if (!res || res->status != 200) {
+                Logger::log("WARN", "[RECONCILE] /v2/positions returned " +
+                            std::to_string(res ? res->status : 0) + " — skipping.");
+                return;
+            }
+            auto body = json::parse(res->body);
+            if (!body.is_array()) {
+                Logger::log("WARN", "[RECONCILE] Unexpected response format — skipping.");
+                return;
+            }
+            int added = 0, skipped = 0;
+            for (const auto& pos : body) {
+                if (pos.value("asset_class", "") != "us_option") continue;
+                std::string occ = pos.value("symbol", "");
+                if (occ.empty()) continue;
+
+                // Parse OCC symbol: UNDERLYING(1-5) + YYMMDD(6) + C|P(1) + STRIKE(8)
+                // Example: AAPL240119C00150000 → underlying=AAPL, exp=2024-01-19, call, $150.000
+                size_t i = 0;
+                while (i < occ.size() && std::isalpha(static_cast<unsigned char>(occ[i]))) ++i;
+                if (i == 0 || occ.size() < i + 15) continue; // malformed OCC
+
+                std::string underlying = occ.substr(0, i);
+                std::string yymmdd     = occ.substr(i, 6);
+                std::string expiry     = "20" + yymmdd.substr(0, 2) + "-"
+                                                + yymmdd.substr(2, 2) + "-"
+                                                + yymmdd.substr(4, 2);
+                std::string opt_type   = (occ[i + 6] == 'C') ? "call" : "put";
+                double strike = 0.0;
+                try { strike = std::stod(occ.substr(i + 7, 8)) / 1000.0; } catch (...) { continue; }
+                if (strike <= 0.0) continue;
+
+                if (positionManager_->has_open_position(underlying)) { skipped++; continue; }
+
+                // Prefer avg_entry_price (real fill); fall back to current_price
+                double entry_price = 0.0;
+                auto tryParse = [](const json& j, const char* key) -> double {
+                    if (!j.contains(key)) return 0.0;
+                    const auto& v = j[key];
+                    try {
+                        if (v.is_number()) return v.get<double>();
+                        if (v.is_string()) return std::stod(v.get<std::string>());
+                    } catch (...) {}
+                    return 0.0;
+                };
+                entry_price = tryParse(pos, "avg_entry_price");
+                if (entry_price <= 0.0) entry_price = tryParse(pos, "current_price");
+                if (entry_price <= 0.0) entry_price = 1.0; // safe fallback; ratios still fire
+
+                int qty = 1;
+                if (pos.contains("qty")) {
+                    const auto& q = pos["qty"];
+                    try {
+                        if (q.is_number()) qty = std::abs(q.get<int>());
+                        else if (q.is_string()) qty = std::abs(std::stoi(q.get<std::string>()));
+                    } catch (...) {}
+                }
+
+                std::string side         = pos.value("side", "long");
+                std::string profile_type = (side == "short") ? "short_premium" : "long";
+                std::string today        = get_today_date_string();
+
+                positionManager_->add_position(underlying, opt_type, strike, qty,
+                                               entry_price, today, profile_type, expiry);
+                added++;
+                Logger::log("INFO", "[RECONCILE] Seeded orphan: " + underlying +
+                            " " + opt_type + " $" + std::to_string(strike) +
+                            " exp=" + expiry + " entry=$" + std::to_string(entry_price));
+            }
+            Logger::log("INFO", "[RECONCILE] Done — seeded=" + std::to_string(added) +
+                        ", already-tracked=" + std::to_string(skipped) + ".");
+            if (added > 0) {
+                TelegramNotifier::sendMessage(
+                    "🔄 *Startup Reconciliation*\n"
+                    "────────────────────────\n"
+                    "• Seeded *" + std::to_string(added) + "* untracked option position(s) from Alpaca.\n"
+                    "• These were open before the last engine restart.\n"
+                    "_Exit rules (50% profit / 21 DTE / stop-loss) are now active._"
+                );
+            }
+        } catch (const std::exception& e) {
+            Logger::log("WARN", "[RECONCILE] Exception: " + std::string(e.what()));
+        }
+    }
+
     // RULE-005: Fetch live equity with exponential-backoff retry (2s -> 4s -> 8s).
     // Returns -1.0 on total failure — callers MUST NOT proceed with any fallback.
     double fetch_account_equity() {
@@ -1139,6 +1240,7 @@ public:
             positionManager_ = std::make_unique<PositionManager>(memory_bank_path_, *order_router);
             positionManager_->start_monitoring();
             Logger::log("INFO", "[POS_MANAGER] Position Manager initialized at " + memory_bank_path_);
+            reconcilePositionsFromBroker();
         } catch (const std::exception& e) {
             std::cerr << "[FATAL] [POS_MANAGER] Failed to initialize Position Manager: "
                       << e.what() << ". Refusing to start." << std::endl;
@@ -1491,10 +1593,10 @@ public:
                 std::string tg_token = std::getenv("TELEGRAM_BOT_TOKEN") ? std::getenv("TELEGRAM_BOT_TOKEN") : "";
                 std::string tg_chat  = std::getenv("TELEGRAM_CHAT_ID")   ? std::getenv("TELEGRAM_CHAT_ID")   : "";
 
-                // Pass memory_bank_path_ for open-position deduplication.
+                // Pass memory_bank_path_ for dedup and positionManager_ for Gap 1 fill recording.
                 nox::options_signal::OptionsSignalGenerator generator(
                     alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat, profile,
-                    memory_bank_path_);
+                    memory_bank_path_, positionManager_.get());
 
                 while (running_.load()) {
                     try {

@@ -16,7 +16,6 @@
 
 // Forward declarations
 namespace nox::options_router { class OptionsOrderRouter; }
-class TelegramNotifier;
 
 struct OptionPosition {
     long id;
