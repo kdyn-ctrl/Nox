@@ -190,9 +190,46 @@ def init_db():
                     CREATE INDEX IF NOT EXISTS idx_lag_ticker
                     ON lag_windows(ticker)
                 ''')
+                # WS6 / Weekly Report — predicted vs actual outcomes for MAE tracking.
+                # Rows are written by any workstream that records a forecast
+                # (e.g. Claude risk-score vs realised PnL direction).
+                c.execute('''
+                    CREATE TABLE IF NOT EXISTS trade_predictions (
+                        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp         DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        ticker            TEXT,
+                        predicted_outcome REAL,
+                        actual_outcome    REAL
+                    )
+                ''')
+                # Tracks every filing that failed to parse / analyse so the
+                # weekly report can surface systematic parsing regressions.
+                c.execute('''
+                    CREATE TABLE IF NOT EXISTS parsing_failures (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        ticker      TEXT,
+                        filing_type TEXT DEFAULT '8-K',
+                        error_msg   TEXT
+                    )
+                ''')
                 conn.commit()
     except Exception as e:
         print(f"Database initialization error: {e}")
+
+def _log_parsing_failure(ticker: str, filing_type: str, error_msg: str) -> None:
+    """Persist a SEC filing parse/analysis failure to the parsing_failures table."""
+    try:
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "INSERT INTO parsing_failures (ticker, filing_type, error_msg) "
+                    "VALUES (?, ?, ?)",
+                    (ticker, filing_type, str(error_msg)[:500]),
+                )
+    except Exception as e:
+        logger.warning(f"_log_parsing_failure DB write failed: {e}")
+
 
 # --- 2. DATA EXTRACTION ---
 # RULE-008: All HTTP calls use a (connect_timeout, read_timeout) tuple.
@@ -1461,6 +1498,65 @@ def schedule_checker():
 
     _reschedule_iv_collection()
 
+    # --- Weekly Performance Report (last NYSE trading day at 16:00 ET) ---
+    # pandas_market_calendars determines whether today is the last trading day
+    # of the week (Friday, or Thursday on early-close/holiday weeks). The job
+    # is only registered on that day and cleared the following morning by
+    # _combined_reschedule, so it never fires on the wrong day.
+
+    def _reschedule_weekly_report():
+        """
+        Register run_weekly_performance_report at 16:00 ET only when today
+        is the last NYSE trading day of the current Mon–Fri week.
+
+        Uses pandas_market_calendars (lazy import — loads once then cached)
+        so NYSE holidays automatically shift the report to Thursday with no
+        manual calendar maintenance required. Re-run nightly at 00:01 UTC.
+        """
+        schedule.clear("weekly_report")
+        try:
+            import pandas_market_calendars as mcal  # noqa: PLC0415
+
+            nyse   = mcal.get_calendar("NYSE")
+            now_et = datetime.now(tz=ET)
+            today  = now_et.date()
+            monday = today - timedelta(days=today.weekday())
+            friday = monday + timedelta(days=4)
+
+            sched_df = nyse.schedule(
+                start_date=monday.strftime("%Y-%m-%d"),
+                end_date=friday.strftime("%Y-%m-%d"),
+            )
+
+            if sched_df.empty:
+                logger.info("Weekly report: no NYSE trading days this week — skipping.")
+                return
+
+            last_trading_day = sched_df.index[-1].date()
+
+            if today != last_trading_day:
+                logger.info(
+                    f"Weekly report: today ({today}) is not the last trading day "
+                    f"this week ({last_trading_day}). Not scheduling."
+                )
+                return
+
+            # Today IS the last trading day — register a one-shot at 16:00 ET.
+            target_et  = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+            target_utc = target_et.astimezone(UTC)
+            utc_hhmm   = target_utc.strftime("%H:%M")
+
+            schedule.every().day.at(utc_hhmm).do(run_weekly_performance_report).tag("weekly_report")
+            print(
+                f"[INFO] [HEARTBEAT] Weekly report scheduled for today ({today}) "
+                f"at 16:00 ET = {utc_hhmm} UTC.",
+                flush=True,
+            )
+        except Exception as e:
+            logger.error(f"_reschedule_weekly_report failed: {e}")
+
+    _reschedule_weekly_report()
+
     # --- Market Scanner (every 30 minutes, market hours only) ---
     # Runs independently of DST — the is_market_hours() check inside handles
     # the ET window, so we schedule on a fixed wall-clock interval, not a time.
@@ -1470,10 +1566,12 @@ def schedule_checker():
     # Fire once immediately at startup so first signals don't wait 30 minutes.
     threading.Thread(target=run_market_scanner, daemon=True).start()
 
-    # Reschedule IV collection each night along with the scout
+    # Reschedule all time-sensitive jobs each night so DST shifts and
+    # "is today the last trading day?" checks are re-evaluated daily.
     def _combined_reschedule():
         _reschedule_scout()
         _reschedule_iv_collection()
+        _reschedule_weekly_report()
 
     schedule.clear("reschedule")
     schedule.every().day.at("00:01").do(_combined_reschedule).tag("reschedule")
@@ -1509,6 +1607,24 @@ def trigger_report(message):
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] /report command failed: {e}", flush=True)
         bot.reply_to(message, f"⚠️ Failed to trigger report: {str(e)}")
+
+@bot.message_handler(commands=['weekly_report'])
+def trigger_weekly_report(message):
+    """
+    /weekly_report — Manually triggers the weekly performance report on demand.
+    Runs in a background thread so the bot stays responsive during DB queries.
+    """
+    try:
+        bot.reply_to(
+            message,
+            "📊 *Generating weekly performance report...* Querying memory bank.",
+            parse_mode="Markdown",
+        )
+        threading.Thread(target=run_weekly_performance_report, daemon=True).start()
+    except Exception as e:
+        print(f"[ERROR] [HEARTBEAT] /weekly_report failed: {e}", flush=True)
+        bot.reply_to(message, f"⚠️ Failed to trigger weekly report: {str(e)}")
+
 
 @bot.message_handler(commands=['status'])
 def send_status(message):
@@ -2371,6 +2487,7 @@ def analyze_and_alert(ticker: str, payload: str, filing_type: str, context: str 
             bot.send_message(CHAT_ID, chunk, parse_mode='Markdown')
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] Analysis/alerting failed for {ticker}: {e}", flush=True)
+        _log_parsing_failure(ticker, filing_type, str(e))
         bot.send_message(CHAT_ID, f"⚠️ Analysis failed for {ticker} filing.", parse_mode='Markdown')
 
 
@@ -2531,6 +2648,167 @@ def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8
 
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] Failed to process automated filing for {ticker}: {e}", flush=True)
+
+# --- 5.7 WEEKLY PERFORMANCE REPORT ---
+# Scheduled to fire at 16:00 ET on the last NYSE trading day of each week
+# (Friday, or Thursday when Friday is a holiday — determined dynamically by
+# pandas_market_calendars so no manual calendar updates are ever needed).
+# The scheduler is re-evaluated at 00:01 UTC each night; the job is only
+# registered on the correct day, then cleared the following morning.
+#
+# Data sources: memory_bank.db tables trade_history, trade_predictions,
+# parsing_failures.  All queries wrapped in db_lock (RULE-016).
+
+def get_weekly_stats() -> dict:
+    """
+    Query memory_bank.db for the current calendar week's performance metrics.
+
+    Returns a dict with keys:
+        week_label, trade_count, total_pnl, wins, losses,
+        win_loss_ratio, mae, calibration_score, parsing_failure_count
+    On DB error returns {week_label, error}.
+    """
+    et      = ZoneInfo("America/New_York")
+    now_et  = datetime.now(et)
+    monday  = (now_et - timedelta(days=now_et.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    week_label    = monday.strftime("%b %d") + " – " + now_et.strftime("%b %d, %Y")
+    week_start_str = monday.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+
+                # ── Total P&L and Win/Loss breakdown ─────────────────────────
+                c.execute(
+                    "SELECT pnl FROM trade_history "
+                    "WHERE timestamp >= ? AND pnl IS NOT NULL",
+                    (week_start_str,),
+                )
+                pnl_rows    = [r[0] for r in c.fetchall()]
+                trade_count = len(pnl_rows)
+                total_pnl   = sum(pnl_rows)
+                wins        = sum(1 for p in pnl_rows if p > 0)
+                losses      = trade_count - wins
+                win_loss_ratio = wins / losses if losses > 0 else float(wins)
+
+                # ── MAE: predicted vs actual outcome ─────────────────────────
+                # Rows are written by workstreams that log forecasts; the table
+                # starts empty and MAE is reported as N/A until data accumulates.
+                c.execute(
+                    "SELECT predicted_outcome, actual_outcome "
+                    "FROM trade_predictions "
+                    "WHERE timestamp >= ? "
+                    "  AND predicted_outcome IS NOT NULL "
+                    "  AND actual_outcome    IS NOT NULL",
+                    (week_start_str,),
+                )
+                pred_rows = c.fetchall()
+                if pred_rows:
+                    mae = sum(abs(p - a) for p, a in pred_rows) / len(pred_rows)
+                    # Calibration: 1 = perfect (MAE=0), 0 = total miscalibration
+                    calibration_score = max(0.0, min(1.0, 1.0 - mae))
+                else:
+                    mae               = None
+                    calibration_score = None
+
+                # ── SEC parsing failures (all form types) ────────────────────
+                c.execute(
+                    "SELECT COUNT(*) FROM parsing_failures WHERE timestamp >= ?",
+                    (week_start_str,),
+                )
+                parsing_failure_count = c.fetchone()[0] or 0
+
+        return {
+            "week_label":            week_label,
+            "trade_count":           trade_count,
+            "total_pnl":             total_pnl,
+            "wins":                  wins,
+            "losses":                losses,
+            "win_loss_ratio":        win_loss_ratio,
+            "mae":                   mae,
+            "calibration_score":     calibration_score,
+            "parsing_failure_count": parsing_failure_count,
+        }
+    except Exception as e:
+        logger.error(f"get_weekly_stats failed: {e}")
+        return {"week_label": week_label, "error": str(e)}
+
+
+def format_weekly_report(stats: dict) -> str:
+    """
+    Render weekly performance stats as a Telegram-ready Markdown message.
+
+    Uses a monospace code block for the table — pipe-based Markdown tables
+    are not supported in Telegram's Markdown mode; a code block gives clean
+    fixed-width rendering without requiring MarkdownV2 escaping.
+    """
+    if "error" in stats:
+        return f"⚠️ *Weekly Report Error*\n`{stats['error']}`"
+
+    pnl_str = (
+        f"+${stats['total_pnl']:.2f}"
+        if stats["total_pnl"] >= 0
+        else f"-${abs(stats['total_pnl']):.2f}"
+    )
+    if stats["losses"] > 0:
+        wl_ratio_str = f"{stats['win_loss_ratio']:.2f}"
+    elif stats["wins"] > 0:
+        wl_ratio_str = "∞  (all wins)"
+    else:
+        wl_ratio_str = "N/A"
+
+    mae_str = f"{stats['mae']:.4f}" if stats["mae"] is not None else "N/A"
+    cal_str = (
+        f"{stats['calibration_score']:.1%}"
+        if stats["calibration_score"] is not None
+        else "N/A — no predictions logged"
+    )
+
+    W    = 22   # metric label column width
+    rows = [
+        ("Total P&L",            pnl_str),
+        ("Trades",               f"{stats['trade_count']}  "
+                                 f"({stats['wins']}W / {stats['losses']}L)"),
+        ("Win/Loss Ratio",       wl_ratio_str),
+        ("MAE (Pred vs Actual)", mae_str),
+        ("Calibration Score",    cal_str),
+        ("8-K Parse Failures",   str(stats["parsing_failure_count"])),
+    ]
+    header = f"{'Metric':<{W}}│ Value"
+    sep    = "─" * W + "┼" + "─" * 16
+    body   = "\n".join(f"{label:<{W}}│ {value}" for label, value in rows)
+    table  = f"```\n{header}\n{sep}\n{body}\n```"
+
+    return (
+        f"📊 *NOX WEEKLY PERFORMANCE REPORT*\n"
+        f"────────────────────────\n"
+        f"*Week:* {stats['week_label']}\n\n"
+        + table
+    )
+
+
+def run_weekly_performance_report() -> None:
+    """
+    Build and deliver the weekly performance report via Telegram.
+    smart_split ensures the message never exceeds Telegram's 4096-char cap.
+    """
+    try:
+        logger.info("Weekly performance report building...")
+        stats  = get_weekly_stats()
+        report = format_weekly_report(stats)
+        for chunk in smart_split(report, chars_per_string=4096):
+            bot.send_message(CHAT_ID, chunk, parse_mode="Markdown")
+        logger.info("Weekly performance report delivered.")
+    except Exception as e:
+        logger.error(f"run_weekly_performance_report failed: {e}")
+        try:
+            bot.send_message(CHAT_ID, f"⚠️ Weekly report failed: {e}")
+        except Exception:
+            pass
+
 
 # --- 5.5 MONTHLY TRADING JOURNAL ---
 # Generates a structured markdown report from the SQLite database and writes it
