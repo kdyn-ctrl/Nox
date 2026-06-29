@@ -111,11 +111,7 @@ def example_iv_heatmap():
             filled = int(rank * 20)
             bar = "█" * filled + "░" * (20 - filled)
 
-        # iv_rank may be None (unknown) or absent (error) — only percent-format a
-        # real number, otherwise show a placeholder instead of crashing.
-        rank_val = result.get('iv_rank')
-        rank_str = f"{rank_val:.1%}" if isinstance(rank_val, (int, float)) else "?"
-        print(f"{ticker:6} {bar:24} {rank_str}")
+        print(f"{ticker:6} {bar:24} {result.get('iv_rank', '?'):.1%}")
 
 
 # ============================================================================
@@ -220,6 +216,36 @@ def example_iv_trend():
     print(f"\nTrend: {change:+.1f}% → {trend}")
 
 
+# ============================================================================
+# EXAMPLE 7: IV skew (WS1 Contradiction Vector input)
+# ============================================================================
+def example_iv_skew():
+    """
+    Compute put-vs-call IV skew for a ticker. Positive skew = puts bid up =
+    bearish options positioning; the Contradiction Vector flags bullish text
+    against a bearish skew as a signal to IGNORE.
+    """
+    from heartbeat.monitor import fetch_iv_skew
+
+    ticker = "NVDA"
+    result = fetch_iv_skew(ticker)
+
+    if result.get("method") != "live_chain":
+        print(f"✗ {ticker}: {result.get('error', 'no data')}")
+        return
+
+    skew = result["skew"]
+    direction = (
+        "🔴 BEARISH (puts bid up)" if result["skew_pct"] >= 0.03
+        else "🟢 BULLISH (calls bid up)" if result["skew_pct"] <= -0.03
+        else "⚪ NEUTRAL"
+    )
+    print(f"{ticker} IV Skew:")
+    print(f"  Call IV: {result['call_iv']:.2%}   Put IV: {result['put_iv']:.2%}")
+    print(f"  Skew: {skew:+.4f} ({result['skew_pct']:+.1%})  {direction}")
+    print(f"  Put/Call OI ratio: {result['put_call_oi_ratio']:.2f}")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -230,6 +256,7 @@ if __name__ == "__main__":
         "4": ("IV Rank heatmap", example_iv_heatmap),
         "5": ("IV divergence detection", example_iv_divergence),
         "6": ("IV trend analysis", example_iv_trend),
+        "7": ("IV skew (Contradiction Vector)", example_iv_skew),
     }
 
     if len(sys.argv) > 1:

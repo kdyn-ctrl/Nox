@@ -42,4 +42,7 @@ logs/
 
 # Runtime data
 data/memory_bank.db
-.env
+execution/nox_backtest
+execution/third_party/
+reports/
+/Nox/execution/nox_engine

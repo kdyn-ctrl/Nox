@@ -270,11 +270,9 @@ For an edge you need >52% on ≥50 signals (coin flip is 50%, you need statistic
 cd /root/Nox/execution
 
 # Build the live engine
-# (PositionManager.cpp holds the monitoring-thread implementation, and sqlite3
-#  backs the open-positions store — both are required to link.)
 g++ -std=c++17 -O2 -DCPPHTTPLIB_OPENSSL_SUPPORT -I. \
-    -o nox_engine main.cpp PositionManager.cpp \
-    -lssl -lcrypto -lpthread -lsqlite3
+    -o nox_engine main.cpp \
+    -lssl -lcrypto -lpthread
 
 # Build the backtester
 g++ -std=c++17 -O2 -DCPPHTTPLIB_OPENSSL_SUPPORT -I. \

@@ -6,18 +6,20 @@
 #include "OptionEngine.hpp"
 #include "OptionsSignalTypes.hpp"
 #include "OptionsOrderRouter.hpp"
-#include "PositionManager.hpp"
 #include "../shared/RegimeStateMachine.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -25,11 +27,152 @@
 
 using json = nlohmann::json;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// WS5 — Liquidity Vacuum / Microstructure Gate.
+// ─────────────────────────────────────────────────────────────────────────────
+// Before ANY execution we read the live bid-ask spread. We keep a rolling
+// per-symbol baseline of recent (relative) spreads and abort the trade when the
+// current spread sits more than N standard deviations above that baseline —
+// the fingerprint of a liquidity vacuum (flash move, halt, news gap) where a
+// market order would be filled at a punitive price regardless of how strong the
+// alpha signal is. N and the bypass are .env-configurable.
+//
+// Venue-neutral: callers feed it a spread observed from whatever source they
+// have (Alpaca latest quote on the REST path, IBKR L2 via IBKRClient when the
+// gateway is wired in). The gate only does the statistics + the abort decision.
+namespace nox::liquidity {
+
+struct GateResult {
+    bool        allow   = true;   // false → abort the trade
+    double      spread  = 0.0;    // the observed (relative) spread
+    double      mean    = 0.0;    // baseline mean
+    double      stddev  = 0.0;    // baseline sample stddev
+    double      zscore  = 0.0;    // (spread - mean) / stddev
+    bool        warming = false;  // true while baseline is still filling
+    std::string reason;
+};
+
+class LiquidityGate {
+public:
+    LiquidityGate() { loadConfig(); }
+
+    // Evaluate a freshly observed spread for `symbol` against its rolling
+    // baseline, then record it. The observation is scored BEFORE being added so
+    // a single vacuum spike cannot inflate the baseline it is judged against.
+    GateResult evaluate(const std::string& symbol, double spread) {
+        GateResult r;
+        r.spread = spread;
+        auto& hist = history_[symbol];
+
+        if (bypass_) {
+            r.reason = "gate bypassed (.env)";
+            record(hist, spread);
+            return r;
+        }
+        // A non-positive / invalid spread means we have no usable microstructure
+        // read. Fail OPEN (allow) but flag it — blocking on missing data would
+        // halt all trading whenever a quote feed hiccups.
+        if (spread <= 0.0) {
+            r.reason = "no valid spread read — gate skipped (fail-open)";
+            return r;
+        }
+        if (hist.size() < min_samples_) {
+            r.warming = true;
+            r.reason  = "baseline warming up (" + std::to_string(hist.size()) +
+                        "/" + std::to_string(min_samples_) + " samples)";
+            record(hist, spread);
+            return r;
+        }
+
+        auto [mean, sd] = stats(hist);
+        r.mean   = mean;
+        r.stddev = sd;
+        r.zscore = (sd > 1e-12) ? (spread - mean) / sd : 0.0;
+
+        if (r.zscore > n_stddev_) {
+            r.allow  = false;
+            r.reason = "spread " + num(spread) + " is " + num(r.zscore) +
+                       "σ above baseline mean " + num(mean) +
+                       " (threshold " + num(n_stddev_) + "σ) — liquidity vacuum";
+        } else {
+            r.reason = "spread within " + num(n_stddev_) + "σ of baseline";
+        }
+        record(hist, spread);
+        return r;
+    }
+
+    bool   bypassed()  const { return bypass_; }
+    double threshold() const { return n_stddev_; }
+
+private:
+    void loadConfig() {
+        if (const char* v = std::getenv("LIQUIDITY_GATE_STDDEV")) {
+            try { n_stddev_ = std::stod(v); } catch (...) {}
+        }
+        if (const char* v = std::getenv("LIQUIDITY_GATE_WINDOW")) {
+            try { window_ = std::max<std::size_t>(5, std::stoul(v)); } catch (...) {}
+        }
+        if (const char* v = std::getenv("LIQUIDITY_GATE_MIN_SAMPLES")) {
+            try { min_samples_ = std::max<std::size_t>(3, std::stoul(v)); } catch (...) {}
+        }
+        if (const char* v = std::getenv("LIQUIDITY_GATE_BYPASS")) {
+            std::string s(v);
+            std::transform(s.begin(), s.end(), s.begin(),
+                           [](unsigned char c){ return std::tolower(c); });
+            bypass_ = (s == "true" || s == "1" || s == "yes");
+        }
+    }
+
+    void record(std::deque<double>& h, double spread) {
+        h.push_back(spread);
+        if (h.size() > window_) h.pop_front();
+    }
+
+    static std::pair<double, double> stats(const std::deque<double>& h) {
+        double mean = 0.0;
+        for (double x : h) mean += x;
+        mean /= static_cast<double>(h.size());
+        double var = 0.0;
+        for (double x : h) var += (x - mean) * (x - mean);
+        // Sample variance (n-1) — h.size() >= min_samples_ (>=3) here.
+        var /= static_cast<double>(h.size() - 1);
+        return {mean, std::sqrt(var)};
+    }
+
+    static std::string num(double v) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(4) << v;
+        return oss.str();
+    }
+
+    std::map<std::string, std::deque<double>> history_;
+    double      n_stddev_    = 3.0;  // abort beyond N sigma
+    std::size_t window_      = 50;   // rolling baseline length
+    std::size_t min_samples_ = 10;   // warm-up before the gate is active
+    bool        bypass_      = false;
+};
+
+} // namespace nox::liquidity
+
 namespace nox::options_signal {
 
 // ─── Enumerations ─────────────────────────────────────────────────────────────
 
 enum class DirectionalBias { Bullish, Bearish, Neutral };
+
+// ─── ScoredSignal — internal ranking wrapper ──────────────────────────────────
+// run_scan() collects these, sorts by quality_score descending, then dispatches
+// only the top max_signals_per_scan. The score is venue-agnostic: it measures
+// setup conviction regardless of strategy type.
+struct ScoredSignal {
+    OptionsSignal signal;
+    std::string   formatted_alert;
+    double        quality_score = 0.0;
+    // Raw components (logged for transparency)
+    double sma_distance_atrs = 0.0; // how far price is from SMA20 in ATR units
+    double vol_deviation     = 0.0; // abs(IV/HRV - 1.0)
+    double rsi_extremity     = 0.0; // abs(RSI - 50) / 50
+};
 
 // ─── Structures ───────────────────────────────────────────────────────────────
 
@@ -61,19 +204,26 @@ public:
                            const std::string& apiSec,
                            const std::string& tgToken,
                            const std::string& tgChatId,
-                           RiskProfile        profile,
-                           PositionManager*   position_manager = nullptr)
+                           RiskProfile        profile)
         : alpacaUrl_(alpacaUrl)
         , apiKey_(apiKey)
         , apiSec_(apiSec)
         , tgToken_(tgToken)
         , tgChatId_(tgChatId)
         , profile_(std::move(profile))
-        , position_manager_(position_manager)
     {}
 
     // Entry point — called once per scan cycle from the engine's background thread.
     void run_scan(double live_equity) {
+        // ── Market hours gate ─────────────────────────────────────────────────
+        // Options markets are only open Mon–Fri 9:30–16:00 ET. Scanning on
+        // weekends produces stale signals from Friday's closing data.
+        if (!isMarketHours()) {
+            log("INFO", "[OPTIONS_SCAN][" + profile_.name +
+                "] Outside market hours — scan skipped.");
+            return;
+        }
+
         const auto& watchlist = profile_.watchlist;
         double effective_capital = resolveCapital(live_equity);
         std::string tier         = computeCapitalTier(effective_capital);
@@ -81,9 +231,9 @@ public:
 
         log("INFO", "[OPTIONS_SCAN][" + profile_.name + "] Tier=" + tier +
             " | Capital=$" + fmt(effective_capital, 0) +
-            " | Tickers=" + std::to_string(watchlist.size()));
+            " | Tickers=" + std::to_string(watchlist.size()) +
+            " | MaxSignals=" + std::to_string(profile_.max_signals_per_scan));
 
-        // Fetch macro regime once per scan — reuse for all tickers
         double vix      = fetchVix();
         SpySnapshot spy = fetchSpy();
 
@@ -99,25 +249,77 @@ public:
             vix = 20.0;
         }
 
-        // Fetch earnings calendar once per scan cycle from america-data-engine
         auto earnings_calendar = fetchEarningsCalendar();
 
+        // ── Stage 1: evaluate all tickers, collect scored candidates ──────────
+        std::vector<ScoredSignal> candidates;
         for (const auto& ticker : watchlist) {
             try {
-                // Check if ticker has earnings within 5 days — if so, skip signal generation
                 if (hasEarningsWithin5Days(ticker, earnings_calendar)) {
                     log("INFO", "[OPTIONS_SCAN][EARNINGS_GATE] " + ticker +
-                        " has scheduled earnings within 5 days. Skipping signal generation.");
-                    std::cout << "[EARNINGS_GATE] Excluded: " + ticker + " (earnings window)" << std::endl;
+                        " has earnings within 5 days — skipped.");
                     continue;
                 }
-
-                scanTicker(ticker, effective_capital, tier, fc_mode, vix, spy, regime);
+                auto result = evaluateTicker(ticker, effective_capital, tier,
+                                             fc_mode, vix, spy, regime);
+                if (result) candidates.push_back(std::move(*result));
             } catch (const std::exception& e) {
                 log("WARN", "[OPTIONS_SCAN] Exception on " + ticker + ": " + e.what());
             }
-            // Brief pause between tickers to avoid rate limits
             std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        }
+
+        if (candidates.empty()) {
+            log("INFO", "[OPTIONS_SCAN][" + profile_.name +
+                "] No qualifying setups this cycle.");
+            return;
+        }
+
+        // ── Stage 2: rank by quality, dispatch top max_signals_per_scan ───────
+        std::sort(candidates.begin(), candidates.end(),
+            [](const ScoredSignal& a, const ScoredSignal& b) {
+                return a.quality_score > b.quality_score;
+            });
+
+        int limit      = profile_.max_signals_per_scan;
+        int dispatched = 0;
+
+        for (const auto& sc : candidates) {
+            if (dispatched >= limit) break;
+            sendTelegram(sc.formatted_alert);
+            // WS5 — microstructure gate. The advisory alert always goes out, but
+            // AUTO-EXECUTION is aborted when the live spread signals a liquidity
+            // vacuum. A great setup filled into a vacuum is a losing trade.
+            if (profile_.auto_execute) {
+                double rel_spread = fetchUnderlyingSpread(sc.signal.underlying);
+                auto gate = liquidity_gate_.evaluate(sc.signal.underlying, rel_spread);
+                if (!gate.allow) {
+                    log("WARN", "[OPTIONS_EXEC][LIQUIDITY_GATE] " + sc.signal.underlying +
+                        " execution aborted — " + gate.reason);
+                    sendTelegram(
+                        "🛑 *LIQUIDITY GATE — " + sc.signal.underlying + "*\n"
+                        "────────────────────────\n"
+                        "Auto-execution aborted: " + gate.reason + ".\n"
+                        "_Advisory signal still valid — review manually._"
+                    );
+                    dispatched++;  // counts against the cap; alert was dispatched
+                    continue;
+                }
+                executeSignal(sc.signal);
+            }
+            log("INFO", "[OPTIONS_SCAN] Dispatched #" + std::to_string(dispatched + 1) +
+                ": " + sc.signal.underlying + " / " + sc.signal.strategy +
+                " | score=" + fmt(sc.quality_score, 2) +
+                " (SMA=" + fmt(sc.sma_distance_atrs, 1) + "xATR" +
+                " vol=" + fmt(sc.vol_deviation * 100.0, 0) + "%" +
+                " RSI=" + fmt(sc.signal.rsi, 0) + ")");
+            dispatched++;
+        }
+
+        int suppressed = static_cast<int>(candidates.size()) - dispatched;
+        if (suppressed > 0) {
+            log("INFO", "[OPTIONS_SCAN][" + profile_.name + "] " +
+                std::to_string(suppressed) + " lower-quality setup(s) suppressed by cap.");
         }
     }
 
@@ -130,11 +332,7 @@ private:
     std::string tgChatId_;
     RiskProfile profile_;
     RegimeStateMachine regimeMachine_;
-    // Non-owning handle to the engine's PositionManager. When auto-execute places
-    // a real single-leg order, the filled position is recorded here so the
-    // monitoring thread can manage its profit-target / stop / DTE exits. Null in
-    // advisory-only contexts (e.g. the personal profile or the backtester).
-    PositionManager* position_manager_ = nullptr;
+    nox::liquidity::LiquidityGate liquidity_gate_; // WS5 microstructure gate
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -146,19 +344,6 @@ private:
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(decimals) << v;
         return oss.str();
-    }
-
-    // Serial day count (days since 1970-01-01) for a civil Y-M-D date.
-    // Howard Hinnant's algorithm — exact across month/year boundaries, so the
-    // earnings gate measures real calendar distance instead of the old ±1000
-    // cross-year approximation that silently failed near year-end.
-    static long civilDays(int y, int m, int d) {
-        y -= m <= 2;
-        const long era = (y >= 0 ? y : y - 399) / 400;
-        const unsigned yoe = static_cast<unsigned>(y - era * 400);
-        const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-        const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        return era * 146097L + static_cast<long>(doe) - 719468L;
     }
 
     // ── Capital / tier logic ──────────────────────────────────────────────────
@@ -210,6 +395,80 @@ private:
         }
         if (r == Regime::TRANSITION) return 0.65;
         return 1.0; // RISK_ON
+    }
+
+    // ── Market hours gate ─────────────────────────────────────────────────────
+    // Returns true Mon–Fri between 09:00 and 16:00 ET (approximate DST handling).
+    // Prevents stale weekend / after-hours signals from firing.
+    static bool isMarketHours() {
+        auto now    = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm utc{};
+        gmtime_r(&time_t, &utc);
+
+        if (utc.tm_wday == 0 || utc.tm_wday == 6) return false; // Sat/Sun
+
+        // Approximate ET offset: Apr(3)–Oct(9) = UTC-4 (EDT), else UTC-5 (EST)
+        int offset_h = (utc.tm_mon >= 3 && utc.tm_mon <= 9) ? 4 : 5;
+        int et_mins  = ((utc.tm_hour - offset_h + 24) % 24) * 60 + utc.tm_min;
+
+        return et_mins >= 9 * 60 && et_mins < 16 * 60;
+    }
+
+    // ── Signal quality score ──────────────────────────────────────────────────
+    // Combines three independent conviction signals into a single rank value.
+    // Higher = stronger setup. Used to pick the best N per scan cycle.
+    static ScoredSignal scoreSignal(const OptionsSignal& sig,
+                                    const std::string& formatted_alert,
+                                    const UnderlyingData& d) {
+        ScoredSignal sc;
+        sc.signal          = sig;
+        sc.formatted_alert = formatted_alert;
+        sc.sma_distance_atrs = (d.atr14 > 0)
+            ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
+        sc.vol_deviation   = (sig.hrv30 > 0.01)
+            ? std::abs(sig.iv_level / sig.hrv30 - 1.0) : 0.0;
+        sc.rsi_extremity   = std::abs(sig.rsi - 50.0) / 50.0;
+        // Weights: trend conviction matters most, vol signal second, RSI third
+        sc.quality_score   = sc.sma_distance_atrs * 0.50
+                           + sc.vol_deviation      * 0.30
+                           + sc.rsi_extremity      * 0.20;
+        return sc;
+    }
+
+    // ── Market data: live bid-ask spread (WS5 liquidity gate input) ────────────
+    //
+    // Returns the underlying's RELATIVE spread (ask-bid)/mid from Alpaca's latest
+    // quote, or -1.0 on any failure. Relative (not absolute) so the rolling
+    // baseline is scale-free and comparable across symbols and price levels.
+    // The underlying's spread is a clean liquidity proxy: a vacuum in the stock
+    // implies punitive option fills too. IBKR L2 is the richer source when wired.
+    double fetchUnderlyingSpread(const std::string& symbol) const {
+        try {
+            httplib::Client cli("https://data.alpaca.markets");
+            cli.set_connection_timeout(std::chrono::seconds(5));
+            cli.set_read_timeout(std::chrono::seconds(10));
+
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID",     apiKey_},
+                {"APCA-API-SECRET-KEY", apiSec_}
+            };
+
+            std::string path = "/v2/stocks/" + symbol + "/quotes/latest?feed=iex";
+            auto res = cli.Get(path.c_str(), headers);
+            if (!res || res->status != 200) return -1.0;
+
+            auto body = json::parse(res->body);
+            const auto& q = body.at("quote");
+            double bid = q.value("bp", 0.0);
+            double ask = q.value("ap", 0.0);
+            if (bid <= 0.0 || ask <= 0.0 || ask < bid) return -1.0;
+
+            double mid = (ask + bid) / 2.0;
+            return (mid > 0.0) ? (ask - bid) / mid : -1.0;
+        } catch (...) {
+            return -1.0;
+        }
     }
 
     // ── Market data: VIX ──────────────────────────────────────────────────────
@@ -341,28 +600,49 @@ private:
             return false; // No earnings found for this ticker
         }
 
-        // Get today's date in UTC. gmtime_r is the reentrant POSIX variant —
-        // std::gmtime returns a shared static tm that the two concurrent profile
-        // scan threads (bot + personal) would race on.
+        // Get today's date (system local time, converted to YYYY-MM-DD string)
         auto now = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
-        std::tm tm_buf{};
-        gmtime_r(&time_t, &tm_buf);
-        int today_year  = tm_buf.tm_year + 1900;
-        int today_month = tm_buf.tm_mon + 1;
-        int today_day   = tm_buf.tm_mday;
-        long today_serial = civilDays(today_year, today_month, today_day);
+        std::tm* gm_time = std::gmtime(&time_t);
+
+        std::ostringstream oss;
+        oss << std::put_time(gm_time, "%Y-%m-%d");
+        std::string today_str = oss.str();
+
+        // Parse today's date
+        int today_year, today_month, today_day;
+        std::sscanf(today_str.c_str(), "%d-%d-%d", &today_year, &today_month, &today_day);
 
         // Check each earnings event for this ticker
         for (const auto& event : it->second) {
             int event_year, event_month, event_day;
-            if (std::sscanf(event.date.c_str(), "%d-%d-%d",
-                            &event_year, &event_month, &event_day) != 3) {
-                continue; // unparseable date — skip rather than misfire the gate
-            }
+            std::sscanf(event.date.c_str(), "%d-%d-%d", &event_year, &event_month, &event_day);
 
-            // Exact calendar-day distance (works across month/year boundaries).
-            long days_diff = civilDays(event_year, event_month, event_day) - today_serial;
+            // Simple date comparison: convert both to day-of-year for same year, else compare years
+            auto days_until_event = [](int y1, int m1, int d1, int y2, int m2, int d2) -> long {
+                // Count days from date1 to date2
+                // This is a simplified comparison — proper implementation would use chrono
+                if (y1 != y2) {
+                    return y2 > y1 ? 1000 : -1000; // Different years, approximate
+                }
+
+                // Same year: convert month/day to day-of-year
+                int days_in_month[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+                if ((y1 % 4 == 0 && y1 % 100 != 0) || (y1 % 400 == 0)) {
+                    days_in_month[2] = 29; // Leap year
+                }
+
+                int doy1 = d1;
+                for (int i = 1; i < m1; ++i) doy1 += days_in_month[i];
+
+                int doy2 = d2;
+                for (int i = 1; i < m2; ++i) doy2 += days_in_month[i];
+
+                return static_cast<long>(doy2 - doy1);
+            };
+
+            long days_diff = days_until_event(today_year, today_month, today_day,
+                                               event_year, event_month, event_day);
 
             // Earnings within 5 days (inclusive of today)
             if (days_diff >= 0 && days_diff <= 5) {
@@ -757,13 +1037,7 @@ private:
         OptionGreeks g1 = compute_greeks(primary);
 
         double max_risk   = computeMaxRisk(allocated_capital, tier);
-        // Guard against a near-zero Black-Scholes premium (deep-OTM strike or
-        // degenerate inputs): dividing max_risk by ~0 would yield an astronomical
-        // contract count and overflow the displayed risk/reward figures.
-        double premium_per_contract = g1.price * 100.0;
-        double contracts  = (premium_per_contract > 1.0)
-                            ? std::max(1.0, std::floor(max_risk / premium_per_contract))
-                            : 1.0;
+        double contracts  = std::max(1.0, std::floor(max_risk / (g1.price * 100.0)));
 
         // Per-contract P&L geometry
         if (strategy == "LONG_CALL" || strategy == "LONG_PUT") {
@@ -941,7 +1215,8 @@ private:
             " | ATR(14): $" + fmt(s.atr) + "\n"
             "\n🌐 *Macro Regime:* " + regime.log_message + " " + regime_emoji +
             " (VIX " + fmt(vix, 1) + ")\n"
-            "🎯 *Signal Confidence:* " + std::to_string(conf_pct) + "%\n"
+            "🌡️ *Regime Clearance:* " + std::to_string(conf_pct) + "% "
+                "(100=RISK_ON · 65=TRANSITION · 0=RISK_OFF)\n"
             "\n📋 _" + s.rationale + "_" +
             fc_footer + "\n"
             "⚠️ _Advisory only — manual execution required._";
@@ -973,83 +1248,74 @@ private:
         }
     }
 
-    // ── Per-ticker scan orchestrator ──────────────────────────────────────────
+    // ── Per-ticker evaluator — returns scored signal or nullopt if no setup ───
 
-    void scanTicker(const std::string& ticker,
-                    double effective_capital, const std::string& tier, bool fc_mode,
-                    double vix, const SpySnapshot& spy,
-                    const AllocationStrategy& regime)
+    std::optional<ScoredSignal> evaluateTicker(
+        const std::string& ticker,
+        double effective_capital, const std::string& tier, bool fc_mode,
+        double vix, const SpySnapshot& spy,
+        const AllocationStrategy& regime)
     {
         log("INFO", "[OPTIONS_SCAN] Scanning " + ticker + "...");
 
         UnderlyingData d = fetchUnderlyingBars(ticker);
         if (!d.valid) {
             log("WARN", "[OPTIONS_SCAN] No bar data for " + ticker + " — skipping.");
-            return;
+            return std::nullopt;
         }
 
         IVData iv_data  = fetchIVData(ticker, vix, d.hrv30);
         double iv_rank  = iv_data.iv_rank;
-        double iv_sigma = iv_data.iv_level; // actual market IV — use directly in BS
-
-        double rfr = 0.05; // US risk-free rate (approximate)
+        double iv_sigma = iv_data.iv_level;
+        double rfr      = 0.05;
 
         DirectionalBias bias     = computeBias(d);
         std::string     strategy = selectStrategy(bias, iv_rank, iv_sigma, d.hrv30, tier);
 
-        double conf = regimeConfidence(regime.current_regime, strategy);
-        if (conf < 1e-6) {
+        double regime_clearance = regimeConfidence(regime.current_regime, strategy);
+        if (regime_clearance < 1e-6) {
             log("INFO", "[OPTIONS_SCAN] " + ticker + " / " + strategy +
                 " suppressed by RISK_OFF regime.");
-            return;
+            return std::nullopt;
+        }
+
+        // Setup quality gate — requires at least one of:
+        //   A) Price ≥1.0×ATR from SMA20 (clear trend conviction)
+        //   B) IV deviates ≥30% from HRV (strong vol signal)
+        //   C) RSI ≤35 or ≥68 (clear momentum extreme)
+        {
+            double sma_atrs  = (d.atr14 > 0) ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
+            bool strong_trend = sma_atrs >= 1.0;
+            bool strong_vol   = (d.hrv30 > 0.01) &&
+                                (iv_sigma > d.hrv30 * 1.30 || iv_sigma < d.hrv30 * 0.80);
+            bool rsi_extreme  = d.rsi14 <= 35.0 || d.rsi14 >= 68.0;
+            bool clear_bias   = (bias != DirectionalBias::Neutral);
+
+            if (!strong_trend && !strong_vol && !rsi_extreme && !clear_bias) {
+                log("INFO", "[OPTIONS_SCAN] " + ticker +
+                    " — no qualifying setup (SMA=" + fmt(sma_atrs, 2) +
+                    "xATR RSI=" + fmt(d.rsi14, 1) + "). Skipped.");
+                return std::nullopt;
+            }
         }
 
         ContractParams cp = buildContractParams(strategy, d.price, d.atr14, rfr, iv_sigma);
         if (cp.strike <= 0.0) {
             log("WARN", "[OPTIONS_SCAN] Could not determine valid strike for " + ticker);
-            return;
+            return std::nullopt;
         }
 
         OptionsSignal sig = assembleSignal(ticker, d, strategy, cp,
-                                           iv_rank, iv_sigma, rfr, conf,
-                                           tier, fc_mode, effective_capital,
-                                           d.hrv30);
+                                           iv_rank, iv_sigma, rfr, regime_clearance,
+                                           tier, fc_mode, effective_capital, d.hrv30);
 
         std::string alert = formatAlert(sig, vix, regime);
-        sendTelegram(alert);
-        log("INFO", "[OPTIONS_SCAN] Signal emitted: " + ticker + " / " + strategy +
-            " | conf=" + fmt(conf * 100.0, 0) + "%");
-
-        if (profile_.auto_execute) {
-            executeSignal(sig);
-        }
+        return scoreSignal(sig, alert, d);
     }
 
     // ── Live order execution via OptionsOrderRouter ───────────────────────────
 
     void executeSignal(const OptionsSignal& sig) const {
-        // Auto-execute is restricted to single-leg strategies. The position
-        // monitor can only price/manage single-leg "long" and "short_premium"
-        // positions, so auto-placing a multi-leg order would leave it unmanaged
-        // (no profit-target / stop / DTE exit). Such signals remain advisory:
-        // the Telegram alert already fired in scanTicker — execute manually.
-        const bool is_single_leg =
-            (sig.strategy == "LONG_CALL" || sig.strategy == "LONG_PUT" ||
-             sig.strategy == "CSP"       || sig.strategy == "CC");
-        if (!is_single_leg) {
-            log("WARN", "[OPTIONS_EXEC] Auto-execute skipped for multi-leg strategy " +
-                sig.strategy + " on " + sig.underlying +
-                " — advisory only (monitor cannot yet manage multi-leg). Execute manually.");
-            sendTelegram(
-                "⚠️ *AUTO-EXECUTE SKIPPED (multi-leg) — " + sig.underlying + "*\n"
-                "────────────────────────\n"
-                "• *Strategy:* " + sig.strategy + "\n"
-                "_Multi-leg positions aren't auto-managed yet. Signal is advisory —"
-                " execute manually if you want it._"
-            );
-            return;
-        }
-
         nox::options_router::OptionsOrderRouter router(alpacaUrl_, apiKey_, apiSec_);
 
         // Covered calls require 100 shares per contract as collateral.
@@ -1075,7 +1341,6 @@ private:
 
         if (result.success) {
             log("INFO", "[OPTIONS_EXEC] Order placed — " + result.message);
-            recordExecutedPosition(sig);
             sendTelegram(
                 "✅ *OPTIONS ORDER PLACED*\n"
                 "────────────────────────\n"
@@ -1094,54 +1359,6 @@ private:
                 "• *Strategy:* " + sig.strategy + "\n"
                 "• *Reason:* `" + result.message + "`"
             );
-        }
-    }
-
-    // Persists a freshly executed position into the PositionManager so the
-    // monitoring thread will apply the profit-target / stop / DTE exit rules.
-    // The monitor only understands single-leg "long" and "short_premium"
-    // positions, so multi-leg strategies are logged as unmanaged rather than
-    // recorded with a single-leg basis that the monitor would mis-close.
-    void recordExecutedPosition(const OptionsSignal& sig) const {
-        if (!position_manager_) return;
-
-        std::string profile_type;
-        if (sig.strategy == "LONG_CALL" || sig.strategy == "LONG_PUT") {
-            profile_type = "long";
-        } else if (sig.strategy == "CSP" || sig.strategy == "CC") {
-            profile_type = "short_premium";
-        } else {
-            log("WARN", "[OPTIONS_EXEC] " + sig.strategy + " on " + sig.underlying +
-                " is multi-leg — not tracked by the single-leg position monitor. "
-                "Manage manually.");
-            return;
-        }
-
-        std::string option_type =
-            (sig.option_type == nox::options::OptionType::Call) ? "call" : "put";
-
-        // Entry date (UTC, YYYY-MM-DD) — gmtime_r for thread safety.
-        auto now    = std::chrono::system_clock::now();
-        auto now_tt = std::chrono::system_clock::to_time_t(now);
-        std::tm tm_buf{};
-        gmtime_r(&now_tt, &tm_buf);
-        std::ostringstream date_oss;
-        date_oss << std::put_time(&tm_buf, "%Y-%m-%d");
-
-        try {
-            position_manager_->add_position(
-                sig.underlying,
-                option_type,
-                sig.strike,
-                profile_.qty_contracts,
-                sig.entry_price,
-                date_oss.str(),
-                profile_type,
-                sig.expiry_date);
-            log("INFO", "[OPTIONS_EXEC] Recorded " + profile_type + " position for " +
-                sig.underlying + " — now under monitor management.");
-        } catch (const std::exception& e) {
-            log("WARN", std::string("[OPTIONS_EXEC] Failed to record position: ") + e.what());
         }
     }
 };

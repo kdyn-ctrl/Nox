@@ -15,6 +15,14 @@
 #include <map>
 #include <mutex>
 #include <fstream>
+#include <deque>
+
+// ── IBKR execution path (compile with -DIBKR_ENABLED and TWS API on include path) ──
+// Vendor TWS API: run execution/setup_ibkr_vendor.sh to download and unpack
+// the IBKR C++ source under third_party/twsapi/source/cppclient/client/.
+#ifdef IBKR_ENABLED
+#include "IBKROrderRouter.hpp"
+#endif
 
 using json = nlohmann::json;
 
@@ -180,13 +188,51 @@ private:
     RegimeStateMachine regimeMachine;
     std::string last_analyst_report_time;
 
+    // WS5 — pre-execution microstructure gate (rolling per-symbol spread baseline)
+    nox::liquidity::LiquidityGate liquidity_gate_;
+
     // Position Manager (for options)
     std::unique_ptr<PositionManager> positionManager_;
 
-    // Options signal generator profiles (configured in the ctor, consumed by run()).
+    // Options signal scanner profiles (configured from env vars in the constructor)
     nox::options_signal::RiskProfile optionsBotProfile_;
     nox::options_signal::RiskProfile optionsPersonalProfile_;
 
+    // ── Inbound signal log (last 50 authenticated signals, newest at back) ─────
+    struct SignalLogEntry {
+        std::string received_at;
+        std::string ticker;
+        std::string action;
+        double price = 0.0;
+        double rsi   = 0.0;
+        double vix   = 0.0;
+    };
+    std::deque<SignalLogEntry> signal_log_;
+    std::mutex                 signal_log_mutex_;
+    static constexpr std::size_t SIGNAL_LOG_MAX = 50;
+
+    void record_signal(const TradeSignal& s) {
+        auto now    = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm_buf{};
+        std::ostringstream ts;
+        ts << std::put_time(::gmtime_r(&time_t, &tm_buf), "%Y-%m-%dT%H:%M:%SZ");
+        std::lock_guard<std::mutex> lock(signal_log_mutex_);
+        signal_log_.push_back({ts.str(), s.ticker, s.action, s.price, s.rsi, s.vix});
+        if (signal_log_.size() > SIGNAL_LOG_MAX)
+            signal_log_.pop_front();
+    }
+
+    // ── IBKR execution venue (compiled in only when IBKR_ENABLED is defined) ───
+    // Set EXECUTION_VENUE=ibkr in the environment to activate. Defaults to alpaca.
+    // Requires IB Gateway (paper port 4002 / live port 4001) reachable on the
+    // Docker network.
+#ifdef IBKR_ENABLED
+    std::string execution_venue_;
+    std::unique_ptr<nox::ibkr::IBKRWrapper>     ibkr_wrapper_;
+    std::unique_ptr<nox::ibkr::IBKRConnection>  ibkr_conn_;
+    std::unique_ptr<nox::ibkr::IBKROrderRouter> ibkr_router_;
+#endif
 
     // CN-RULE-002: T+1 position state — maps ticker → entry date.
     // Written on confirmed BUY, read & evicted on confirmed SELL.
@@ -311,6 +357,34 @@ private:
         return -1.0; // sentinel: caller must abort the trade
     }
 
+    // WS5 — read the live RELATIVE bid-ask spread (ask-bid)/mid for an equity
+    // from Alpaca's latest quote. Returns -1.0 on failure; the gate fails open
+    // on -1.0 so a transient quote-feed hiccup never halts all trading.
+    double fetch_equity_spread(const std::string& symbol) const {
+        try {
+            httplib::Client cli("https://data.alpaca.markets");
+            cli.set_connection_timeout(std::chrono::seconds(5));
+            cli.set_read_timeout(std::chrono::seconds(10));
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID", apiKey},
+                {"APCA-API-SECRET-KEY", apiSec}
+            };
+            std::string path = "/v2/stocks/" + symbol + "/quotes/latest?feed=iex";
+            auto res = cli.Get(path.c_str(), headers);
+            if (!res || res->status != 200) return -1.0;
+
+            auto body = json::parse(res->body);
+            const auto& q = body.at("quote");
+            double bid = q.value("bp", 0.0);
+            double ask = q.value("ap", 0.0);
+            if (bid <= 0.0 || ask <= 0.0 || ask < bid) return -1.0;
+            double mid = (ask + bid) / 2.0;
+            return (mid > 0.0) ? (ask - bid) / mid : -1.0;
+        } catch (...) {
+            return -1.0;
+        }
+    }
+
     void process(TradeSignal sig) {
         // Skip processing if the action is HOLD or a REPORT audit payload
         if (sig.action == "HOLD" || sig.action == "REPORT") {
@@ -361,6 +435,41 @@ private:
             }
 
             Logger::log("INFO", "[EXECUTION] SELL signal for " + sig.ticker + ". Closing position.");
+#ifdef IBKR_ENABLED
+            if (execution_venue_ == "ibkr") {
+                Contract stock;
+                stock.symbol   = sig.ticker;
+                stock.secType  = "STK";
+                stock.exchange = "SMART";
+                stock.currency = "USD";
+
+                Order mkt_order;
+                mkt_order.action        = "SELL";
+                mkt_order.orderType     = "MKT";
+                mkt_order.totalQuantity = 0;  // 0 = liquidate full position via IBKR
+                // IBKR does not have a "close all" API like Alpaca's DELETE /positions.
+                // totalQuantity=0 is invalid — the operator must track qty or query positions.
+                // For now we log a warning and Telegram-alert for manual action.
+                Logger::log("WARN",
+                    "[IBKR] SELL routed to IBKR: qty unknown without position query. "
+                    "Manual review required to confirm close.");
+                TelegramNotifier::sendMessage(
+                    "⚠️ *IBKR SELL — Manual Action Required*\n"
+                    "────────────────────────\n"
+                    "• *Ticker:* " + sig.ticker + "\n"
+                    "• IBKR lacks a liquidate-all REST API. Log into TWS/Gateway and\n"
+                    "  close the position manually, or implement a position query to get qty."
+                );
+
+                // Evict T+1 record regardless.
+                {
+                    std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                    china_positions_.erase(sig.ticker);
+                    persist_china_positions_locked();
+                }
+                return;
+            }
+#endif
             try {
                 httplib::Client alpaca_cli(alpacaBaseUrl);
                 // RULE-008: Strict timeout handling
@@ -572,6 +681,72 @@ private:
                 return;
             }
 
+            // WS5 — Liquidity Vacuum / Microstructure Gate (Physical Hard Gate).
+            // The final check before any order leaves the building: read the live
+            // bid-ask spread and abort if it is N standard deviations above the
+            // rolling baseline — a market order into a vacuum fills at a punitive
+            // price regardless of signal strength. Bypassable only via .env.
+            {
+                double rel_spread = fetch_equity_spread(sig.ticker);
+                auto gate = liquidity_gate_.evaluate(sig.ticker, rel_spread);
+                if (!gate.allow) {
+                    Logger::log("CRITICAL",
+                        "[WS5][LIQUIDITY_GATE] " + sig.ticker +
+                        " order aborted — " + gate.reason);
+                    TelegramNotifier::sendMessage(
+                        "🛑 *LIQUIDITY GATE — " + sig.ticker + "*\n"
+                        "────────────────────────\n"
+                        "• *Spread z-score:* " + std::to_string(gate.zscore) + "σ\n"
+                        "• *Threshold:* " + std::to_string(liquidity_gate_.threshold()) + "σ\n"
+                        "⛔ Liquidity vacuum detected between sizing and submission.\n"
+                        "Order aborted to avoid punitive fill."
+                    );
+                    return;
+                }
+            }
+
+#ifdef IBKR_ENABLED
+            // ── IBKR equity BUY path ────────────────────────────────────────────
+            if (execution_venue_ == "ibkr") {
+                // Route a plain equity (stock) market buy via IBKR.
+                // Options routing goes through IBKROrderRouter::route(OptionsSignal).
+                // Webhook BUY signals are stock orders — construct a stock Contract.
+                Contract stock;
+                stock.symbol   = sig.ticker;
+                stock.secType  = "STK";
+                stock.exchange = "SMART";
+                stock.currency = "USD";
+
+                Order mkt_order;
+                mkt_order.action        = "BUY";
+                mkt_order.orderType     = "MKT";
+                mkt_order.totalQuantity = static_cast<double>(qty);
+                mkt_order.tif           = "DAY";
+
+                OrderId oid = ibkr_wrapper_->reserveOrderId();
+                ibkr_conn_->placeOrder(oid, stock, mkt_order);
+
+                Logger::log("INFO", "[IBKR] BUY order placed: " + sig.ticker +
+                            " qty=" + std::to_string(qty) + " orderId=" + std::to_string(oid));
+                TelegramNotifier::sendMessage(
+                    "🟢 *BUY ORDER → IBKR*\n"
+                    "────────────────────────\n"
+                    "• *Ticker:* " + sig.ticker + "\n"
+                    "• *Qty:* " + std::to_string(qty) + " shares\n"
+                    "• *IBKR OrderId:* `" + std::to_string(oid) + "`"
+                );
+
+                // Record T+1 entry date for CN-RULE-002 enforcement.
+                {
+                    std::string entry_date = sig.trade_date.empty()
+                        ? get_today_date_string() : sig.trade_date;
+                    std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                    china_positions_[sig.ticker] = ChinaPositionRecord{entry_date};
+                    persist_china_positions_locked();
+                }
+                return;
+            }
+#endif
             try {
                 httplib::Client alpaca_cli(alpacaBaseUrl);
                 // RULE-008: Strict timeout handling
@@ -773,11 +948,12 @@ public:
         Logger::log("INFO", "[CN-RULE-001] Board-lot size: " + std::to_string(cnBoardLotSize) + " shares.");
 
         // CN-RULE-002: Path for T+1 position persistence file.
-        // Override with CN_POSITIONS_PATH env var, default to /tmp/china_positions.json.
+        // Override with CN_POSITIONS_PATH env var, default to /app/data (volume-mounted).
+        // /tmp is ephemeral in Docker; losing state mid-day would clear the T+1 sell gate.
         const char* pos_path_env = std::getenv("CN_POSITIONS_PATH");
         cnPositionsPath = (pos_path_env && std::string(pos_path_env) != "")
             ? std::string(pos_path_env)
-            : "/tmp/china_positions.json";
+            : "/app/data/china_positions.json";
         Logger::log("INFO", "[CN-RULE-002] T+1 positions persistence path: " + cnPositionsPath);
         load_china_positions();
 
@@ -823,6 +999,8 @@ public:
                 envInt("OPTIONS_BOT_QTY_CONTRACTS", 1);
             optionsBotProfile_.free_capital_amount =
                 envDbl("OPTIONS_BOT_FREE_CAPITAL_AMOUNT", 0.0);
+            optionsBotProfile_.max_signals_per_scan =
+                envInt("OPTIONS_BOT_MAX_SIGNALS", 3);
 
             // ── PERSONAL profile — high-risk-tolerance advisory signals ────────
             optionsPersonalProfile_ = nox::options_signal::RiskProfile::personal();
@@ -835,6 +1013,8 @@ public:
                 envInt("OPTIONS_PERSONAL_QTY_CONTRACTS", 1);
             optionsPersonalProfile_.free_capital_amount =
                 envDbl("OPTIONS_PERSONAL_FREE_CAPITAL_AMOUNT", 0.0);
+            optionsPersonalProfile_.max_signals_per_scan =
+                envInt("OPTIONS_PERSONAL_MAX_SIGNALS", 2);
 
             Logger::log("INFO", "[OPTIONS_SIGNAL] BOT profile: AutoExecute="
                 + std::string(optionsBotProfile_.auto_execute ? "ON" : "OFF (advisory)")
@@ -851,19 +1031,68 @@ public:
 
         // Initialize and start the Position Manager
         try {
-            // NOTE: This assumes OptionsOrderRouter can be instantiated here.
-            // In a larger system, this might be injected or retrieved from a service locator.
             auto order_router = std::make_shared<nox::options_router::OptionsOrderRouter>(
                 alpacaBaseUrl, apiKey, apiSec
             );
-            positionManager_ = std::make_unique<PositionManager>("./memory_bank.db", *order_router);
+            // MEMORY_BANK_PATH must point to the volume-mounted data directory so the
+            // options position DB survives container restarts. Default: /app/data.
+            const char* mb_env = std::getenv("MEMORY_BANK_PATH");
+            std::string memory_bank_path = (mb_env && std::string(mb_env) != "")
+                ? std::string(mb_env)
+                : "/app/data/memory_bank.db";
+            positionManager_ = std::make_unique<PositionManager>(memory_bank_path, *order_router);
             positionManager_->start_monitoring();
             Logger::log("INFO", "[POS_MANAGER] Position Manager initialized and monitoring thread started.");
         } catch (const std::exception& e) {
-            std::cerr << "[FATAL] [POS_MANAGER] Failed to initialize Position Manager: " 
+            std::cerr << "[FATAL] [POS_MANAGER] Failed to initialize Position Manager: "
                       << e.what() << ". Refusing to start." << std::endl;
             std::exit(1);
         }
+
+#ifdef IBKR_ENABLED
+        // ── IBKR venue initialisation ─────────────────────────────────────────
+        {
+            const char* venue_env = std::getenv("EXECUTION_VENUE");
+            execution_venue_ = (venue_env && std::string(venue_env) == "ibkr") ? "ibkr" : "alpaca";
+            Logger::log("INFO", "[VENUE] Execution venue: " + execution_venue_);
+
+            if (execution_venue_ == "ibkr") {
+                const char* host_env = std::getenv("IBKR_GATEWAY_HOST");
+                const char* port_env = std::getenv("IBKR_GATEWAY_PORT");
+                std::string host = host_env ? host_env : "127.0.0.1";
+                int         port = port_env ? std::stoi(port_env) : 4002; // 4002=paper, 4001=live
+
+                ibkr_wrapper_ = std::make_unique<nox::ibkr::IBKRWrapper>();
+                ibkr_conn_    = std::make_unique<nox::ibkr::IBKRConnection>(*ibkr_wrapper_);
+
+                if (!ibkr_conn_->connect(host.c_str(), port)) {
+                    std::cerr << "[FATAL] [IBKR] Failed to connect to IB Gateway at "
+                              << host << ":" << port << std::endl;
+                    std::exit(1);
+                }
+
+                // Wait up to 5 s for nextValidId handshake.
+                int waited = 0;
+                while (!ibkr_wrapper_->hasValidOrderId() && ++waited < 100)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+                if (!ibkr_wrapper_->hasValidOrderId()) {
+                    std::cerr << "[FATAL] [IBKR] Timed out waiting for nextValidId from gateway.\n";
+                    std::exit(1);
+                }
+
+                ibkr_router_ = std::make_unique<nox::ibkr::IBKROrderRouter>(*ibkr_conn_, *ibkr_wrapper_);
+                Logger::log("INFO", "[IBKR] Gateway handshake complete — IBKR execution active.");
+                TelegramNotifier::sendMessage(
+                    "🔌 *IBKR Gateway Connected*\n"
+                    "────────────────────────\n"
+                    "• *Host:* " + host + ":" + std::to_string(port) + "\n"
+                    "• *Venue:* Interactive Brokers (paper)\n"
+                    "• *Status:* nextValidId received — ready to route orders."
+                );
+            }
+        }
+#endif
 
     }
 
@@ -880,6 +1109,24 @@ public:
                 {"last_analyst_report", last_analyst_report_time.empty() ? "Never" : last_analyst_report_time}
             };
             res.set_content(response.dump(), "application/json");
+        });
+
+        // Returns the last 50 authenticated signals received by the webhook.
+        // Used by the heartbeat /signals Telegram command to verify signal flow.
+        svr.Get("/recent-signals", [this](const httplib::Request&, httplib::Response& res) {
+            std::lock_guard<std::mutex> lock(signal_log_mutex_);
+            json arr = json::array();
+            for (const auto& e : signal_log_) {
+                arr.push_back({
+                    {"received_at", e.received_at},
+                    {"ticker",      e.ticker},
+                    {"action",      e.action},
+                    {"price",       e.price},
+                    {"rsi",         e.rsi},
+                    {"vix",         e.vix}
+                });
+            }
+            res.set_content(arr.dump(), "application/json");
         });
 
         svr.Post("/options/price", [](const httplib::Request& req, httplib::Response& res) {
@@ -1006,6 +1253,7 @@ public:
                     }
 
                     Logger::log("INFO", "Signal Parsed successfully: " + signal.action + " " + signal.ticker);
+                    record_signal(signal);
 
                     // Fast path for analyst audit reports: acknowledge immediately
                     // so the caller does not time out waiting on downstream network
@@ -1018,8 +1266,9 @@ public:
                         if (signal.ticker == "GLOBAL_AUDIT") {
                             auto now = std::chrono::system_clock::now();
                             auto time_t = std::chrono::system_clock::to_time_t(now);
+                            std::tm tm_buf{};
                             std::stringstream ss;
-                            ss << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%SZ");
+                            ss << std::put_time(::gmtime_r(&time_t, &tm_buf), "%Y-%m-%dT%H:%M:%SZ");
                             last_analyst_report_time = ss.str();
                         }
                         success_count++;
@@ -1075,8 +1324,7 @@ public:
                 std::string tg_chat  = std::getenv("TELEGRAM_CHAT_ID")   ? std::getenv("TELEGRAM_CHAT_ID")   : "";
 
                 nox::options_signal::OptionsSignalGenerator generator(
-                    alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat, profile,
-                    positionManager_.get());
+                    alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat, profile);
 
                 while (true) {
                     try {

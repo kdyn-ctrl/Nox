@@ -9,10 +9,37 @@ services:
       context: ./america_data_engine
     container_name: nox_america_data_engine
     restart: unless-stopped
+    # WS1/architecture: cap NLP-side memory so the sentiment/contradiction layer
+    # can never starve or share heap with the C++ execution engine.
+    mem_limit: 512m
     environment:
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
       - ALPACA_API_KEY=${ALPACA_API_KEY}
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      # WS1 — Contradiction Vector: reach heartbeat's IV skew endpoint + tuning.
+      - HEARTBEAT_BASE_URL=${HEARTBEAT_BASE_URL:-http://heartbeat-monitor:8002}
+      - CONTRADICTION_SKEW_THRESHOLD=${CONTRADICTION_SKEW_THRESHOLD:-0.03}
+      - CONTRADICTION_SENTIMENT_THRESHOLD=${CONTRADICTION_SENTIMENT_THRESHOLD:-0.25}
+      - CONTRADICTION_BYPASS=${CONTRADICTION_BYPASS:-false}
+      # WS3 — Insider Cluster Filter (SEC Form 4).
+      - SEC_USER_AGENT=${SEC_USER_AGENT:-Nox/1.0 contact@nox.local}
+      - INSIDER_CLUSTER_WINDOW_HOURS=${INSIDER_CLUSTER_WINDOW_HOURS:-48}
+      - INSIDER_MIN_EXECS=${INSIDER_MIN_EXECS:-2}
+      - INSIDER_CLUSTER_BYPASS=${INSIDER_CLUSTER_BYPASS:-false}
+      # WS2 — Alternative Macro Pipeline (physical-supply verification).
+      - ALT_INSURANCE_URL=${ALT_INSURANCE_URL:-}
+      - ALT_INSURANCE_JSON=${ALT_INSURANCE_JSON:-}
+      - ALT_AIS_URL=${ALT_AIS_URL:-}
+      - ALT_AIS_JSON=${ALT_AIS_JSON:-}
+      - OFAC_ACTIONS_URL=${OFAC_ACTIONS_URL:-https://ofac.treasury.gov/system/files/126/ofac.xml}
+      - ALT_MACRO_PHYSICAL_MIN=${ALT_MACRO_PHYSICAL_MIN:-0.30}
+      - ALT_MACRO_POLITICAL_MIN=${ALT_MACRO_POLITICAL_MIN:-0.30}
+      - ALT_MACRO_BYPASS=${ALT_MACRO_BYPASS:-false}
+      # WS6 — Weekend Skeptic Report output directory (mounted from host).
+      - SKEPTIC_REPORT_DIR=/app/data
+    volumes:
+      # WS6: weekend batch writes reports here; path appears on host at data/.
+      - ./data:/app/data
     networks:
       - nox_net
   china-data-engine:
@@ -20,6 +47,7 @@ services:
       context: ./china_data_engine
     container_name: nox_china_data_engine
     restart: unless-stopped
+    mem_limit: 512m
     environment:
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
     networks:
@@ -62,6 +90,19 @@ services:
       - KELLY_FRACTION=${KELLY_FRACTION}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - OPTIONS_BOT_AUTO_EXECUTE=${OPTIONS_BOT_AUTO_EXECUTE:-false}
+      - OPTIONS_BOT_MAX_SIGNALS=${OPTIONS_BOT_MAX_SIGNALS:-3}
+      - OPTIONS_PERSONAL_MAX_SIGNALS=${OPTIONS_PERSONAL_MAX_SIGNALS:-2}
+      # WS5 — Liquidity Vacuum / Microstructure Gate.
+      - LIQUIDITY_GATE_STDDEV=${LIQUIDITY_GATE_STDDEV:-3.0}
+      - LIQUIDITY_GATE_WINDOW=${LIQUIDITY_GATE_WINDOW:-50}
+      - LIQUIDITY_GATE_MIN_SAMPLES=${LIQUIDITY_GATE_MIN_SAMPLES:-10}
+      - LIQUIDITY_GATE_BYPASS=${LIQUIDITY_GATE_BYPASS:-false}
+      # Persistence — must match the volume mount below so data survives restarts.
+      - MEMORY_BANK_PATH=/app/data/memory_bank.db
+      - CN_POSITIONS_PATH=/app/data/china_positions.json
+    volumes:
+      - ./data:/app/data
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.execution-webhook.rule=Path(`/webhook`)"
@@ -76,6 +117,7 @@ services:
       context: ./heartbeat
     container_name: nox_heartbeat
     restart: unless-stopped
+    mem_limit: 768m
     depends_on:
       - china-data-engine
       - america-data-engine
@@ -87,11 +129,42 @@ services:
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
       # Shared secret used to authenticate requests to the china-data-engine API.
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
+      # WS1 — port for the internal IV skew endpoint served to the data engines.
+      - HEARTBEAT_IV_PORT=${HEARTBEAT_IV_PORT:-8002}
     volumes:
       - ./data:/app/data
-    command: sh -c "chown -R root:root /app/data && python -u monitor.py"
+      - ./reports:/app/reports
+    command: sh -c "chown -R root:root /app/data && mkdir -p /app/reports && python -u monitor.py"
     networks:
       - nox_net
+
+# ── IBKR Paper Trading Gateway (nocturnal branch only) ───────────────────────
+# Uncomment this block when ready to activate IBKR execution.
+# Requires: IBKR paper trading account credentials set in .env:
+#   IB_GATEWAY_USER=your_paper_username
+#   IB_GATEWAY_PASSWORD=your_paper_password
+# After uncommenting:
+#   1. Run: ./execution/setup_ibkr_vendor.sh
+#   2. Recompile: g++ ... -DIBKR_ENABLED ... -o execution/nox_engine_ibkr
+#      (then copy it as nox_engine before docker compose up --build)
+#   3. Set EXECUTION_VENUE=ibkr in .env
+#   4. docker compose up -d
+#
+#  ib-gateway:
+#    image: ghcr.io/gnzsnz/ib-gateway:stable
+#    container_name: nox_ib_gateway
+#    restart: unless-stopped
+#    environment:
+#      - TWS_USERID=${IB_GATEWAY_USER}
+#      - TWS_PASSWORD=${IB_GATEWAY_PASSWORD}
+#      - TRADING_MODE=paper          # paper = port 4002, live = port 4001
+#      - TWS_SETTINGS_PATH=/home/ibgateway/Jts
+#      - VNC_SERVER_PASSWORD=nox_vnc # optional: view gateway UI via VNC on port 5900
+#    ports:
+#      - "4002:4002"   # TWS API (paper) — exposed to host for debugging
+#      - "5900:5900"   # VNC optional
+#    networks:
+#      - nox_net
 
 networks:
   nox_net:

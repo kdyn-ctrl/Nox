@@ -4,7 +4,6 @@
 #include "nlohmann/json.hpp"
 #include <thread>
 #include <chrono>
-#include <cstdio>
 
 // Forward declare TelegramNotifier to avoid including main.cpp
 class TelegramNotifier {
@@ -22,30 +21,19 @@ std::string get_current_date() {
     return ss.str();
 }
 
-// Converts a Y-M-D civil date to a serial day count (days since 1970-01-01).
-// Howard Hinnant's algorithm — exact, timezone- and DST-independent. Avoids
-// std::mktime, whose local-time/DST behaviour can shift a date-only diff by an
-// hour and truncate the 21-DTE exit decision off-by-one across a DST boundary.
-static long days_from_civil(int y, unsigned m, unsigned d) {
-    y -= m <= 2;
-    const long era = (y >= 0 ? y : y - 399) / 400;
-    const unsigned yoe = static_cast<unsigned>(y - era * 400);
-    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097L + static_cast<long>(doe) - 719468L;
-}
-
-// Signed day count from date1 to date2 (date2 - date1), parsed as "YYYY-MM-DD".
-// Positive when date2 is later than date1. Returns 0 on unparseable input.
+// Helper to calculate days between two dates
 int days_between(const std::string& date1_str, const std::string& date2_str) {
-    int y1, m1, d1, y2, m2, d2;
-    if (std::sscanf(date1_str.c_str(), "%d-%d-%d", &y1, &m1, &d1) != 3 ||
-        std::sscanf(date2_str.c_str(), "%d-%d-%d", &y2, &m2, &d2) != 3) {
-        return 0;
-    }
-    return static_cast<int>(
-        days_from_civil(y2, static_cast<unsigned>(m2), static_cast<unsigned>(d2)) -
-        days_from_civil(y1, static_cast<unsigned>(m1), static_cast<unsigned>(d1)));
+    std::tm date1_tm = {};
+    std::tm date2_tm = {};
+    std::stringstream ss1(date1_str);
+    std::stringstream ss2(date2_str);
+    ss1 >> std::get_time(&date1_tm, "%Y-%m-%d");
+    ss2 >> std::get_time(&date2_tm, "%Y-%m-%d");
+
+    auto time1 = std::mktime(&date1_tm);
+    auto time2 = std::mktime(&date2_tm);
+
+    return std::abs(time2 - time1) / (60 * 60 * 24);
 }
 
 double get_option_price_from_alpaca(const OptionPosition& position,
@@ -217,22 +205,12 @@ void PositionManager::monitor_positions() {
                 auto result = order_router_.closePosition(occ_symbol, pos.quantity, is_short);
 
                 if (result.success) {
-                    std::cout << "[POS_MANAGER] Successfully closed position " << pos.id
+                    std::cout << "[POS_MANAGER] Successfully closed position " << pos.id 
                               << ". Order ID: " << result.order_id << std::endl;
-
-                    // Realized P&L (per contract = 100 shares). Long premium profits
-                    // when the option appreciates; short premium profits when it decays.
-                    double pnl = (is_short
-                                  ? (pos.entry_price - current_price)
-                                  : (current_price - pos.entry_price))
-                                 * pos.quantity * 100.0;
-
-                    // Persist to the closed-trade ledger for performance review.
-                    log_closed_trade(pos, current_price, pnl, get_current_date(),
-                                     exit_reason, result.order_id);
-                    std::cout << "LOG: " << pos.ticker << " " << pos.strike << " " << pos.option_type
-                              << " closed for " << exit_reason << ". Exit: " << current_price
-                              << " | P&L: $" << pnl << std::endl;
+                    
+                    // Log transaction (placeholder)
+                    std::cout << "LOG: " << pos.ticker << " " << pos.strike << " " << pos.option_type 
+                              << " closed for " << exit_reason << ". Price: " << current_price << std::endl;
 
                     // Fire Telegram alert
                     std::stringstream tg_msg;
@@ -243,7 +221,6 @@ void PositionManager::monitor_positions() {
                            << "• *Reason:* " << exit_reason << "\n"
                            << "• *Entry Price:* " << pos.entry_price << "\n"
                            << "• *Exit Price:* " << current_price << "\n"
-                           << "• *Realized P&L:* $" << pnl << "\n"
                            << "• *Order ID:* `" << result.order_id << "`\n"
                            << "• *Quantity:* " << pos.quantity;
                     TelegramNotifier::sendMessage(tg_msg.str());
