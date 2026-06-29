@@ -165,23 +165,57 @@ if (signal.strategy == "CC") {
 - Win rate and directional accuracy reporting
 - Volume richness breakdown (P&L when IV > RV vs IV ≈ RV)
 
+✅ **Position Manager with exit rules** *(added June 25, 2026)*
+- SQLite-backed open position tracking (`open_positions` table in `memory_bank.db`)
+- Background monitoring thread (30-min cycle)
+- Three exit rules: 50% profit target, 21 DTE close for income trades, 2× stop loss
+- Telegram alerts on close; market order routing via `OptionsOrderRouter`
+
+✅ **Whole-market scanner** *(3-stage pipeline)*
+- Stage 1: fetch ~6,000–8,000 tradable US equities from Alpaca
+- Stage 2: batch-snapshot screen by unusual activity (volume × % move)
+- Stage 3: RSI / ATR / SMA bar analysis on top-80 candidates, signal → execution engine
+- Runs every 30 minutes during market hours; regime-gated
+
+✅ **Intelligence pipeline (Heartbeat Monitor)**
+- Daily scout at 09:00 ET: US news + SEC filings + China macro → Claude analysis
+- Real-time SEC radar: 8-K and 6-K feeds, watchlist matching, heavyweight filing routing
+- IV Rank accumulation: daily EOD snapshots → 52-week percentile builds over time
+- `/pulse` command: fast intraday VIX + headlines + contradiction verdicts (~10 sec)
+- Weekly performance report: fires at 16:00 ET on last NYSE trading day (holiday-aware)
+- Monthly trading journal: written to `reports/` on the 1st of each month
+
+✅ **WS7 Information Lag Window tracker** *(Chinese ADR edge)*
+- Opens a window when a material 6-K is filed before CN retail media picks it up
+- Polls china-data-engine every 15 min for East Money / Cailian Press pickup
+- Computes abnormal return vs MCHI over the lag period
+- Grades each event A/B/C/F with Claude; persisted to `lag_windows` table
+
+✅ **IBKR execution path (wired, not yet active)**
+- `IBKRClient.hpp/cpp`: async socket layer with lock-free SPSC ring buffer for ticks
+- `IBKROrderRouter.hpp`: maps all 8 options strategies to IBKR combo contracts
+- Venue flag in `main.cpp`; flip `EXECUTION_VENUE=ibkr` to activate
+- 3 items remaining before production-ready (see `execution/IBKR_MIGRATION.md`)
+
 ---
 
 ## What's NOT Implemented (and why)
 
-❌ **Real options chain data** — Would need Polygon.io (~$29/month) or CBOE DataShop. The backtester uses Black-Scholes re-pricing with a simple IV proxy (HRV × 1.15), which introduces bias. A real backtest uses historical mid-prices from the options market.
+❌ **Real options chain data** — The backtester uses Black-Scholes re-pricing with an IV proxy (HRV × 1.15). Real historical mid-prices require Polygon.io (~$29/month) or CBOE DataShop. Backtest results are estimates, not market-accurate.
 
-❌ **True 52-week IV Rank** — Requires historical IV data accumulated over time. The system computes IV percentile within a single snapshot (intra-day skew metric, not a true rank). You can start accumulating this for free by logging daily IV fetches.
+❌ **True 52-week IV Rank** — Accumulation started (daily EOD snapshots via `historical_volatility` table). Full rank becomes meaningful after 30+ trading days of data per ticker. It is silently absent on first paper-trading day.
 
-❌ **American exercise valuation** — The Greeks assume European exercise. Real equity options are American and have early-exercise premium. For short-dated options (<30 DTE) this is usually <1% of the premium. For longer-dated options it's material.
+❌ **American exercise valuation** — Greeks assume European exercise. Equity options are American; early-exercise premium is usually <1% for short-dated contracts but material beyond 60 DTE.
 
-❌ **Volatility surface & skew** — Uses a single IV (snapshot average). Real options have different IVs by strike (put skew, call smile) and expiry (term structure). This causes the strike selection to be slightly optimistic (real OTM puts have higher IV).
+❌ **Volatility surface & skew** — Uses an OI-weighted average IV per ticker (no strike-by-strike surface). Real OTM puts carry a volatility premium not captured here, making strike selection slightly optimistic.
 
-❌ **Limit order support** — All orders are market. Limit orders would improve fills but require monitoring and amendment logic.
+❌ **Limit order support** — All orders are market-only. Fills may differ from theoretical prices, especially for less-liquid options.
 
-❌ **Exit rules in live engine** — The backtester has exit logic (50% profit target, 21 DTE close for income trades). The live engine has none — positions would need manual management or a position monitor thread.
+❌ **Earnings avoidance** — No filter to suppress signals 3 days before earnings. This is the single highest-impact missing safety gate. The Alpaca corporate actions endpoint provides this data at no extra cost.
 
-❌ **Earnings avoidance** — A simple filter (skip if earnings within 3 days) would eliminate the largest source of unexpected moves. Alpaca provides this data via the corporate actions endpoint.
+❌ **PositionManager ↔ OptionsSignalGenerator wiring** — `PositionManager::add_position()` exists and works but is never called after `executeSignal()`. Until this is connected, positions won't be tracked by the exit-rule monitor. **This is the most critical gap for paper trading.**
+
+❌ **`trade_history` / `trade_predictions` population** — The heartbeat's `memory_bank.db` tables exist but the execution engine does not write to them. The weekly report P&L and MAE fields will show zero / N/A until this cross-container write path is implemented.
 
 ---
 

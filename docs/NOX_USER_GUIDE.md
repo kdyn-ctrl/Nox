@@ -200,6 +200,65 @@ You'll receive Telegram notifications. Here's what they mean:
 
 ---
 
+## Telegram Commands (What You Can Ask Nox)
+
+You can type these commands directly in Telegram and Nox will respond immediately.
+
+| Command | What it does | How fast |
+|---------|-------------|---------|
+| `/report` | Triggers a full daily scout: US news + SEC filings + China macro → Claude analysis | ~30 sec |
+| `/pulse` | Fast intraday snapshot: VIX, recent headlines, contradictions, upcoming earnings, position gaps | ~10 sec |
+| `/weekly_report` | Generates the weekly performance report on demand (P&L, win rate, MAE, calibration score, parse failures) | ~5 sec |
+| `/status` | Live system health: all container statuses, last audit age, analyst heartbeat, memory bank stats | ~5 sec |
+| `/history [n]` | Shows last N daily audit reports from the memory bank (default 5, max 20) | instant |
+| `/signals [n]` | Last N signals received by the execution engine (default 10, max 50) | instant |
+| `/lagstats` | WS7 meta-analysis: grade distribution (A/B/C/F), mean lag hours, mean abnormal return for closed lag windows | instant |
+| `/monthly_report [YYYY-MM]` | Generate a full trading journal for any month (defaults to current month) | ~5 sec |
+
+### Weekly Performance Report
+
+Every Friday at 4:00 PM ET (or Thursday if Friday is a market holiday), Nox automatically sends a performance summary:
+
+```
+📊 NOX WEEKLY PERFORMANCE REPORT
+────────────────────────
+Week: Jun 23 – Jun 29, 2026
+
+Metric                │ Value
+──────────────────────┼────────────────
+Total P&L             │ +$142.50
+Trades                │ 8  (6W / 2L)
+Win/Loss Ratio        │ 3.00
+MAE (Pred vs Actual)  │ 0.0823
+Calibration Score     │ 91.8%
+8-K Parse Failures    │ 1
+```
+
+**Calibration Score**: How accurate Nox's outcome predictions are (100% = perfect, 0% = completely wrong). This starts as N/A until the prediction-tracking pipeline is fully wired.
+
+### WS7 Lag Window Alerts
+
+When Nox detects a material Chinese ADR (BABA, JD, etc.) 6-K filing that hasn't yet been picked up by Chinese retail media, you'll see:
+
+```
+⏳ [WS7] LAG WINDOW OPEN — BABA
+6-K filed — not yet trending on CN media
+Materiality: 0.72
+[Filing Index](link)
+```
+
+Then when Chinese retail discovers it:
+
+```
+🔔 [WS7] LAG WINDOW CLOSED — BABA
+Source: East Money
+Lag: 4.2h since 6-K filing
+```
+
+A longer lag = more time the information asymmetry existed.
+
+---
+
 ## When Does Nox Trade?
 
 ### Nox is Active
