@@ -1379,6 +1379,153 @@ public:
             res.set_content(response.dump(), "application/json");
         });
 
+        // Daily end-of-day report: aggregates positions, P&L, Greeks, and signals
+        svr.Get("/daily-report", [this](const httplib::Request&, httplib::Response& res) {
+            try {
+                // Fetch account equity and portfolio value
+                double equity = fetch_account_equity();
+                if (equity <= 0.0) {
+                    res.status = 500;
+                    res.set_content("Failed to fetch account equity", "text/plain");
+                    return;
+                }
+
+                auto positions = positionManager_->get_open_positions_public();
+
+                // Calculate Greeks and P&L
+                double total_delta = 0.0, total_gamma = 0.0;
+                double total_theta = 0.0, total_vega  = 0.0;
+                double notional    = 0.0;
+                double unrealized_pnl = 0.0;
+
+                for (const auto& pos : positions) {
+                    double expiry_years = 0.0;
+                    {
+                        auto now    = std::chrono::system_clock::now();
+                        auto time_t = std::chrono::system_clock::to_time_t(now);
+                        std::tm tm_now{};
+                        gmtime_r(&time_t, &tm_now);
+
+                        int ey, em, ed;
+                        std::sscanf(pos.expiration_date.c_str(), "%d-%d-%d", &ey, &em, &ed);
+                        int days_exp = (ey - (1900 + tm_now.tm_year)) * 365
+                                     + (em - 1 - tm_now.tm_mon) * 30
+                                     + (ed - tm_now.tm_mday);
+                        expiry_years = std::max(0.0, days_exp / 365.0);
+                    }
+
+                    nox::options::OptionContract contract;
+                    contract.underlying     = pos.strike;
+                    contract.strike         = pos.strike;
+                    contract.expiry         = expiry_years;
+                    contract.risk_free_rate = 0.05;
+                    contract.volatility     = 0.25;
+                    contract.type = (pos.option_type == "call")
+                                    ? nox::options::OptionType::Call
+                                    : nox::options::OptionType::Put;
+
+                    auto g = nox::options::compute_greeks(contract, false);
+                    double sign = (pos.profile_type == "short_premium") ? -1.0 : 1.0;
+
+                    total_delta += g.delta * sign * pos.quantity * 100.0;
+                    total_gamma += g.gamma * sign * pos.quantity * 100.0;
+                    total_theta += g.theta * sign * pos.quantity * 100.0;
+                    total_vega  += g.vega  * sign * pos.quantity * 100.0;
+                    notional    += pos.entry_price * pos.quantity * 100.0;
+
+                    // Rough P&L estimate: (current_price - entry_price) * qty * 100
+                    // Uses entry price as proxy for current
+                    unrealized_pnl += (g.price - pos.entry_price) * pos.quantity * 100.0 * sign;
+                }
+
+                // Collect recent signals
+                {
+                    std::lock_guard<std::mutex> lock(signal_log_mutex_);
+                    int buy_count = 0, sell_count = 0, hold_count = 0;
+                    for (const auto& e : signal_log_) {
+                        if (e.action == "BUY") buy_count++;
+                        else if (e.action == "SELL") sell_count++;
+                        else if (e.action == "HOLD") hold_count++;
+                    }
+
+                    // Calculate drawdown
+                    {
+                        std::lock_guard<std::mutex> dd_lock(peak_equity_mutex_);
+                        double drawdown_pct = (peak_equity_ > 0.0)
+                            ? ((peak_equity_ - equity) / peak_equity_) * 100.0
+                            : 0.0;
+
+                        std::ostringstream report;
+                        report << "📊 *END-OF-DAY TRADING REPORT*\n"
+                               << "════════════════════════════════════════\n\n"
+                               << "*ACCOUNT SUMMARY*\n"
+                               << "• *Equity:* $" << std::fixed << std::setprecision(2) << equity << "\n"
+                               << "• *Peak Equity:* $" << peak_equity_ << "\n"
+                               << "• *Drawdown:* " << drawdown_pct << "%\n"
+                               << "• *Circuit Breaker:* " << (scanner_halt_drawdown_.load() ? "🔴 ACTIVE" : "🟢 NORMAL") << "\n\n";
+
+                        report << "*SIGNAL FLOW*\n"
+                               << "• *BUY signals:* " << buy_count << "\n"
+                               << "• *SELL signals:* " << sell_count << "\n"
+                               << "• *HOLD signals:* " << hold_count << "\n"
+                               << "• *Total processed:* " << (buy_count + sell_count + hold_count) << "\n\n";
+
+                        report << "*POSITIONS SUMMARY*\n"
+                               << "• *Open options:* " << positions.size() << "\n"
+                               << "• *Total notional:* $" << notional << "\n"
+                               << "• *Unrealized P&L:* $" << unrealized_pnl << "\n\n";
+
+                        if (positions.size() > 0) {
+                            report << "*PORTFOLIO GREEKS*\n"
+                                   << "• *Delta:* " << std::round(total_delta * 1000.0) / 1000.0 << "\n"
+                                   << "• *Gamma:* " << std::round(total_gamma * 10000.0) / 10000.0 << "\n"
+                                   << "• *Theta:* " << std::round(total_theta * 100.0) / 100.0 << " per day\n"
+                                   << "• *Vega:* " << std::round(total_vega * 100.0) / 100.0 << "\n\n";
+                        }
+
+                        report << "*OPEN POSITIONS*\n";
+                        if (positions.empty()) {
+                            report << "_(None)_\n";
+                        } else {
+                            for (const auto& pos : positions) {
+                                report << "• " << pos.ticker << " " << pos.option_type << " $"
+                                       << std::fixed << std::setprecision(2) << pos.strike
+                                       << " exp:" << pos.expiration_date << " qty:" << pos.quantity << "\n";
+                            }
+                        }
+
+                        report << "\n_Report generated at market close_\n";
+
+                        std::string telegram_msg = report.str();
+                        TelegramNotifier::sendMessage(telegram_msg);
+
+                        json response = {
+                            {"status", "report_generated"},
+                            {"equity", equity},
+                            {"drawdown_pct", drawdown_pct},
+                            {"open_positions", static_cast<int>(positions.size())},
+                            {"signals_today", {
+                                {"buy", buy_count},
+                                {"sell", sell_count},
+                                {"hold", hold_count}
+                            }},
+                            {"greeks", {
+                                {"delta", std::round(total_delta * 1000.0) / 1000.0},
+                                {"gamma", std::round(total_gamma * 10000.0) / 10000.0},
+                                {"theta", std::round(total_theta * 100.0) / 100.0},
+                                {"vega", std::round(total_vega * 100.0) / 100.0}
+                            }},
+                            {"unrealized_pnl", unrealized_pnl}
+                        };
+                        res.set_content(response.dump(2), "application/json");
+                    }
+                }
+            } catch (const std::exception& e) {
+                res.status = 500;
+                res.set_content(std::string("Report generation failed: ") + e.what(), "text/plain");
+            }
+        });
+
         // Returns the last 50 authenticated signals received by the webhook.
         // Used by the heartbeat /signals Telegram command to verify signal flow.
         svr.Get("/recent-signals", [this](const httplib::Request&, httplib::Response& res) {

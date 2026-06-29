@@ -351,7 +351,7 @@ private:
         std::string side = is_short_premium ? "buy" : "sell";
         json order = {
             {"symbol",          occ_symbol},
-            {"qty",             std::to_string(quantity)},
+            {"qty",             quantity},
             {"side",            side},
             {"time_in_force",   "day"},
             {"position_effect", "close"}
@@ -383,7 +383,7 @@ private:
 
         json order = {
             {"symbol",          contract.occ_symbol},
-            {"qty",             std::to_string(qty_contracts)},
+            {"qty",             qty_contracts},
             {"side",            side},
             {"time_in_force",   "day"},
             {"position_effect", "open"}
@@ -417,18 +417,18 @@ private:
             {"type",          "market"},
             {"order_class",   "mleg"},
             {"time_in_force", "day"},
-            {"qty",           std::to_string(qty_contracts)},
+            {"qty",           qty_contracts},
             {"legs", json::array({
                 {
                     {"symbol",          buy_leg.occ_symbol},
                     {"side",            "buy"},
-                    {"ratio_qty",       "1"},
+                    {"ratio_qty",       1},
                     {"position_effect", "open"}
                 },
                 {
                     {"symbol",          sell_leg.occ_symbol},
                     {"side",            "sell"},
-                    {"ratio_qty",       "1"},
+                    {"ratio_qty",       1},
                     {"position_effect", "open"}
                 }
             })}
@@ -454,18 +454,18 @@ private:
             {"type",          "market"},
             {"order_class",   "mleg"},
             {"time_in_force", "day"},
-            {"qty",           std::to_string(qty_contracts)},
+            {"qty",           qty_contracts},
             {"legs", json::array({
                 {
                     {"symbol",          call_leg.occ_symbol},
                     {"side",            "buy"},
-                    {"ratio_qty",       "1"},
+                    {"ratio_qty",       1},
                     {"position_effect", "open"}
                 },
                 {
                     {"symbol",          put_leg.occ_symbol},
                     {"side",            "buy"},
-                    {"ratio_qty",       "1"},
+                    {"ratio_qty",       1},
                     {"position_effect", "open"}
                 }
             })}
@@ -492,18 +492,18 @@ private:
             {"type",          "market"},
             {"order_class",   "mleg"},
             {"time_in_force", "day"},
-            {"qty",           std::to_string(qty_contracts)},
+            {"qty",           qty_contracts},
             {"legs", json::array({
                 {
                     {"symbol",          call_leg.occ_symbol},
                     {"side",            "buy"},
-                    {"ratio_qty",       "1"},
+                    {"ratio_qty",       1},
                     {"position_effect", "open"}
                 },
                 {
                     {"symbol",          put_leg.occ_symbol},
                     {"side",            "buy"},
-                    {"ratio_qty",       "1"},
+                    {"ratio_qty",       1},
                     {"position_effect", "open"}
                 }
             })}
