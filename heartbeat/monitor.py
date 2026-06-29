@@ -1656,6 +1656,120 @@ def send_history(message):
         bot.reply_to(message, f"⚠️ Failed to retrieve history: {str(e)}")
 
 
+@bot.message_handler(commands=['pulse'])
+def cmd_pulse(message):
+    """
+    /pulse — Fast intraday market pulse (VIX + headlines + gap analysis).
+    Gathers current VIX, recent headlines, contradiction verdicts, and upcoming
+    earnings; sends to Claude for a 3-sentence market read + up to 3 gaps
+    the trader may not be thinking about given their current positions.
+    Response is fast (~10 seconds) because all data is cached.
+    """
+    try:
+        bot.reply_to(message, "📡 *Market Pulse analyzing...* Gathering VIX, headlines, and position gaps.", parse_mode='Markdown')
+
+        # 1. Fetch VIX
+        vix = fetch_vix_level()
+
+        # 2. Fetch headlines from america-data-engine
+        news_data = query_data_engine("/news/us", "http://america-data-engine:8001")
+        headlines = [a.get("headline", "") for a in news_data.get("news", [])[:8]] if news_data else []
+
+        # 3. Fetch contradiction verdicts
+        contradiction_data = query_data_engine("/contradiction/us", "http://america-data-engine:8001")
+        # Extract ticker verdicts from the results list
+        contradictions = {}
+        if contradiction_data:
+            for result in contradiction_data.get("results", []):
+                if isinstance(result, dict):
+                    ticker = result.get("ticker")
+                    verdict = result.get("verdict", "NEUTRAL")
+                    if ticker and verdict != "NEUTRAL":
+                        contradictions[ticker] = verdict
+
+        # 4. Fetch upcoming earnings (next 5 days)
+        earnings_data = query_data_engine("/earnings/calendar", "http://america-data-engine:8001")
+        upcoming_earnings_tickers = set()
+        if earnings_data:
+            earnings_cal = earnings_data.get("earnings_calendar", {})
+            today = datetime.now()
+            for ticker, events in earnings_cal.items():
+                for event in events:
+                    try:
+                        event_date = datetime.strptime(event.get("date", ""), "%Y-%m-%d").date()
+                        days_until = (event_date - today.date()).days
+                        if 0 <= days_until <= 5:
+                            upcoming_earnings_tickers.add(ticker)
+                    except (ValueError, AttributeError):
+                        pass
+
+        # 5. Fetch current positions from Alpaca
+        positions_text = "No open positions"
+        try:
+            pos_resp = requests.get(
+                "https://paper-api.alpaca.markets/v2/positions",
+                headers={
+                    "APCA-API-KEY-ID": ALPACA_API,
+                    "APCA-API-SECRET-KEY": ALPACA_SEC,
+                },
+                timeout=HTTP_TIMEOUT
+            )
+            if pos_resp.status_code == 200:
+                positions = pos_resp.json()
+                if positions:
+                    position_strs = []
+                    for p in positions:
+                        try:
+                            plpc = float(p.get("unrealized_plpc", 0))
+                            position_strs.append(
+                                f"{p['symbol']} ({p['side']}, {plpc*100:+.1f}%)"
+                            )
+                        except (ValueError, KeyError):
+                            position_strs.append(f"{p.get('symbol', '?')} ({p.get('side', '?')})")
+                    if position_strs:
+                        positions_text = ", ".join(position_strs)
+        except Exception as e:
+            logger.warning(f"Failed to fetch positions: {e}")
+            positions_text = "Positions unavailable"
+
+        # 6. Build Claude prompt
+        prompt = (
+            f"VIX: {vix:.1f}\n\n"
+            f"Recent US headlines:\n" +
+            "\n".join(f"- {h}" for h in headlines if h) +
+            f"\n\nCurrent positions: {positions_text}\n\n"
+            f"Contradiction signals (text vs IV): {contradictions if contradictions else 'None flagged'}\n\n"
+            f"Upcoming earnings (next 5 days): {', '.join(sorted(upcoming_earnings_tickers)) if upcoming_earnings_tickers else 'None'}\n\n"
+            "Answer in TWO sections (short and direct):\n\n"
+            "MARKET READ (2-3 sentences): What is driving the tape right now? Is sentiment constructive or cautious? One actionable insight.\n\n"
+            "GAPS (max 3 bullets): What risk or opportunity is this trader likely NOT thinking about right now? "
+            "Reference actual tickers, contradictions, or upcoming catalysts from the data above. "
+            "Skip this section if there are no material gaps."
+        )
+
+        # 7. Call Claude
+        response = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            system="You are a quantitative market analyst. Be direct and specific. Assume the trader knows technicals and fundamentals. No preamble.",
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        analysis = response.content[0].text
+
+        # 8. Send response
+        bot.reply_to(
+            message,
+            f"📡 *Market Pulse* — VIX {vix:.1f}\n\n{analysis}",
+            parse_mode='Markdown'
+        )
+
+        logger.info("Pulse command completed successfully")
+    except Exception as e:
+        logger.error(f"Pulse command failed: {e}")
+        bot.reply_to(message, f"⚠️ Pulse analysis failed: {str(e)}")
+
+
 @bot.message_handler(commands=['signals'])
 def send_signals(message):
     """
