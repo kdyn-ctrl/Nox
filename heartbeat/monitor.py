@@ -157,6 +157,39 @@ def init_db():
                         source TEXT DEFAULT 'market_scanner'
                     )
                 ''')
+                # WS7 — Information lag windows: tracks the period between a
+                # material 6-K SEC filing and Chinese retail media pickup.
+                c.execute('''
+                    CREATE TABLE IF NOT EXISTS lag_windows (
+                        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ticker            TEXT NOT NULL,
+                        filing_url        TEXT NOT NULL,
+                        materiality_score REAL NOT NULL DEFAULT 0.0,
+                        opened_at         TEXT NOT NULL,
+                        closed_at         TEXT,
+                        closed_by_source  TEXT,
+                        lag_hours         REAL,
+                        abnormal_return   REAL,
+                        grade             TEXT,
+                        grade_reasoning   TEXT,
+                        graded_at         TEXT
+                    )
+                ''')
+                # Migrate existing deployments — ADD COLUMN is idempotent via try/except
+                for _col, _typ in [
+                    ("abnormal_return", "REAL"),
+                    ("grade",           "TEXT"),
+                    ("grade_reasoning", "TEXT"),
+                    ("graded_at",       "TEXT"),
+                ]:
+                    try:
+                        c.execute(f"ALTER TABLE lag_windows ADD COLUMN {_col} {_typ}")
+                    except Exception:
+                        pass  # column already exists
+                c.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_lag_ticker
+                    ON lag_windows(ticker)
+                ''')
                 conn.commit()
     except Exception as e:
         print(f"Database initialization error: {e}")
@@ -1824,6 +1857,72 @@ def send_signals(message):
         bot.reply_to(message, f"⚠️ Failed to fetch signals: {str(e)}")
 
 
+@bot.message_handler(commands=['lagstats'])
+def send_lag_stats(message):
+    """
+    /lagstats — WS7 meta-analysis report.
+    Shows grade distribution, mean lag, mean AR, and last 10 graded events
+    from the lag_windows SQLite table.
+    """
+    try:
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                rows = conn.execute(
+                    """SELECT ticker, lag_hours, abnormal_return, grade,
+                              grade_reasoning, closed_by_source, closed_at
+                       FROM lag_windows
+                       WHERE closed_at IS NOT NULL
+                       ORDER BY closed_at DESC
+                       LIMIT 50"""
+                ).fetchall()
+
+        if not rows:
+            bot.reply_to(message, "📭 No closed lag windows yet. Waiting for 6-K detections.")
+            return
+
+        graded = [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows if r[3]]
+        grades = {"A": 0, "B": 0, "C": 0, "F": 0}
+        ar_by_grade = {"A": [], "B": [], "C": [], "F": []}
+        for _, lag_h, ar, grade, _, _ in graded:
+            g = grade.strip().upper() if grade else "?"
+            if g in grades:
+                grades[g] += 1
+                if ar is not None:
+                    ar_by_grade[g].append(ar)
+
+        total_graded = sum(grades.values())
+        mean_lag = sum(r[1] for r in rows if r[1]) / max(len(rows), 1)
+
+        lines = [
+            f"📊 *WS7 Lag Window — Meta Analysis*",
+            f"Total closed windows: {len(rows)} | Graded: {total_graded}",
+            f"Mean lag: *{mean_lag:.1f}h*",
+            "",
+            "*Grade Distribution:*",
+        ]
+        for g in ["A", "B", "C", "F"]:
+            count = grades[g]
+            ars = ar_by_grade[g]
+            mean_ar = f"{sum(ars)/len(ars)*100:+.2f}%" if ars else "N/A"
+            lines.append(f"  `{g}` ×{count}  mean AR={mean_ar}")
+
+        lines += ["", "*Last 10 Events:*"]
+        for row in rows[:10]:
+            ticker, lag_h, ar, grade, reasoning, source, closed_at = row
+            lag_str = f"{lag_h:.1f}h" if lag_h else "—"
+            ar_str  = f"{ar*100:+.2f}%" if ar is not None else "—"
+            g_str   = grade if grade else "?"
+            lines.append(
+                f"`{ticker}` {g_str} | lag={lag_str} | AR={ar_str} | via {source or '?'}"
+            )
+            if reasoning:
+                lines.append(f"  _{reasoning}_")
+
+        bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ /lagstats failed: {e}")
+
+
 @bot.message_handler(func=lambda message: True)
 def chat_with_nox(message):
     # Patch A: The three variable assignments below were previously placed INSIDE
@@ -1869,6 +1968,257 @@ def mark_filing_processed(filing_id):
             c = conn.cursor()
             c.execute("INSERT OR IGNORE INTO processed_filings (filing_id) VALUES (?)", (filing_id,))
             conn.commit()
+
+
+# --- WS7: Information Lag Window Tracker ---
+# Tracks the period between a material 6-K SEC filing and Chinese retail media
+# pickup (East Money hot board or Cailian Press). When the lag window closes,
+# we know Chinese retail has discovered the filing — the edge has been consumed.
+
+_CN_DATA_ENGINE_URL = "http://china-data-engine:8001"
+_LAG_WINDOW_MAX_HOURS = 48  # auto-expire windows older than this
+
+
+def _lag_open_window(ticker: str, filing_url: str, materiality_score: float) -> int:
+    """Open a new lag window. Returns row id. Skips if already open for ticker."""
+    now = datetime.utcnow().isoformat()
+    with db_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            existing = conn.execute(
+                "SELECT id FROM lag_windows WHERE ticker=? AND closed_at IS NULL",
+                (ticker,),
+            ).fetchone()
+            if existing:
+                return existing[0]
+            cur = conn.execute(
+                "INSERT INTO lag_windows (ticker, filing_url, materiality_score, opened_at) VALUES (?,?,?,?)",
+                (ticker, filing_url, materiality_score, now),
+            )
+            return cur.lastrowid
+
+
+def _lag_close_window(window_id: int, closed_by_source: str) -> float:
+    """Close a lag window, compute lag_hours, return it."""
+    now_dt = datetime.utcnow()
+    now_iso = now_dt.isoformat()
+    with db_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT opened_at FROM lag_windows WHERE id=? AND closed_at IS NULL",
+                (window_id,),
+            ).fetchone()
+            if not row:
+                return 0.0
+            opened = datetime.fromisoformat(row[0])
+            lag_hours = round((now_dt - opened).total_seconds() / 3600, 2)
+            conn.execute(
+                "UPDATE lag_windows SET closed_at=?, closed_by_source=?, lag_hours=? WHERE id=?",
+                (now_iso, closed_by_source, lag_hours, window_id),
+            )
+            return lag_hours
+
+
+def _lag_get_open_windows() -> list:
+    """Return all open, non-expired lag windows (includes materiality_score)."""
+    now_dt = datetime.utcnow()
+    with db_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                """SELECT id, ticker, filing_url, materiality_score, opened_at
+                   FROM lag_windows WHERE closed_at IS NULL"""
+            ).fetchall()
+
+    active = []
+    for row in rows:
+        wid, ticker, filing_url, mat_score, opened_str = row
+        opened = datetime.fromisoformat(opened_str)
+        age_hours = (now_dt - opened).total_seconds() / 3600
+        if age_hours >= _LAG_WINDOW_MAX_HOURS:
+            _lag_close_window(wid, "TIMEOUT")
+        else:
+            active.append({
+                "id":                wid,
+                "ticker":            ticker,
+                "filing_url":        filing_url,
+                "materiality_score": mat_score or 0.0,
+                "opened_at":         opened_str,
+            })
+    return active
+
+
+def _check_lag_window_for_ticker(ticker: str) -> dict:
+    """Query china-data-engine /lag/check for a ticker. Returns {} on failure."""
+    try:
+        r = requests.get(
+            f"{_CN_DATA_ENGINE_URL}/lag/check",
+            params={"ticker": ticker},
+            headers={"X-Nox-Token": WEBHOOK_SECRET},
+            timeout=HTTP_TIMEOUT,
+        )
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"[WARN] [HEARTBEAT] /lag/check failed for {ticker}: {e}", flush=True)
+    return {}
+
+
+def _fetch_bars_range(ticker: str, start_iso: str, days: int = 10) -> list:
+    """
+    Fetch up to `days` daily bars from Alpaca starting at start_iso (UTC ISO string).
+    Returns list of {t, o, h, l, c, v} dicts, oldest first.
+    """
+    headers = {
+        "APCA-API-KEY-ID":     ALPACA_API,
+        "APCA-API-SECRET-KEY": ALPACA_SEC,
+    }
+    try:
+        resp = requests.get(
+            f"{ALPACA_DATA_URL}/v2/stocks/{ticker}/bars",
+            headers=headers,
+            params={
+                "timeframe":  "1Day",
+                "start":      start_iso[:10] + "T00:00:00Z",
+                "limit":      days,
+                "adjustment": "raw",
+                "feed":       "iex",
+            },
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("bars", [])
+    except Exception as e:
+        print(f"[WARN] [HEARTBEAT] WS7 bars fetch failed for {ticker}: {e}", flush=True)
+    return []
+
+
+def _grade_lag_window(window_id: int, ticker: str, filing_url: str,
+                      materiality_score: float, opened_at: str,
+                      lag_hours: float, closed_by_source: str) -> None:
+    """
+    Background task: compute AR for a just-closed lag window, call Claude Haiku
+    to grade it (A/B/C/F), and persist the result to SQLite.
+
+    AR = ticker_return − MCHI_return over the lag window period.
+    Grade rubric:
+      A  material + |AR| > 1%  + closed by CN media (confirmed edge)
+      B  material + |AR| > 0.3% or moderate materiality
+      C  low materiality or near-zero AR
+      F  reverse return or TIMEOUT (CN media never picked up)
+    """
+    try:
+        ticker_bars = _fetch_bars_range(ticker, opened_at, days=10)
+        mchi_bars   = _fetch_bars_range("MCHI",  opened_at, days=10)
+
+        ar = None
+        if ticker_bars and mchi_bars:
+            t_entry = ticker_bars[0]["c"]
+            m_entry = mchi_bars[0]["c"]
+            # Find the bar nearest to lag_hours after open
+            lag_days = max(1, int(lag_hours / 24) + 1)
+            t_idx = min(lag_days, len(ticker_bars) - 1)
+            m_idx = min(lag_days, len(mchi_bars)  - 1)
+            t_exit = ticker_bars[t_idx]["c"]
+            m_exit = mchi_bars[m_idx]["c"]
+            if t_entry and m_entry:
+                ar = ((t_exit - t_entry) / t_entry) - ((m_exit - m_entry) / m_entry)
+                ar = round(ar, 6)
+
+        ar_pct = f"{ar * 100:+.2f}%" if ar is not None else "N/A"
+
+        prompt = (
+            f"Ticker: {ticker}\n"
+            f"Lag duration: {lag_hours:.1f}h\n"
+            f"Materiality score: {materiality_score:.2f} (0=routine, 1=highly material)\n"
+            f"Closed by: {closed_by_source}\n"
+            f"Abnormal return during window: {ar_pct} vs MCHI\n\n"
+            f"Grade this WS7 lag window event.\n"
+            f"A=clear edge (material, |AR|>1%, closed by CN media)\n"
+            f"B=moderate edge (material or |AR|>0.3%)\n"
+            f"C=weak (low materiality or near-zero AR)\n"
+            f"F=no edge (reverse return or TIMEOUT)\n\n"
+            f"Reply strictly: GRADE: [A/B/C/F] | REASONING: [max 100 chars]"
+        )
+        response = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=80,
+            system=(
+                "You are the WS7 Signal Grader for Nox, a quant trading system. "
+                "Grade lag window events objectively. Be terse."
+            ),
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        # Parse "GRADE: A | REASONING: ..."
+        grade, reasoning = "?", raw
+        if "GRADE:" in raw and "REASONING:" in raw:
+            try:
+                parts = raw.split("|")
+                grade    = parts[0].split("GRADE:")[-1].strip()
+                reasoning = parts[1].split("REASONING:")[-1].strip()[:120]
+            except Exception:
+                pass
+
+        now_iso = datetime.utcnow().isoformat()
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    """UPDATE lag_windows
+                       SET abnormal_return=?, grade=?, grade_reasoning=?, graded_at=?
+                       WHERE id=?""",
+                    (ar, grade, reasoning, now_iso, window_id),
+                )
+        print(
+            f"[INFO] [HEARTBEAT] WS7 graded window {window_id} ({ticker}): "
+            f"{grade} | AR={ar_pct} | {reasoning}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[ERROR] [HEARTBEAT] WS7 grading failed for window {window_id}: {e}", flush=True)
+
+
+def _lag_monitor_loop():
+    """
+    Background thread — polls china-data-engine every 15 minutes for all open
+    lag windows. When a window closes (ticker appears in CN media), fires a
+    Telegram alert with the measured lag duration, then spawns a grading thread.
+    """
+    print("[INFO] [HEARTBEAT] WS7 lag monitor loop started.", flush=True)
+    while True:
+        time.sleep(900)  # 15 minutes — same cadence as china-data-engine refresh
+        try:
+            open_windows = _lag_get_open_windows()
+            for window in open_windows:
+                presence = _check_lag_window_for_ticker(window["ticker"])
+                if not presence:
+                    continue
+                if not presence.get("lag_open", True):
+                    source = (
+                        "East Money" if presence.get("is_on_hot_board") else "Cailian"
+                    )
+                    lag_hours = _lag_close_window(window["id"], source.lower().replace(" ", "_"))
+                    msg = (
+                        f"🔔 *[WS7] LAG WINDOW CLOSED — {window['ticker']}*\n"
+                        f"Source: {source}\n"
+                        f"Lag: *{lag_hours:.1f}h* since 6-K filing\n"
+                        f"[Filing]({window['filing_url']})"
+                    )
+                    try:
+                        bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
+                    except Exception as e:
+                        print(f"[WARN] [HEARTBEAT] WS7 Telegram send failed: {e}", flush=True)
+                    # Spawn grading asynchronously — doesn't block the poll cycle
+                    threading.Thread(
+                        target=_grade_lag_window,
+                        args=(
+                            window["id"], window["ticker"], window["filing_url"],
+                            window["materiality_score"], window["opened_at"],
+                            lag_hours, source,
+                        ),
+                        daemon=True,
+                    ).start()
+        except Exception as e:
+            print(f"[ERROR] [HEARTBEAT] WS7 lag monitor loop error: {e}", flush=True)
+
 
 def poll_sec_edgar():
     print("[INFO] [HEARTBEAT] Nox Automated SEC Radar engaged...", flush=True)
@@ -2139,6 +2489,45 @@ def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8
                 args=(ticker, dense_payload, filing_type),
                 daemon=True
             ).start()
+
+        # --- WS7: Information Lag Window ---
+        # For Chinese ADR 6-K filings only: check whether Chinese retail media has
+        # already covered this ticker. If not, the lag window is open — we have an
+        # edge before Chinese retail discovers the disclosure.
+        if filing_type == "6-K" and ticker in CHINESE_ADRS:
+            # Quick lexicon materiality score from the dense payload text
+            _BULLISH_W = {"beat":1.0,"surge":1.0,"soar":1.0,"rally":0.9,"jump":0.8,
+                          "gain":0.6,"profit":0.5,"growth":0.5,"approval":0.7,"record":0.7}
+            _BEARISH_W = {"miss":-1.0,"plunge":-1.0,"crash":-1.0,"slump":-0.9,
+                          "drop":-0.7,"warn":-0.8,"loss":-0.6,"default":-0.9}
+            _NEG = {"not","no","without","fails","fail","denies","denied"}
+            _tok_re = re.compile(r"[a-z']+")
+            toks = _tok_re.findall(dense_payload[:4000].lower())
+            raw = 0.0
+            for _i, _t in enumerate(toks):
+                _w = _BULLISH_W.get(_t) or _BEARISH_W.get(_t)
+                if _w and _i > 0 and toks[_i - 1] in _NEG:
+                    _w = -_w
+                if _w:
+                    raw += _w
+            materiality = min(1.0, abs(raw) / 3.0)
+
+            presence = _check_lag_window_for_ticker(ticker)
+            if presence.get("lag_open", False) and materiality >= 0.25:
+                win_id = _lag_open_window(ticker, filing_url, materiality)
+                msg = (
+                    f"⏳ *[WS7] LAG WINDOW OPEN — {ticker}*\n"
+                    f"6-K filed — not yet trending on CN media\n"
+                    f"Materiality: *{materiality:.2f}*\n"
+                    f"[Filing Index]({filing_url})"
+                )
+                try:
+                    bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
+                    print(f"[INFO] [HEARTBEAT] WS7 lag window opened for {ticker} (id={win_id})", flush=True)
+                except Exception as _te:
+                    print(f"[WARN] [HEARTBEAT] WS7 Telegram send failed: {_te}", flush=True)
+            elif presence:
+                print(f"[INFO] [HEARTBEAT] WS7: {ticker} 6-K already in CN media, no lag window.", flush=True)
 
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] Failed to process automated filing for {ticker}: {e}", flush=True)
@@ -2499,5 +2888,6 @@ if __name__ == "__main__":
     threading.Thread(target=schedule_checker, daemon=True).start()
     threading.Thread(target=poll_sec_edgar, daemon=True).start()
     threading.Thread(target=_start_iv_http_server, daemon=True).start()
+    threading.Thread(target=_lag_monitor_loop, daemon=True).start()  # WS7
 
     bot.infinity_polling()
