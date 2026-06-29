@@ -55,8 +55,13 @@ DB_PATH = '/app/data/memory_bank.db'
 #                     Polling the 8-K feed for these tickers would silently miss all
 #                     their disclosures. The get_filing_type() helper resolves which
 #                     feed and which document type to use for each ticker.
-DOMESTIC_WATCHLIST = ["AAPL", "TSLA", "NVDA", "MSFT"]
-CHINESE_ADRS       = ["BABA", "JD", "PDD", "BIDU", "NIO"]
+#
+# Driven by NOX_WATCHLIST_US / NOX_WATCHLIST_CN env vars (set in .env / compose)
+# so that adding a ticker in one place propagates to all services automatically.
+_us_raw = os.getenv("NOX_WATCHLIST_US", "AAPL,TSLA,NVDA,MSFT")
+_cn_raw = os.getenv("NOX_WATCHLIST_CN", "BABA,JD,PDD,BIDU,NIO")
+DOMESTIC_WATCHLIST = [t.strip() for t in _us_raw.split(",") if t.strip()]
+CHINESE_ADRS       = [t.strip() for t in _cn_raw.split(",") if t.strip()]
 WATCHLIST          = DOMESTIC_WATCHLIST + CHINESE_ADRS
 
 # Broad market scanner watchlist — covers all major S&P 500 sectors.

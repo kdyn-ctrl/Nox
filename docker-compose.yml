@@ -37,6 +37,9 @@ services:
       - ALT_MACRO_BYPASS=${ALT_MACRO_BYPASS:-false}
       # WS6 — Weekend Skeptic Report output directory (mounted from host).
       - SKEPTIC_REPORT_DIR=/app/data
+      # Shared watchlist — set once here, propagates to all services.
+      - NOX_WATCHLIST_US=${NOX_WATCHLIST_US:-AAPL,TSLA,NVDA,MSFT}
+      - NOX_WATCHLIST_CN=${NOX_WATCHLIST_CN:-BABA,JD,PDD,BIDU,NIO}
     volumes:
       # WS6: weekend batch writes reports here; path appears on host at data/.
       - ./data:/app/data
@@ -131,6 +134,9 @@ services:
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
       # WS1 — port for the internal IV skew endpoint served to the data engines.
       - HEARTBEAT_IV_PORT=${HEARTBEAT_IV_PORT:-8002}
+      # Shared watchlist — must match america-data-engine above.
+      - NOX_WATCHLIST_US=${NOX_WATCHLIST_US:-AAPL,TSLA,NVDA,MSFT}
+      - NOX_WATCHLIST_CN=${NOX_WATCHLIST_CN:-BABA,JD,PDD,BIDU,NIO}
     volumes:
       - ./data:/app/data
       - ./reports:/app/reports
