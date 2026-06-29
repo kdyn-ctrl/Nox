@@ -2343,6 +2343,29 @@ def _start_iv_http_server():
                 self._send(200, fetch_iv_skew(ticker))
                 return
 
+            if parsed.path == "/iv/rank":
+                qs = parse_qs(parsed.query)
+                ticker = (qs.get("ticker", [""])[0] or "").upper().strip()
+                if not ticker:
+                    self._send(400, {"error": "missing ?ticker="})
+                    return
+                result = calculate_iv_rank(ticker)
+                # Normalise keys for C++ consumer: return iv_rank as 0–100 percentile,
+                # iv_level and iv_min/max as raw decimals (same unit as HRV-30).
+                payload = {
+                    "ticker":      ticker,
+                    "iv_rank":     round((result.get("iv_rank") or 0.0) * 100.0, 1),
+                    "iv_level":    round(result.get("current_iv") or 0.0, 4),
+                    "iv_min_52w":  round(result.get("iv_min") or 0.0, 4),
+                    "iv_max_52w":  round(result.get("iv_max") or 0.0, 4),
+                    "data_points": result.get("data_points", 0),
+                    "days_available": result.get("days_available", 0),
+                    "method":      result.get("method", "error"),
+                    "error":       result.get("error"),
+                }
+                self._send(200, payload)
+                return
+
             self._send(404, {"error": "not found"})
 
         def log_message(self, *args):  # silence default stderr access logging

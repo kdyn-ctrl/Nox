@@ -63,6 +63,27 @@ public:
         }
     }
 
+    // Returns true if any open position already exists for the given underlying ticker.
+    // Used by OptionsSignalGenerator to skip signals on underlyings already in-play.
+    bool has_open_position(const std::string& ticker) {
+        std::lock_guard<std::mutex> lock(db_lock_);
+        const char* sql = "SELECT COUNT(*) FROM open_positions WHERE ticker = ?;";
+        sqlite3_stmt* stmt = nullptr;
+        int count = 0;
+        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, 0) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, ticker.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) == SQLITE_ROW)
+                count = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        return count > 0;
+    }
+
+    // Returns all open positions. Used by the /portfolio/greeks endpoint.
+    std::vector<OptionPosition> get_open_positions_public() {
+        return get_open_positions(); // delegate to the private method
+    }
+
     // Record a new open option position in the database
     void add_position(const std::string& ticker,
                       const std::string& option_type,

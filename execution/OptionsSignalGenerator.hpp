@@ -21,6 +21,7 @@
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include <sqlite3.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -199,18 +200,22 @@ struct IVData {
 class OptionsSignalGenerator {
 public:
     // Profile-driven constructor — all risk parameters come from the RiskProfile.
+    // db_path: optional path to the PositionManager SQLite DB for open-position
+    //          deduplication (leave empty to disable the check).
     OptionsSignalGenerator(const std::string& alpacaUrl,
                            const std::string& apiKey,
                            const std::string& apiSec,
                            const std::string& tgToken,
                            const std::string& tgChatId,
-                           RiskProfile        profile)
+                           RiskProfile        profile,
+                           const std::string& db_path = "")
         : alpacaUrl_(alpacaUrl)
         , apiKey_(apiKey)
         , apiSec_(apiSec)
         , tgToken_(tgToken)
         , tgChatId_(tgChatId)
         , profile_(std::move(profile))
+        , dedup_db_path_(db_path)
     {}
 
     // Entry point — called once per scan cycle from the engine's background thread.
@@ -234,7 +239,19 @@ public:
             " | Tickers=" + std::to_string(watchlist.size()) +
             " | MaxSignals=" + std::to_string(profile_.max_signals_per_scan));
 
-        double vix      = fetchVix();
+        // Fetch VIX term structure first — it includes spot VIX so we can reuse it.
+        VixTermStructure vts = fetchVixTermStructure();
+        double vix = (vts.valid && vts.spot > 0.0) ? vts.spot : fetchVix();
+
+        if (vts.valid) {
+            log("INFO", "[OPTIONS_SCAN] VIX term structure: " + vts.label +
+                " (VIX=" + fmt(vts.spot, 1) +
+                " VIX3M=" + fmt(vts.vix3m, 1) +
+                " ratio=" + fmt(vts.ratio, 3) + ")");
+        } else {
+            log("WARN", "[OPTIONS_SCAN] Could not fetch VIX term structure — spot VIX only.");
+        }
+
         SpySnapshot spy = fetchSpy();
 
         AllocationStrategy regime{};
@@ -260,8 +277,13 @@ public:
                         " has earnings within 5 days — skipped.");
                     continue;
                 }
+                if (hasOpenPosition(ticker)) {
+                    log("INFO", "[OPTIONS_SCAN][DEDUP] " + ticker +
+                        " already has an open position — skipped to prevent doubling in.");
+                    continue;
+                }
                 auto result = evaluateTicker(ticker, effective_capital, tier,
-                                             fc_mode, vix, spy, regime);
+                                             fc_mode, vix, spy, regime, vts);
                 if (result) candidates.push_back(std::move(*result));
             } catch (const std::exception& e) {
                 log("WARN", "[OPTIONS_SCAN] Exception on " + ticker + ": " + e.what());
@@ -286,6 +308,28 @@ public:
 
         for (const auto& sc : candidates) {
             if (dispatched >= limit) break;
+
+            // VIX term structure gate: suppress SELL-premium auto-execution during
+            // backwardation (front vol > longer-dated vol = tail-risk regime).
+            // Advisory alerts still go out; only live execution is blocked.
+            bool is_sell_premium = (sc.signal.strategy == "CSP" || sc.signal.strategy == "CC" ||
+                                    sc.signal.strategy == "STRANGLE");
+            if (vts.valid && vts.label == "BACKWARDATION" && is_sell_premium) {
+                log("WARN", "[OPTIONS_SCAN][VIX_TERM] " + sc.signal.underlying +
+                    " SELL-premium execution suppressed — VIX backwardation (" +
+                    fmt(vts.ratio, 3) + "). Advisory alert sent.");
+                sendTelegram(
+                    "⚠️ *VIX TERM GATE — " + sc.signal.underlying + "*\n"
+                    "────────────────────────\n"
+                    "Strategy: " + sc.signal.strategy + "\n"
+                    "VIX3M/VIX = " + fmt(vts.ratio, 3) + " → *BACKWARDATION*\n"
+                    "Auto-execution suppressed — front vol > back vol signals tail risk.\n"
+                    "_Advisory signal still valid._"
+                );
+                dispatched++;
+                continue;
+            }
+
             sendTelegram(sc.formatted_alert);
             // WS5 — microstructure gate. The advisory alert always goes out, but
             // AUTO-EXECUTION is aborted when the live spread signals a liquidity
@@ -331,6 +375,7 @@ private:
     std::string tgToken_;
     std::string tgChatId_;
     RiskProfile profile_;
+    std::string dedup_db_path_; // path to PositionManager SQLite DB for dedup
     RegimeStateMachine regimeMachine_;
     nox::liquidity::LiquidityGate liquidity_gate_; // WS5 microstructure gate
 
@@ -344,6 +389,29 @@ private:
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(decimals) << v;
         return oss.str();
+    }
+
+    // Returns true if the PositionManager DB already has an open position for
+    // this underlying ticker. Prevents the scanner from doubling into the same
+    // underlying when a vol condition persists across multiple 30-minute cycles.
+    bool hasOpenPosition(const std::string& ticker) const {
+        if (dedup_db_path_.empty()) return false;
+        sqlite3* db = nullptr;
+        if (sqlite3_open_v2(dedup_db_path_.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+            sqlite3_close(db);
+            return false; // DB not accessible — fail open (don't block the signal)
+        }
+        const char* sql = "SELECT COUNT(*) FROM open_positions WHERE ticker = ?;";
+        sqlite3_stmt* stmt = nullptr;
+        int count = 0;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, ticker.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) == SQLITE_ROW)
+                count = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return count > 0;
     }
 
     // ── Capital / tier logic ──────────────────────────────────────────────────
@@ -490,6 +558,55 @@ private:
             }
         } catch (...) {}
         return -1.0;
+    }
+
+    // ── Market data: VIX term structure (spot VIX vs 3-month VIX) ───────────
+    //
+    // VIX3M/VIX > 1.05 → normal contango → short-vol is structurally favoured
+    // VIX3M/VIX < 0.95 → backwardation → front vol spiked → avoid selling premium
+    // Between 0.95–1.05 → neutral / inconclusive
+    //
+    // The ratio is used as a secondary regime signal: backwardation reduces
+    // regime_clearance for sell-premium strategies even in RISK_ON regime.
+
+    struct VixTermStructure {
+        double spot   = -1.0; // ^VIX
+        double vix3m  = -1.0; // ^VIX3M (91-day CBOE index)
+        double ratio  = 1.0;  // vix3m / spot
+        bool   valid  = false;
+        std::string label; // "CONTANGO" | "BACKWARDATION" | "FLAT"
+    };
+
+    VixTermStructure fetchVixTermStructure() const {
+        VixTermStructure ts;
+        auto fetchSymbol = [&](const std::string& symbol) -> double {
+            try {
+                httplib::Client cli("https://query1.finance.yahoo.com");
+                cli.set_connection_timeout(std::chrono::seconds(8));
+                cli.set_read_timeout(std::chrono::seconds(12));
+                std::string path = "/v8/finance/chart/" + symbol + "?interval=1d&range=2d";
+                auto res = cli.Get(path.c_str());
+                if (!res || res->status != 200) return -1.0;
+                auto body = json::parse(res->body);
+                const auto& closes = body.at("chart").at("result").at(0)
+                                          .at("indicators").at("quote").at(0).at("close");
+                for (int i = static_cast<int>(closes.size()) - 1; i >= 0; --i)
+                    if (!closes[i].is_null()) return closes[i].get<double>();
+            } catch (...) {}
+            return -1.0;
+        };
+
+        ts.spot  = fetchSymbol("%5EVIX");
+        ts.vix3m = fetchSymbol("%5EVIX3M");
+
+        if (ts.spot > 0.0 && ts.vix3m > 0.0) {
+            ts.ratio = ts.vix3m / ts.spot;
+            ts.valid  = true;
+            if (ts.ratio > 1.05)       ts.label = "CONTANGO";
+            else if (ts.ratio < 0.95)  ts.label = "BACKWARDATION";
+            else                       ts.label = "FLAT";
+        }
+        return ts;
     }
 
     // ── Market data: SPY ──────────────────────────────────────────────────────
@@ -1144,7 +1261,8 @@ private:
     // ── Telegram formatting ───────────────────────────────────────────────────
 
     std::string formatAlert(const OptionsSignal& s, double vix,
-                            const AllocationStrategy& regime) const
+                            const AllocationStrategy& regime,
+                            const VixTermStructure& vts = VixTermStructure{}) const
     {
         std::string leg2_str = (s.strike2 > 0)
             ? " / $" + fmt(s.strike2, 0)
@@ -1192,6 +1310,15 @@ private:
                                "% | HRV-30: " + fmt(s.hrv30 * 100.0, 1) +
                                "% → " + hrv_tag;
 
+        std::string vts_line;
+        if (vts.valid) {
+            std::string vts_emoji = (vts.label == "BACKWARDATION") ? "⚠️"
+                                  : (vts.label == "CONTANGO")      ? "✅" : "➖";
+            vts_line = "\n📉 *VIX Term Structure:* " + vts.label + " " + vts_emoji +
+                       " (VIX=" + fmt(vts.spot, 1) + " · VIX3M=" + fmt(vts.vix3m, 1) +
+                       " · ratio=" + fmt(vts.ratio, 3) + ")";
+        }
+
         std::string alert =
             "📊 *OPTIONS SIGNAL — " + s.underlying + "* [" + s.profile_name + " · " + s.capital_tier + "]\n"
             "────────────────────────────────────\n"
@@ -1216,7 +1343,8 @@ private:
             "\n🌐 *Macro Regime:* " + regime.log_message + " " + regime_emoji +
             " (VIX " + fmt(vix, 1) + ")\n"
             "🌡️ *Regime Clearance:* " + std::to_string(conf_pct) + "% "
-                "(100=RISK_ON · 65=TRANSITION · 0=RISK_OFF)\n"
+                "(100=RISK_ON · 65=TRANSITION · 0=RISK_OFF)" +
+            vts_line + "\n"
             "\n📋 _" + s.rationale + "_" +
             fc_footer + "\n"
             "⚠️ _Advisory only — manual execution required._";
@@ -1254,7 +1382,8 @@ private:
         const std::string& ticker,
         double effective_capital, const std::string& tier, bool fc_mode,
         double vix, const SpySnapshot& spy,
-        const AllocationStrategy& regime)
+        const AllocationStrategy& regime,
+        const VixTermStructure& vts = VixTermStructure{})
     {
         log("INFO", "[OPTIONS_SCAN] Scanning " + ticker + "...");
 
@@ -1309,7 +1438,7 @@ private:
                                            iv_rank, iv_sigma, rfr, regime_clearance,
                                            tier, fc_mode, effective_capital, d.hrv30);
 
-        std::string alert = formatAlert(sig, vix, regime);
+        std::string alert = formatAlert(sig, vix, regime, vts);
         return scoreSignal(sig, alert, d);
     }
 

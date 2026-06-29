@@ -159,6 +159,61 @@ private:
 
     // Position Manager (for options)
     std::unique_ptr<PositionManager> positionManager_;
+    std::string memory_bank_path_; // stored so OptionsSignalGenerator can query it for dedup
+
+    // ── Drawdown circuit breaker ───────────────────────────────────────────────
+    // Tracks peak portfolio equity and halts the options scanner when the
+    // peak-to-trough drawdown exceeds DRAWDOWN_HALT_PCT (default 10%).
+    double            peak_equity_        = 0.0;
+    std::atomic<bool> scanner_halt_drawdown_{false};
+    std::mutex        peak_equity_mutex_;
+    double            drawdown_halt_pct_  = 0.10; // read from DRAWDOWN_HALT_PCT env
+
+    // Returns true if the drawdown circuit breaker just fired (new halt).
+    bool updateDrawdown(double current_equity) {
+        std::lock_guard<std::mutex> lock(peak_equity_mutex_);
+        if (current_equity > peak_equity_) {
+            peak_equity_ = current_equity;
+        }
+        if (peak_equity_ <= 0.0) return false;
+
+        double drawdown = (peak_equity_ - current_equity) / peak_equity_;
+        bool was_halted = scanner_halt_drawdown_.load();
+
+        if (!was_halted && drawdown >= drawdown_halt_pct_) {
+            scanner_halt_drawdown_.store(true);
+            Logger::log("CRITICAL",
+                "[DRAWDOWN] Circuit breaker FIRED: drawdown=" +
+                std::to_string(drawdown * 100.0) + "% ≥ threshold=" +
+                std::to_string(drawdown_halt_pct_ * 100.0) +
+                "%. Options scanner HALTED.");
+            TelegramNotifier::sendMessage(
+                "🚨 *DRAWDOWN CIRCUIT BREAKER*\n"
+                "────────────────────────\n"
+                "• *Drawdown:* " + std::to_string(drawdown * 100.0) + "% from peak\n"
+                "• *Peak Equity:* $" + std::to_string(peak_equity_) + "\n"
+                "• *Current:* $" + std::to_string(current_equity) + "\n"
+                "⛔ Options scanner halted — new entries suspended.\n"
+                "_Existing positions continue to be monitored._"
+            );
+            return true;
+        }
+
+        // Recovery: if drawdown falls back below 50% of threshold, clear the halt
+        if (was_halted && drawdown < drawdown_halt_pct_ * 0.50) {
+            scanner_halt_drawdown_.store(false);
+            Logger::log("INFO",
+                "[DRAWDOWN] Circuit breaker CLEARED: drawdown=" +
+                std::to_string(drawdown * 100.0) + "% — scanner resumed.");
+            TelegramNotifier::sendMessage(
+                "✅ *DRAWDOWN CIRCUIT BREAKER CLEARED*\n"
+                "────────────────────────\n"
+                "• *Drawdown:* " + std::to_string(drawdown * 100.0) + "% (recovered)\n"
+                "• Options scanner RESUMED."
+            );
+        }
+        return false;
+    }
 
     // Options signal scanner profiles (configured from env vars in the constructor)
     nox::options_signal::RiskProfile optionsBotProfile_;
@@ -221,6 +276,11 @@ private:
     std::unique_ptr<nox::ibkr::IBKRWrapper>     ibkr_wrapper_;
     std::unique_ptr<nox::ibkr::IBKRConnection>  ibkr_conn_;
     std::unique_ptr<nox::ibkr::IBKROrderRouter> ibkr_router_;
+
+    // Tracks equity position sizes submitted via IBKR BUY orders so the SELL
+    // path can use the correct quantity (IBKR has no liquidate-all REST API).
+    // Guarded by china_positions_mutex_ (reused since access is already serialised).
+    std::map<std::string, int> ibkr_position_qty_;
 #endif
 
     // CN-RULE-002: T+1 position state — maps ticker → entry date.
@@ -426,6 +486,36 @@ private:
             Logger::log("INFO", "[EXECUTION] SELL signal for " + sig.ticker + ". Closing position.");
 #ifdef IBKR_ENABLED
             if (execution_venue_ == "ibkr") {
+                // Resolve position size from the local tracker populated on BUY.
+                int sell_qty = 0;
+                {
+                    std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                    auto it = ibkr_position_qty_.find(sig.ticker);
+                    if (it != ibkr_position_qty_.end()) {
+                        sell_qty = it->second;
+                        ibkr_position_qty_.erase(it);
+                    }
+                }
+
+                if (sell_qty <= 0) {
+                    Logger::log("WARN",
+                        "[IBKR] SELL for " + sig.ticker +
+                        ": no tracked position size (position may pre-date this engine instance). "
+                        "Manual close required.");
+                    TelegramNotifier::sendMessage(
+                        "⚠️ *IBKR SELL — No Position Record*\n"
+                        "────────────────────────\n"
+                        "• *Ticker:* " + sig.ticker + "\n"
+                        "• No IBKR position size tracked. Log into TWS and close manually.\n"
+                        "_This occurs when the BUY was placed before this engine instance started._"
+                    );
+                    // Evict T+1 record regardless.
+                    std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                    china_positions_.erase(sig.ticker);
+                    persist_china_positions_locked();
+                    return;
+                }
+
                 Contract stock;
                 stock.symbol   = sig.ticker;
                 stock.secType  = "STK";
@@ -435,22 +525,23 @@ private:
                 Order mkt_order;
                 mkt_order.action        = "SELL";
                 mkt_order.orderType     = "MKT";
-                mkt_order.totalQuantity = 0;  // 0 = liquidate full position via IBKR
-                // IBKR does not have a "close all" API like Alpaca's DELETE /positions.
-                // totalQuantity=0 is invalid — the operator must track qty or query positions.
-                // For now we log a warning and Telegram-alert for manual action.
-                Logger::log("WARN",
-                    "[IBKR] SELL routed to IBKR: qty unknown without position query. "
-                    "Manual review required to confirm close.");
+                mkt_order.totalQuantity = static_cast<double>(sell_qty);
+                mkt_order.tif           = "DAY";
+
+                OrderId oid = ibkr_wrapper_->reserveOrderId();
+                ibkr_conn_->placeOrder(oid, stock, mkt_order);
+
+                Logger::log("INFO", "[IBKR] SELL order placed: " + sig.ticker +
+                            " qty=" + std::to_string(sell_qty) + " orderId=" + std::to_string(oid));
                 TelegramNotifier::sendMessage(
-                    "⚠️ *IBKR SELL — Manual Action Required*\n"
+                    "⚪ *SELL ORDER → IBKR*\n"
                     "────────────────────────\n"
                     "• *Ticker:* " + sig.ticker + "\n"
-                    "• IBKR lacks a liquidate-all REST API. Log into TWS/Gateway and\n"
-                    "  close the position manually, or implement a position query to get qty."
+                    "• *Qty:* " + std::to_string(sell_qty) + " shares\n"
+                    "• *IBKR OrderId:* `" + std::to_string(oid) + "`"
                 );
 
-                // Evict T+1 record regardless.
+                // Evict T+1 record.
                 {
                     std::lock_guard<std::mutex> lock(china_positions_mutex_);
                     china_positions_.erase(sig.ticker);
@@ -715,6 +806,11 @@ private:
                 OrderId oid = ibkr_wrapper_->reserveOrderId();
                 ibkr_conn_->placeOrder(oid, stock, mkt_order);
 
+                // Track position size so the SELL path can close the correct quantity.
+                {
+                    std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                    ibkr_position_qty_[sig.ticker] = qty;
+                }
                 Logger::log("INFO", "[IBKR] BUY order placed: " + sig.ticker +
                             " qty=" + std::to_string(qty) + " orderId=" + std::to_string(oid));
                 TelegramNotifier::sendMessage(
@@ -1018,6 +1114,17 @@ public:
                     : ""));
         }
 
+        // Drawdown circuit breaker threshold (env var, default 10%)
+        const char* dd_env = std::getenv("DRAWDOWN_HALT_PCT");
+        if (dd_env && std::string(dd_env) != "") {
+            try {
+                double pct = std::stod(std::string(dd_env));
+                if (pct > 0.0 && pct < 1.0) drawdown_halt_pct_ = pct;
+            } catch (...) {}
+        }
+        Logger::log("INFO", "[DRAWDOWN] Circuit breaker threshold: " +
+                    std::to_string(drawdown_halt_pct_ * 100.0) + "%");
+
         // Initialize and start the Position Manager
         try {
             auto order_router = std::make_shared<nox::options_router::OptionsOrderRouter>(
@@ -1026,12 +1133,12 @@ public:
             // MEMORY_BANK_PATH must point to the volume-mounted data directory so the
             // options position DB survives container restarts. Default: /app/data.
             const char* mb_env = std::getenv("MEMORY_BANK_PATH");
-            std::string memory_bank_path = (mb_env && std::string(mb_env) != "")
+            memory_bank_path_ = (mb_env && std::string(mb_env) != "")
                 ? std::string(mb_env)
                 : "/app/data/memory_bank.db";
-            positionManager_ = std::make_unique<PositionManager>(memory_bank_path, *order_router);
+            positionManager_ = std::make_unique<PositionManager>(memory_bank_path_, *order_router);
             positionManager_->start_monitoring();
-            Logger::log("INFO", "[POS_MANAGER] Position Manager initialized and monitoring thread started.");
+            Logger::log("INFO", "[POS_MANAGER] Position Manager initialized at " + memory_bank_path_);
         } catch (const std::exception& e) {
             std::cerr << "[FATAL] [POS_MANAGER] Failed to initialize Position Manager: "
                       << e.what() << ". Refusing to start." << std::endl;
@@ -1091,6 +1198,76 @@ public:
         svr.Get("/health", [](const httplib::Request &, httplib::Response &res) {
             json health_response = {{"status", "healthy"}};
             res.set_content(health_response.dump(), "application/json");
+        });
+
+        // Returns aggregated portfolio-level Greeks across all open options positions.
+        // Greeks are re-computed on each request using Black-Scholes with stored entry
+        // data (spot price = entry_price used as proxy; for production use a live quote).
+        svr.Get("/portfolio/greeks", [this](const httplib::Request&, httplib::Response& res) {
+            try {
+                auto positions = positionManager_->get_open_positions_public();
+
+                double total_delta = 0.0, total_gamma = 0.0;
+                double total_theta = 0.0, total_vega  = 0.0;
+                double notional    = 0.0;
+
+                for (const auto& pos : positions) {
+                    // Re-compute BS Greeks using stored position data.
+                    // entry_price is the BS theoretical option price at signal time.
+                    // Derive approximate time-to-expiry from today → expiration_date.
+                    double expiry_years = 0.0;
+                    {
+                        auto now    = std::chrono::system_clock::now();
+                        auto time_t = std::chrono::system_clock::to_time_t(now);
+                        std::tm tm_now{};
+                        gmtime_r(&time_t, &tm_now);
+
+                        int ey, em, ed;
+                        std::sscanf(pos.expiration_date.c_str(), "%d-%d-%d", &ey, &em, &ed);
+                        // Rough days-to-expiry: treat months/years as 365-day approximation
+                        int days_exp = (ey - (1900 + tm_now.tm_year)) * 365
+                                     + (em - 1 - tm_now.tm_mon) * 30
+                                     + (ed - tm_now.tm_mday);
+                        expiry_years = std::max(0.0, days_exp / 365.0);
+                    }
+
+                    nox::options::OptionContract contract;
+                    // We don't store the underlying price — use entry_price * 4 as a rough
+                    // ATM proxy (option price ≈ 1–5% of underlying for ATM 30-DTE).
+                    // For production, fetch live price; this gives directional sign only.
+                    contract.underlying     = pos.strike; // ATM approximation
+                    contract.strike         = pos.strike;
+                    contract.expiry         = expiry_years;
+                    contract.risk_free_rate = 0.05;
+                    contract.volatility     = 0.25; // VIX-neutral proxy
+                    contract.type = (pos.option_type == "call")
+                                    ? nox::options::OptionType::Call
+                                    : nox::options::OptionType::Put;
+
+                    auto g = nox::options::compute_greeks(contract, false);
+                    double sign = (pos.profile_type == "short_premium") ? -1.0 : 1.0;
+
+                    total_delta += g.delta * sign * pos.quantity * 100.0;
+                    total_gamma += g.gamma * sign * pos.quantity * 100.0;
+                    total_theta += g.theta * sign * pos.quantity * 100.0;
+                    total_vega  += g.vega  * sign * pos.quantity * 100.0;
+                    notional    += pos.entry_price * pos.quantity * 100.0;
+                }
+
+                json response = {
+                    {"open_positions",    static_cast<int>(positions.size())},
+                    {"total_delta",       std::round(total_delta * 1000.0) / 1000.0},
+                    {"total_gamma",       std::round(total_gamma * 10000.0) / 10000.0},
+                    {"total_theta",       std::round(total_theta * 100.0) / 100.0},
+                    {"total_vega",        std::round(total_vega  * 100.0) / 100.0},
+                    {"notional_exposure", std::round(notional * 100.0) / 100.0},
+                    {"note", "Greeks computed from entry data; use /options/price for live greeks"}
+                };
+                res.set_content(response.dump(), "application/json");
+            } catch (const std::exception& e) {
+                res.status = 500;
+                res.set_content(std::string("Greeks computation failed: ") + e.what(), "text/plain");
+            }
         });
 
         svr.Get("/last-report", [this](const httplib::Request &, httplib::Response &res) {
@@ -1314,14 +1491,22 @@ public:
                 std::string tg_token = std::getenv("TELEGRAM_BOT_TOKEN") ? std::getenv("TELEGRAM_BOT_TOKEN") : "";
                 std::string tg_chat  = std::getenv("TELEGRAM_CHAT_ID")   ? std::getenv("TELEGRAM_CHAT_ID")   : "";
 
+                // Pass memory_bank_path_ for open-position deduplication.
                 nox::options_signal::OptionsSignalGenerator generator(
-                    alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat, profile);
+                    alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat, profile,
+                    memory_bank_path_);
 
                 while (running_.load()) {
                     try {
                         double equity = fetch_account_equity();
                         if (equity > 0.0) {
-                            generator.run_scan(equity);
+                            updateDrawdown(equity);
+                            if (scanner_halt_drawdown_.load()) {
+                                Logger::log("WARN", "[OPTIONS_SIGNAL][" + profile.name +
+                                            "] Drawdown circuit breaker active — scan skipped.");
+                            } else {
+                                generator.run_scan(equity);
+                            }
                         } else {
                             Logger::log("WARN", "[OPTIONS_SIGNAL][" + profile.name +
                                         "] Skipping scan — equity unavailable.");

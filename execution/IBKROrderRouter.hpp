@@ -63,12 +63,22 @@ static Contract make_option_contract(
 }
 
 // Build a market order for a single-leg contract.
-// action: "BUY" or "SELL"
 static Order make_market_order(const std::string& action, int qty) {
     Order o;
     o.action        = action;
     o.orderType     = "MKT";
     o.totalQuantity = static_cast<double>(qty);
+    o.tif           = "DAY";
+    return o;
+}
+
+// Build a DAY limit order. limit_price must be > 0.
+static Order make_limit_order(const std::string& action, int qty, double limit_price) {
+    Order o;
+    o.action        = action;
+    o.orderType     = "LMT";
+    o.totalQuantity = static_cast<double>(qty);
+    o.lmtPrice      = limit_price;
     o.tif           = "DAY";
     return o;
 }
@@ -91,10 +101,11 @@ public:
         const std::string expiry = to_ibkr_expiry(sig.expiry_date);
         const std::string s      = sig.strategy;
 
-        if      (s == "LONG_CALL")        return route_single(sig, expiry, sig.strike,  "C", "BUY",  qty_contracts);
-        else if (s == "LONG_PUT")         return route_single(sig, expiry, sig.strike,  "P", "BUY",  qty_contracts);
-        else if (s == "CSP")              return route_single(sig, expiry, sig.strike,  "P", "SELL", qty_contracts);
-        else if (s == "CC")               return route_single(sig, expiry, sig.strike,  "C", "SELL", qty_contracts);
+        double mid = sig.entry_price; // BS theoretical mid — starting limit price
+        if      (s == "LONG_CALL")        return route_single(sig, expiry, sig.strike,  "C", "BUY",  qty_contracts, mid, true);
+        else if (s == "LONG_PUT")         return route_single(sig, expiry, sig.strike,  "P", "BUY",  qty_contracts, mid, true);
+        else if (s == "CSP")              return route_single(sig, expiry, sig.strike,  "P", "SELL", qty_contracts, mid, false);
+        else if (s == "CC")               return route_single(sig, expiry, sig.strike,  "C", "SELL", qty_contracts, mid, false);
         else if (s == "BULL_CALL_SPREAD") return route_spread(sig, expiry, "C", qty_contracts);
         else if (s == "BEAR_PUT_SPREAD")  return route_spread(sig, expiry, "P", qty_contracts);
         else if (s == "STRADDLE")         return route_straddle(sig, expiry, qty_contracts);
@@ -106,20 +117,66 @@ private:
     IBKRConnection& conn_;
     IBKRWrapper&    wrapper_;
 
-    // ── Single-leg ───────────────────────────────────────────────────────────
+    // ── Single-leg with limit + retry ────────────────────────────────────────
+    // Sends a limit order at mid price, polls for fill, steps 10% toward the
+    // fill-side price on each of 2 retries, then cancels and returns false.
+    // entry_mid: BS theoretical mid (starting limit); 0.0 → use market fallback.
+    // side_is_buy: true = buying (step price toward ask), false = selling (toward bid).
     bool route_single(
         const nox::options_signal::OptionsSignal& sig,
         const std::string& expiry,
         double             strike,
         const std::string& right,   // "C" or "P"
         const std::string& action,  // "BUY" or "SELL"
-        int                qty
+        int                qty,
+        double             entry_mid = 0.0,
+        bool               side_is_buy = true
     ) {
         Contract c = make_option_contract(sig.underlying, expiry, strike, right);
-        Order    o = make_market_order(action, qty);
-        OrderId  id = wrapper_.reserveOrderId();
-        conn_.placeOrder(id, c, o);
-        return true;
+
+        if (entry_mid <= 0.0) {
+            // No price hint — fall back to market order
+            Order o = make_market_order(action, qty);
+            OrderId id = wrapper_.reserveOrderId();
+            conn_.placeOrder(id, c, o);
+            return true;
+        }
+
+        // Estimate fill-side price (ask for buys, bid for sells) as ±10% of mid
+        double far = side_is_buy ? entry_mid * 1.10 : entry_mid * 0.90;
+
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            double step_frac  = attempt * 0.10;
+            double limit_price = entry_mid + (far - entry_mid) * step_frac;
+            limit_price = std::round(limit_price * 100.0) / 100.0;
+            limit_price = std::max(limit_price, 0.01);
+
+            OrderId id = wrapper_.reserveOrderId();
+            Order   o  = make_limit_order(action, qty, limit_price);
+            conn_.placeOrder(id, c, o);
+
+            // Poll for fill for 30 seconds
+            bool filled = false;
+            for (int sec = 0; sec < 30; ++sec) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                OrderUpdate upd;
+                if (wrapper_.latestStatus(id, upd)) {
+                    if (upd.status == "Filled" || upd.status == "PartiallyFilled") {
+                        filled = true;
+                        break;
+                    }
+                    if (upd.status == "Cancelled" || upd.status == "Inactive") break;
+                }
+            }
+            if (filled) return true;
+
+            // Cancel unfilled order before retry
+            conn_.cancelOrder(id);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+            if (attempt == 2) return false; // all retries exhausted
+        }
+        return false;
     }
 
     // ── Vertical spread (BULL_CALL_SPREAD / BEAR_PUT_SPREAD) ─────────────────
