@@ -1,4 +1,7 @@
 #define CPPHTTPLIB_OPENSSL_SUPPORT
+#include <atomic>
+#include <condition_variable>
+#include <csignal>
 #include <iostream>
 #include <chrono>
 #include <thread>
@@ -11,62 +14,31 @@
 #include <cctype>
 #include <ctime>
 #include "../shared/RegimeStateMachine.hpp"
-#include "httplib.h"               // Add this for HTTP Client capabilities
-#include "nlohmann/json.hpp"       // Add this for JSON creation
+#include "../shared/TelegramNotifier.hpp"
+#include "httplib.h"
+#include "nlohmann/json.hpp"
 
-// Lightweight Telegram Notifier using httplib
-class TelegramNotifier {
-public:
-    TelegramNotifier(const std::string& token, const std::string& chat_id)
-        : bot_token_(token), chat_id_(chat_id) {
-        if (bot_token_.empty() || chat_id_.empty()) {
-            std::cerr << "⚠️  [TELEGRAM] Token or Chat ID is empty. Notifications disabled." << std::endl;
-            is_enabled_ = false;
-        } else {
-            std::cout << "[INFO] Telegram Notifier enabled for Chat ID: " << chat_id_ << std::endl;
-            is_enabled_ = true;
-        }
-    }
+using TelegramNotifier = nox::TelegramNotifier;
 
-    void send(const std::string& message) {
-        if (!is_enabled_) return;
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+// The analyst sleeps for up to ANALYST_CYCLE_HOURS between cycles; without this,
+// SIGTERM would leave it blocked in sleep_for() for hours.
+static std::atomic<bool>       g_running{true};
+static std::mutex              g_stop_mutex;
+static std::condition_variable g_stop_cv;
 
-        std::string encoded_message = url_encode(message);
+static void handle_signal(int) {
+    g_running.store(false);
+    g_stop_cv.notify_all();
+}
 
-        httplib::Client cli("https://api.telegram.org");
-        cli.set_connection_timeout(std::chrono::seconds(10));
-        
-        std::string path = "/bot" + bot_token_ + "/sendMessage?chat_id=" + chat_id_ + "&text=" + encoded_message;
-
-        auto res = cli.Get(path.c_str());
-
-        if (!res || res->status != 200) {
-            std::cerr << "❌ [TELEGRAM] Failed to send message. Status: "
-                      << (res ? std::to_string(res->status) : "No Response") << "\\n"
-                      << (res ? res->body : "") << std::endl;
-        }
-    }
-
-private:
-    std::string url_encode(const std::string& value) {
-        std::ostringstream escaped;
-        escaped.fill('0');
-        escaped << std::hex;
-
-        for (char c : value) {
-            if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-                escaped << c;
-            } else {
-                escaped << '%' << std::setw(2) << std::uppercase << (int)(unsigned char)c;
-            }
-        }
-        return escaped.str();
-    }
-
-    std::string bot_token_;
-    std::string chat_id_;
-    bool is_enabled_ = false;
-};
+// Interruptible sleep: returns early if SIGTERM fires.
+static void interruptible_sleep(double hours) {
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::duration<double>(hours * 3600.0));
+    std::unique_lock<std::mutex> lk(g_stop_mutex);
+    g_stop_cv.wait_for(lk, duration, [] { return !g_running.load(); });
+}
 
 using json = nlohmann::json;
 
@@ -192,17 +164,17 @@ SpyData fetch_spy_data() {
 
 // Orchestrates both data fetches and returns a single combined MarketSnapshot.
 // Both sources are Yahoo Finance — no Alpaca data API subscription required.
-MarketSnapshot fetch_market_snapshot(TelegramNotifier& notifier) {
+MarketSnapshot fetch_market_snapshot() {
     double vix  = fetch_vix();
     SpyData spy = fetch_spy_data();
 
     bool had_error = false;
     if (vix < 0.0) {
-        notifier.send("🔴 ANALYST CRITICAL: Failed to fetch VIX data from Yahoo Finance. Market analysis is compromised.");
+        TelegramNotifier::sendMessage("🔴 ANALYST CRITICAL: Failed to fetch VIX data from Yahoo Finance. Market analysis is compromised.");
         had_error = true;
     }
     if (!spy.valid) {
-        notifier.send("🔴 ANALYST CRITICAL: Failed to fetch SPY data from Yahoo Finance. Market analysis is compromised.");
+        TelegramNotifier::sendMessage("🔴 ANALYST CRITICAL: Failed to fetch SPY data from Yahoo Finance. Market analysis is compromised.");
         had_error = true;
     }
 
@@ -372,11 +344,8 @@ int main() {
     }
     std::string alpaca_api_secret = env_api_secret;
 
-    const char* env_tg_token = std::getenv("TELEGRAM_BOT_TOKEN");
-    const char* env_tg_chat_id = std::getenv("TELEGRAM_CHAT_ID");
-    std::string tg_token = env_tg_token ? env_tg_token : "";
-    std::string tg_chat_id = env_tg_chat_id ? env_tg_chat_id : "";
-    TelegramNotifier notifier(tg_token, tg_chat_id);
+    std::signal(SIGTERM, handle_signal);
+    std::signal(SIGINT,  handle_signal);
 
     // RULE-001 — Cycle interval MUST come from the environment; never hardcoded.
     // Allows the interval to be tightened (e.g., to 1–4 h) during elevated-volatility
@@ -397,9 +366,9 @@ int main() {
     }
     std::cout << "[INFO] [ANALYST] Cycle interval set to " << cycle_hours << " hour(s)." << std::endl;
 
-    while (true) {
+    while (g_running.load()) {
         // 1. Fetch live market data (VIX + SPY both from Yahoo Finance)
-        MarketSnapshot snapshot = fetch_market_snapshot(notifier);
+        MarketSnapshot snapshot = fetch_market_snapshot();
 
         if (!snapshot.valid) {
             std::cerr << "⚠️  [ANALYST] Failed to obtain a valid market snapshot. Skipping cycle." << std::endl;
@@ -491,17 +460,17 @@ int main() {
 
         if (!success) {
             std::cerr << "[ERROR] [ANALYST] CRITICAL: All retry attempts exhausted. Failed to send payload to Execution Engine." << std::endl;
-            notifier.send("🔴 ANALYST CRITICAL: All 5 retries exhausted. The Analyst C++ brain CANNOT communicate with the Execution Engine. Manual intervention required.");
+            TelegramNotifier::sendMessage("🔴 ANALYST CRITICAL: All 5 retries exhausted. The Analyst C++ brain CANNOT communicate with the Execution Engine. Manual intervention required.");
         } else {
-            std::string success_message = "✅ Analyst cycle complete. " + current_strategy.log_message;
-            notifier.send(success_message);
+            TelegramNotifier::sendMessage("✅ Analyst cycle complete. " + current_strategy.log_message);
         }
 
         // RULE-001 — Sleep for the env-configured interval, not a hardcoded 24 h.
+        // Uses an interruptible condition variable so SIGTERM wakes the thread
+        // immediately rather than waiting up to ANALYST_CYCLE_HOURS to exit.
         std::cout << "[INFO] [ANALYST] Cycle complete. Sleeping for "
                   << cycle_hours << " hour(s)." << std::endl;
-        auto sleep_duration = std::chrono::duration<double>(cycle_hours * 3600.0);
-        std::this_thread::sleep_for(sleep_duration);
+        interruptible_sleep(cycle_hours);
     }
    
      return 0;

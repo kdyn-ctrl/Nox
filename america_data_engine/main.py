@@ -30,10 +30,14 @@ WEBHOOK_SECRET = _require_env("WEBHOOK_SECRET_TOKEN")
 print("[INFO] [AMERICA-DATA-ENGINE] All required environment variables validated.", flush=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Watchlist for earnings monitoring
+# Watchlist for earnings monitoring and news sentiment.
+# Driven by NOX_WATCHLIST_US (domestic) + NOX_WATCHLIST_CN (Chinese ADRs) so
+# that all services draw from the same source-of-truth in .env / docker-compose.
 # RULE-008: Earnings calendar is cached in-memory and refreshed once every 24h.
 # ─────────────────────────────────────────────────────────────────────────────
-WATCHLIST = ["AAPL", "TSLA", "NVDA", "MSFT", "BABA", "JD", "PDD", "BIDU", "NIO"]
+_us_raw = os.getenv("NOX_WATCHLIST_US", "AAPL,TSLA,NVDA,MSFT")
+_cn_raw = os.getenv("NOX_WATCHLIST_CN", "BABA,JD,PDD,BIDU,NIO")
+WATCHLIST = [t.strip() for t in (_us_raw + "," + _cn_raw).split(",") if t.strip()]
 
 # ---------------------------------------------------------------------------
 # Auth gate — RULE-004 style: every internal endpoint requires the shared
