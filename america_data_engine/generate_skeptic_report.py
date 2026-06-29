@@ -24,7 +24,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from scrapers import fetch_alpaca_news, fetch_earnings_calendar
+from scrapers import fetch_alpaca_news, fetch_news_with_fallback, fetch_earnings_calendar
 from contradiction_vector import run_contradiction_check
 from insider_cluster import detect_insider_clusters
 from alt_macro import run_alt_macro_check
@@ -45,9 +45,9 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 def _run_contradiction() -> tuple[str, dict, str | None]:
     try:
-        print("[WS6] Fetching news for contradiction check...", flush=True)
-        news = fetch_alpaca_news()
-        print(f"[WS6] {len(news)} article(s) fetched.", flush=True)
+        print("[WS6] Fetching news for contradiction check (multi-source with fallback)...", flush=True)
+        news = fetch_news_with_fallback()
+        print(f"[WS6] {len(news)} article(s) fetched from primary/backup sources.", flush=True)
         result = run_contradiction_check(news)
         print(f"[WS6] Contradiction check: {len(result.get('results', []))} ticker(s) evaluated.", flush=True)
         return "contradiction", result, None

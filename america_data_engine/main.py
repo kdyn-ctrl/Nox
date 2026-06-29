@@ -10,6 +10,10 @@ from fastapi.security import APIKeyHeader
 
 from scrapers import (
     fetch_alpaca_news,
+    fetch_newsapi_news,
+    fetch_polygon_news,
+    fetch_rss_news,
+    fetch_news_with_fallback,
     fetch_earnings_calendar,
 )
 from contradiction_vector import run_contradiction_check
@@ -74,11 +78,12 @@ _CACHE: Dict[str, Any] = {
 def _refresh_cache() -> None:
     """
     Background worker — runs on startup and then every 15 minutes via APScheduler.
-    Refreshes news only (lightweight); earnings are refreshed separately every 24h.
+    Refreshes news with fallback logic (Alpaca → NewsAPI → Polygon → RSS).
+    Earnings are refreshed separately every 24h.
     """
-    print("[INFO] [AMERICA-DATA-ENGINE] Starting scheduled news scrape...", flush=True)
+    print("[INFO] [AMERICA-DATA-ENGINE] Starting scheduled news scrape with fallback logic...", flush=True)
 
-    news_us = fetch_alpaca_news()
+    news_us = fetch_news_with_fallback()
     if news_us:
         _CACHE["news_us"] = news_us
 
@@ -88,6 +93,8 @@ def _refresh_cache() -> None:
             _CACHE["contradiction"] = run_contradiction_check(news_us)
         except Exception as e:
             print(f"[WARN] [AMERICA-DATA-ENGINE] Contradiction check failed: {e}", flush=True)
+    else:
+        print("[WARN] [AMERICA-DATA-ENGINE] All news sources failed — contradiction cache not updated.", flush=True)
 
     _CACHE["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
     print(f"[INFO] [AMERICA-DATA-ENGINE] News refresh complete at {_CACHE['last_updated']}.",

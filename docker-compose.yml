@@ -16,6 +16,9 @@ services:
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
       - ALPACA_API_KEY=${ALPACA_API_KEY}
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      # Backup news sources (optional; if missing, gracefully skipped)
+      - NEWSAPI_KEY=${NEWSAPI_KEY:-}
+      - POLYGON_API_KEY=${POLYGON_API_KEY:-}
       # WS1 — Contradiction Vector: reach heartbeat's IV skew endpoint + tuning.
       - HEARTBEAT_BASE_URL=${HEARTBEAT_BASE_URL:-http://heartbeat-monitor:8002}
       - CONTRADICTION_SKEW_THRESHOLD=${CONTRADICTION_SKEW_THRESHOLD:-0.03}
@@ -74,6 +77,11 @@ services:
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     volumes:
       - ./logs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: 10
     networks:
       - nox_net
 
@@ -106,6 +114,11 @@ services:
       - CN_POSITIONS_PATH=/app/data/china_positions.json
     volumes:
       - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: 10
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.execution-webhook.rule=Path(`/webhook`)"

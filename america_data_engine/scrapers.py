@@ -214,6 +214,225 @@ def fetch_alpaca_news() -> List[Dict[str, Any]]:
         return []
 
 
+def fetch_newsapi_news() -> List[Dict[str, Any]]:
+    """
+    Fetches news from NewsAPI (free tier: 100 req/day, includes global + tech + finance).
+    Filters for market-relevant keywords to avoid pure noise.
+    Backup source if Alpaca fails.
+    """
+    api_key = os.getenv("NEWSAPI_KEY")
+    if not api_key:
+        return []
+
+    try:
+        url = "https://newsapi.org/v2/everything"
+        # Market-relevant keywords: earnings, inflation, Fed, tech, energy, geopolitics
+        q = "(earnings OR inflation OR \"federal reserve\" OR fed OR nvda OR tsla OR aapl OR msft OR tech OR tariff OR sanctions OR oil OR energy) AND (market OR stock OR trading OR business)"
+        params = {
+            "q": q,
+            "sortBy": "publishedAt",
+            "language": "en",
+            "pageSize": 20,
+            "apiKey": api_key,
+        }
+
+        response = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        articles = response.json().get("articles", [])
+
+        result = []
+        for article in articles:
+            # Extract tickers from headline/description using regex
+            headline = article.get("title", "")
+            description = article.get("description", "")
+            symbols = list(set(_TICKER_RE.findall(headline) + _TICKER_RE.findall(description)))
+
+            result.append({
+                "source": article.get("source", {}).get("name", "NewsAPI"),
+                "headline": headline,
+                "summary": description,
+                "url": article.get("url"),
+                "timestamp": article.get("publishedAt"),
+                "symbols": symbols,
+            })
+
+        score_news_batch(result)
+        print(f"[INFO] [SCRAPER] NewsAPI backup fetched ({len(result)} articles, sentiment scored).", flush=True)
+        return result
+    except requests.RequestException as e:
+        print(f"[WARN] [SCRAPER] NewsAPI backup fetch failed: {e}", flush=True)
+        return []
+
+
+def fetch_polygon_news() -> List[Dict[str, Any]]:
+    """
+    Fetches news from Polygon.io free tier.
+    Includes market, tech, and general news with high relevance to trading.
+    Second backup source.
+    """
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        return []
+
+    try:
+        url = "https://api.polygon.io/v2/reference/news"
+        params = {
+            "limit": 20,
+            "sort": "-published_utc",
+            "apiKey": api_key,
+        }
+
+        response = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        results = response.json().get("results", [])
+
+        result = []
+        for article in results:
+            symbols = article.get("tickers", [])
+
+            result.append({
+                "source": "Polygon.io",
+                "headline": article.get("title", ""),
+                "summary": article.get("description", ""),
+                "url": article.get("article_url"),
+                "timestamp": article.get("published_utc"),
+                "symbols": symbols,
+            })
+
+        score_news_batch(result)
+        print(f"[INFO] [SCRAPER] Polygon backup fetched ({len(result)} articles, sentiment scored).", flush=True)
+        return result
+    except requests.RequestException as e:
+        print(f"[WARN] [SCRAPER] Polygon backup fetch failed: {e}", flush=True)
+        return []
+
+
+def fetch_rss_news() -> List[Dict[str, Any]]:
+    """
+    Fetches news from free RSS feeds (Reuters, CNBC, DW News).
+    Provides geopolitical + earnings + market news without API key requirements.
+    Last-resort fallback source.
+    """
+    try:
+        import xml.etree.ElementTree as ET
+    except ImportError:
+        return []
+
+    feeds = [
+        ("Reuters Markets", "https://www.reutersagency.com/feed/?taxonomy=best-topics&post_type=best-news&storyline=market_news"),
+        ("Reuters Business", "https://feeds.reuters.com/reuters/businessNews"),
+        ("Reuters Tech", "https://feeds.reuters.com/reuters/technologyNews"),
+        ("CNBC Top News", "https://feeds.cnbc.com/id/100003114/device/rss/rss.html"),
+        ("DW Business", "https://www.dw.com/en/business/s-9097"),
+    ]
+
+    result = []
+
+    for feed_name, feed_url in feeds:
+        try:
+            response = requests.get(feed_url, timeout=(5, 8))
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+
+            # RSS 2.0 standard: items are under /rss/channel/item
+            for item in root.findall(".//item")[:5]:  # limit to 5 per feed
+                title = item.findtext("title", "")
+                desc = item.findtext("description", "")
+                pub_date = item.findtext("pubDate")
+                link = item.findtext("link")
+
+                # Extract tickers from title
+                symbols = _TICKER_RE.findall(title)
+
+                result.append({
+                    "source": feed_name,
+                    "headline": title,
+                    "summary": desc[:500] if desc else "",  # cap summary length
+                    "url": link,
+                    "timestamp": pub_date,
+                    "symbols": list(set(symbols)),
+                })
+        except Exception as e:
+            print(f"[WARN] [SCRAPER] RSS feed '{feed_name}' failed: {e}", flush=True)
+            continue
+
+    score_news_batch(result)
+    if result:
+        print(f"[INFO] [SCRAPER] RSS feeds fetched ({len(result)} articles, sentiment scored).", flush=True)
+    return result
+
+
+def deduplicate_news(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Deduplicates news items by headline hash to avoid double-scoring the same
+    story from multiple sources. Keeps the first (most recent) occurrence.
+    """
+    import hashlib
+
+    seen = set()
+    deduped = []
+
+    for item in news_items:
+        headline = (item.get("headline") or "").lower().strip()
+        if not headline:
+            continue
+
+        # Hash the headline to detect exact/near-duplicates
+        h = hashlib.md5(headline.encode()).hexdigest()
+        if h not in seen:
+            seen.add(h)
+            deduped.append(item)
+
+    return deduped
+
+
+def fetch_news_with_fallback() -> List[Dict[str, Any]]:
+    """
+    Orchestrates multi-source news fetching with fallback logic.
+    Tries sources in order: Alpaca (primary) → NewsAPI → Polygon → RSS (last resort).
+    Deduplicates and scores all results uniformly.
+
+    Returns: list of news items with sentiment scores, or empty list if all sources fail.
+    """
+    all_news = []
+
+    # Primary source
+    news = fetch_alpaca_news()
+    if news:
+        all_news.extend(news)
+        print(f"[INFO] [SCRAPER] Primary (Alpaca) succeeded: {len(news)} items", flush=True)
+    else:
+        print(f"[WARN] [SCRAPER] Primary (Alpaca) failed, trying backups...", flush=True)
+
+        # Secondary sources
+        news = fetch_newsapi_news()
+        if news:
+            all_news.extend(news)
+            print(f"[INFO] [SCRAPER] Secondary (NewsAPI) succeeded: {len(news)} items", flush=True)
+
+        news = fetch_polygon_news()
+        if news:
+            all_news.extend(news)
+            print(f"[INFO] [SCRAPER] Secondary (Polygon) succeeded: {len(news)} items", flush=True)
+
+        # Last resort
+        if not all_news:
+            news = fetch_rss_news()
+            if news:
+                all_news.extend(news)
+                print(f"[INFO] [SCRAPER] Fallback (RSS) succeeded: {len(news)} items", flush=True)
+
+    # Deduplicate across all sources
+    deduped = deduplicate_news(all_news)
+
+    if deduped:
+        print(f"[INFO] [SCRAPER] After dedup: {len(deduped)} unique articles", flush=True)
+        return deduped
+    else:
+        print(f"[ERROR] [SCRAPER] All news sources failed — returning empty batch", flush=True)
+        return []
+
+
 def fetch_earnings_calendar(tickers: List[str]) -> Dict[str, List[Dict[str, Any]]]:
     """
     Queries Alpaca's corporate actions endpoint for scheduled earnings announcements.
