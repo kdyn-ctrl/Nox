@@ -9,6 +9,8 @@ services:
       context: ./america_data_engine
     container_name: nox_america_data_engine
     restart: unless-stopped
+    depends_on:
+      - redis
     # WS1/architecture: cap NLP-side memory so the sentiment/contradiction layer
     # can never starve or share heap with the C++ execution engine.
     mem_limit: 512m
@@ -59,6 +61,8 @@ services:
       context: ./china_data_engine
     container_name: nox_china_data_engine
     restart: unless-stopped
+    depends_on:
+      - redis
     mem_limit: 512m
     environment:
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
@@ -72,6 +76,7 @@ services:
     container_name: nox_analyst
     restart: unless-stopped
     depends_on:
+      - redis
       - execution-engine
     environment:
       - TZ=America/New_York
@@ -97,6 +102,8 @@ services:
       dockerfile: execution/Dockerfile
     container_name: nox_execution
     restart: unless-stopped
+    depends_on:
+      - redis
     environment:
       - ALPACA_API_KEY=${ALPACA_API_KEY}
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
@@ -141,6 +148,7 @@ services:
     restart: unless-stopped
     mem_limit: 768m
     depends_on:
+      - redis
       - china-data-engine
       - america-data-engine
     environment:
@@ -190,6 +198,15 @@ services:
 #      - "5900:5900"   # VNC optional
 #    networks:
 #      - nox_net
+
+  redis:
+    image: redis:alpine
+    container_name: nox_redis
+    restart: unless-stopped
+    expose:
+      - "6379"
+    networks:
+      - nox_net
 
 networks:
   nox_net:

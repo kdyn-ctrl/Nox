@@ -770,6 +770,45 @@ private:
         return false;
     }
 
+    // ── WS1 — Contradiction Vector: Kelly multiplier ─────────────────────────
+    //
+    // Queries america-data-engine for the latest per-ticker contradiction verdict
+    // before finalizing position sizing. If headline sentiment contradicts live IV
+    // skew (CONTRADICT_BULLISH or CONTRADICT_BEARISH), the Kelly fraction is halved.
+    //
+    // Strict 3s connect / 5s read timeouts per RULE-008. Fails open (1.0 = no cut)
+    // on any network error, parse failure, or missing token — never blocks execution.
+    double fetchWS1KellyMultiplier(const std::string& ticker) const {
+        try {
+            const char* secret = std::getenv("WEBHOOK_SECRET_TOKEN");
+            if (!secret) return 1.0;
+
+            httplib::Client cli("http://america-data-engine:8001");
+            cli.set_connection_timeout(std::chrono::seconds(3));
+            cli.set_read_timeout(std::chrono::seconds(5));
+
+            httplib::Headers headers = {{"X-Nox-Token", secret}};
+            auto res = cli.Get("/contradiction/us", headers);
+            if (!res || res->status != 200) return 1.0;
+
+            auto body = json::parse(res->body);
+            const auto& results = body.at("results");
+
+            for (const auto& entry : results) {
+                if (entry.value("ticker", "") != ticker) continue;
+                std::string verdict = entry.value("verdict", "");
+                if (verdict.rfind("CONTRADICT", 0) == 0) {
+                    log("WARN", "[WS1][KELLY_CUT] " + ticker +
+                        " — contradiction verdict: " + verdict +
+                        " — kelly_fraction halved (0.5x).");
+                    return 0.5;
+                }
+                return 1.0;
+            }
+        } catch (...) {}
+        return 1.0; // fail-safe: intelligence feed unreachable → normal sizing
+    }
+
     // ── Market data: Underlying OHLCV (Yahoo Finance) ─────────────────────────
 
     UnderlyingData fetchUnderlyingBars(const std::string& symbol) const {
@@ -1434,9 +1473,17 @@ private:
             return std::nullopt;
         }
 
+        // WS1 — Contradiction Vector check. Query the data engine for this
+        // ticker's latest sentiment-vs-skew verdict immediately before finalizing
+        // the Kelly allocation. CONTRADICT_* verdict → halve the risk budget.
+        // Strict timeout + fail-open so a dead intelligence feed never blocks
+        // execution (per RULE-008).
+        double ws1_mult      = fetchWS1KellyMultiplier(ticker);
+        double kelly_capital = effective_capital * ws1_mult;
+
         OptionsSignal sig = assembleSignal(ticker, d, strategy, cp,
                                            iv_rank, iv_sigma, rfr, regime_clearance,
-                                           tier, fc_mode, effective_capital, d.hrv30);
+                                           tier, fc_mode, kelly_capital, d.hrv30);
 
         std::string alert = formatAlert(sig, vix, regime, vts);
         return scoreSignal(sig, alert, d);

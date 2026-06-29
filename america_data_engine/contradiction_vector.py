@@ -37,11 +37,11 @@ BYPASS = os.getenv("CONTRADICTION_BYPASS", "false").lower() in ("true", "1", "ye
 # Index proxy used for the market-wide check when sentiment isn't ticker-specific.
 MARKET_PROXY = os.getenv("CONTRADICTION_MARKET_PROXY", "SPY")
 
-# Half-life decay constants (in hours). Recent articles weighted higher.
-HALFLIFE_GEOPOLITICAL_HOURS = float(os.getenv("HALFLIFE_GEOPOLITICAL_HOURS", "6"))
-HALFLIFE_MACRO_HOURS = float(os.getenv("HALFLIFE_MACRO_HOURS", "48"))
-HALFLIFE_EARNINGS_HOURS = float(os.getenv("HALFLIFE_EARNINGS_HOURS", "72"))
-HALFLIFE_TECHNICAL_HOURS = float(os.getenv("HALFLIFE_TECHNICAL_HOURS", "12"))
+# Half-life decay constants (hours) — sourced from DECAY_* in .env.
+HALFLIFE_GEOPOLITICAL_HOURS = float(os.getenv("DECAY_GEO",      "6"))
+HALFLIFE_MACRO_HOURS        = float(os.getenv("DECAY_MACRO",    "48"))
+HALFLIFE_EARNINGS_HOURS     = float(os.getenv("DECAY_EARNINGS", "72"))
+HALFLIFE_TECHNICAL_HOURS    = float(os.getenv("DECAY_TECHNICAL","12"))
 
 # Anchor events — major structural news that act as reference points.
 _ANCHOR_KEYWORDS = [
