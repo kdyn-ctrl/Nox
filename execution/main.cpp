@@ -150,7 +150,7 @@ private:
     double      kellyWinRate;
     double      kellyWinLossRatio;
     double      kellyFraction;
-    int         cnBoardLotSize;   // CN-RULE-001: configurable via CN_BOARD_LOT_SIZE (default 100)
+    int         cnBoardLotSize;   // CN-RULE-001: configurable via CN_BOARD_LOT_SIZE (default 1)
     std::string cnPositionsPath;  // path for T+1 persistence file
     RegimeStateMachine regimeMachine;
     std::string last_analyst_report_time;
@@ -725,11 +725,7 @@ private:
                 Logger::log("INFO", "[IBKR] BUY order placed: " + sig.ticker +
                             " qty=" + std::to_string(qty) + " orderId=" + std::to_string(oid));
                 TelegramNotifier::sendMessage(
-                    "🟢 *BUY ORDER → IBKR*\n"
-                    "────────────────────────\n"
-                    "• *Ticker:* " + sig.ticker + "\n"
-                    "• *Qty:* " + std::to_string(qty) + " shares\n"
-                    "• *IBKR OrderId:* `" + std::to_string(oid) + "`"
+                    "🟢 *" + sig.ticker + "* — " + std::to_string(qty) + " shares → IBKR"
                 );
 
                 // Record T+1 entry date for CN-RULE-002 enforcement.
@@ -811,27 +807,22 @@ private:
                         if (sl_res && sl_res->status == 200) {
                             json sl_data = json::parse(sl_res->body);
                             std::cout << " [TRAILING STOP PLACED] Order ID: " << sl_data.value("id", "N/A") << std::endl;
-                            stop_line = "\n🛡️ *Stop:* trail $" + trail_offset_str +
-                                        " | ID: `" + sl_data.value("id", "N/A") + "`";
+                            stop_line = " | 🛡️ trail $" + trail_offset_str;
                         } else {
                             std::string sl_status = sl_res ? std::to_string(sl_res->status) : "TIMEOUT";
                             std::string sl_details = sl_res ? sl_res->body : "No response.";
                             std::cerr << "⚠️ [STOP-LOSS FAILED] Status: " << sl_status
                                       << ", Details: " << sl_details << std::endl;
-                            stop_line = "\n⚠️ *Stop failed* HTTP " + sl_status + ": `" + sl_details + "`";
+                            stop_line = " | ⚠️ stop failed";
                         }
                     } else {
                         Logger::log("WARN", "[EXECUTION] ATR or multiplier invalid, skipping trailing stop.");
-                        stop_line = "\n⚠️ _No trailing stop — ATR/multiplier invalid_";
+                        stop_line = " | ⚠️ no stop";
                     }
 
-                    // Single combined confirmation message (buy + stop result)
+                    // Compact confirmation — one line per trade, details via /details
                     TelegramNotifier::sendMessage(
-                        "🟢 *BUY ORDER EXECUTED*\n"
-                        "────────────────────────\n"
-                        "• *Ticker:* " + sig.ticker + "\n"
-                        "• *Qty:* " + std::to_string(qty) + " shares\n"
-                        "• *Order ID:* `" + order_id + "`" +
+                        "🟢 *" + sig.ticker + "* — " + std::to_string(qty) + " shares filled" +
                         stop_line
                     );
                 } else {
@@ -931,11 +922,11 @@ public:
                     cnBoardLotSize = parsed;
                 } else {
                     std::cerr << "[WARN] [EXECUTION] CN_BOARD_LOT_SIZE must be positive. "
-                              << "Using default of 100." << std::endl;
+                              << "Using default of 1." << std::endl;
                 }
             } catch (...) {
                 std::cerr << "[WARN] [EXECUTION] CN_BOARD_LOT_SIZE is not a valid integer. "
-                          << "Using default of 100." << std::endl;
+                          << "Using default of 1." << std::endl;
             }
         }
         Logger::log("INFO", "[CN-RULE-001] Board-lot size: " + std::to_string(cnBoardLotSize) + " shares.");
