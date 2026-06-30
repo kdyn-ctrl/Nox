@@ -218,6 +218,7 @@ private:
     // Options signal scanner profiles (configured from env vars in the constructor)
     nox::options_signal::RiskProfile optionsBotProfile_;
     nox::options_signal::RiskProfile optionsPersonalProfile_;
+    nox::options_signal::RiskProfile optionsBreakoutProfile_;
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
     // SIGTERM sets running_ = false and calls shutdown(), which stops the HTTP
@@ -1202,6 +1203,21 @@ public:
             optionsPersonalProfile_.max_signals_per_scan =
                 envInt("OPTIONS_PERSONAL_MAX_SIGNALS", 2);
 
+            // ── BREAKOUT profile — LEAP advisory signals on breakout setups ───
+            optionsBreakoutProfile_ = nox::options_signal::RiskProfile::breakout();
+            optionsBreakoutProfile_.watchlist = parseWatchlist(
+                envStr("OPTIONS_BREAKOUT_WATCHLIST",
+                       "SPY,QQQ,IWM,AAPL,MSFT,NVDA,AMD,TSLA,AMZN,META,GOOGL,NFLX,COIN,PLTR,MSTR,SHOP,ARKK,SOXX,GLD,XLF"));
+            optionsBreakoutProfile_.scan_interval_minutes =
+                envInt("OPTIONS_BREAKOUT_SCAN_INTERVAL_MINUTES", 30);
+            optionsBreakoutProfile_.auto_execute = false; // always advisory
+            optionsBreakoutProfile_.qty_contracts =
+                envInt("OPTIONS_BREAKOUT_QTY_CONTRACTS", 1);
+            optionsBreakoutProfile_.free_capital_amount =
+                envDbl("OPTIONS_BREAKOUT_FREE_CAPITAL_AMOUNT", 0.0);
+            optionsBreakoutProfile_.max_signals_per_scan =
+                envInt("OPTIONS_BREAKOUT_MAX_SIGNALS", 2);
+
             Logger::log("INFO", "[OPTIONS_SIGNAL] BOT profile: AutoExecute="
                 + std::string(optionsBotProfile_.auto_execute ? "ON" : "OFF (advisory)")
                 + " | Watchlist=" + std::to_string(optionsBotProfile_.watchlist.size()) + " tickers"
@@ -1777,6 +1793,7 @@ public:
 
         launchOptionsThread(optionsBotProfile_);
         launchOptionsThread(optionsPersonalProfile_);
+        launchOptionsThread(optionsBreakoutProfile_);
         // ────────────────────────────────────────────────────────────────────
 
         // Install SIGTERM/SIGINT handlers now that s_instance_ is set and

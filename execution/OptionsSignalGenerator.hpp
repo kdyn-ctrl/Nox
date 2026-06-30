@@ -458,8 +458,12 @@ private:
 
     // Returns true if a strategy is allowed — tier gates honoured only when enforce_tier_gates is set
     bool strategyAllowed(const std::string& strategy, const std::string& tier) const {
-        if (!profile_.enforce_tier_gates) return true; // personal: all strategies open
+        if (!profile_.enforce_tier_gates) return true; // personal/breakout: all strategies open
 
+        // LEAP strategies are directional longs — same tier rules as LONG_CALL/LONG_PUT
+        if (strategy == "LEAP_CALL" || strategy == "LEAP_PUT") {
+            return true; // allowed at all tiers; capital requirements checked at sizing
+        }
         if (tier == "STARTER") {
             return strategy == "LONG_CALL" || strategy == "LONG_PUT";
         }
@@ -474,6 +478,7 @@ private:
 
     double regimeConfidence(Regime r, const std::string& strategy) const {
         bool is_long_premium = (strategy == "LONG_CALL"  || strategy == "LONG_PUT" ||
+                                strategy == "LEAP_CALL"  || strategy == "LEAP_PUT" ||
                                 strategy == "BULL_CALL_SPREAD" || strategy == "BEAR_PUT_SPREAD" ||
                                 strategy == "STRADDLE"   || strategy == "STRANGLE");
 
@@ -1012,7 +1017,18 @@ private:
     //               pending the C++ ↔ heartbeat integration (see private roadmap).
 
     std::string selectStrategy(DirectionalBias bias, double /*iv_rank*/, double iv_level,
-                               double hrv, const std::string& tier) const {
+                               double hrv, const std::string& tier,
+                               double sma_atrs = 0.0, double rsi = 50.0) const {
+        // Breakout profile: strong trend displacement + RSI in momentum zone → LEAP
+        // RSI 55–78 for bullish breakouts, 22–45 for bearish, to avoid chasing exhaustion
+        if (profile_.is_breakout_profile && sma_atrs >= profile_.breakout_sma_atrs_min) {
+            if (bias == DirectionalBias::Bullish && rsi >= 55.0 && rsi <= 78.0)
+                return "LEAP_CALL";
+            if (bias == DirectionalBias::Bearish && rsi >= 22.0 && rsi <= 45.0)
+                return "LEAP_PUT";
+            // Breakout profile but RSI outside momentum zone — fall through to normal selection
+        }
+
         bool vol_rich  = (hrv > 0.01) && (iv_level > hrv * 1.20);
         bool vol_cheap = (hrv > 0.01) && (iv_level < hrv * 0.90);
 
@@ -1076,7 +1092,9 @@ private:
 
         // Target DTE from profile
         int target_dte = profile_.dte_long;
-        if (strategy == "CSP" || strategy == "CC")
+        if (strategy == "LEAP_CALL" || strategy == "LEAP_PUT")
+            target_dte = profile_.dte_leap;
+        else if (strategy == "CSP" || strategy == "CC")
             target_dte = profile_.dte_income;
         else if (strategy == "STRADDLE" || strategy == "STRANGLE" ||
                  strategy == "BULL_CALL_SPREAD" || strategy == "BEAR_PUT_SPREAD")
@@ -1133,8 +1151,13 @@ private:
         const double d_long = profile_.delta_long;
         const double d_inc  = profile_.delta_income;
         const double d_wing = profile_.delta_spread_wing;
+        const double d_leap = profile_.delta_leap;
 
-        if (strategy == "LONG_CALL") {
+        if (strategy == "LEAP_CALL") {
+            p.strike = findStrikeForDelta(d_leap, nox::options::OptionType::Call);
+        } else if (strategy == "LEAP_PUT") {
+            p.strike = findStrikeForDelta(d_leap, nox::options::OptionType::Put);
+        } else if (strategy == "LONG_CALL") {
             p.strike = findStrikeForDelta(d_long, nox::options::OptionType::Call);
         } else if (strategy == "LONG_PUT") {
             p.strike = findStrikeForDelta(d_long, nox::options::OptionType::Put);
@@ -1197,8 +1220,9 @@ private:
         primary.risk_free_rate = rfr;
         primary.volatility     = iv_sigma;
 
-        bool is_call = (strategy == "LONG_CALL" || strategy == "CC" ||
-                        strategy == "BULL_CALL_SPREAD" || strategy == "STRADDLE");
+        bool is_call = (strategy == "LONG_CALL" || strategy == "LEAP_CALL" ||
+                        strategy == "CC" || strategy == "BULL_CALL_SPREAD" ||
+                        strategy == "STRADDLE");
         primary.type   = is_call ? OptionType::Call : OptionType::Put;
         sig.option_type = primary.type;
 
@@ -1208,11 +1232,13 @@ private:
         double contracts  = std::max(1.0, std::floor(max_risk / (g1.price * 100.0)));
 
         // Per-contract P&L geometry
-        if (strategy == "LONG_CALL" || strategy == "LONG_PUT") {
+        if (strategy == "LONG_CALL" || strategy == "LONG_PUT" ||
+            strategy == "LEAP_CALL" || strategy == "LEAP_PUT") {
             sig.entry_price = g1.price;
             sig.max_risk    = g1.price * 100.0 * contracts;
             sig.max_reward  = 999999.0; // theoretically unlimited — sentinel
-            sig.breakeven   = (strategy == "LONG_CALL")
+            bool is_call_side = (strategy == "LONG_CALL" || strategy == "LEAP_CALL");
+            sig.breakeven   = is_call_side
                               ? cp.strike + g1.price
                               : cp.strike - g1.price;
             sig.greeks      = g1;
@@ -1296,9 +1322,17 @@ private:
                                       const UnderlyingData& d,
                                       double iv_rank, double iv_level, double hrv30)
     {
+        bool is_leap = (strategy == "LEAP_CALL" || strategy == "LEAP_PUT");
         std::string r = strategy + " on " +
                         (d.price > d.sma20 ? "bullish" : "bearish") + " bias. ";
-        r += "RSI=" + fmt(d.rsi14) + ", ATR=" + fmt(d.atr14) + ". ";
+        if (is_leap) {
+            double sma_atrs = (d.atr14 > 0) ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
+            r += "Breakout setup: price " + fmt(sma_atrs, 1) +
+                 "x ATR from SMA20 with RSI=" + fmt(d.rsi14, 1) +
+                 " in momentum zone. 180-day expiry gives time to develop. ";
+        } else {
+            r += "RSI=" + fmt(d.rsi14) + ", ATR=" + fmt(d.atr14) + ". ";
+        }
         r += "IV=" + fmt(iv_level * 100.0, 1) + "% (rank " + fmt(iv_rank, 0) +
              "%) vs HRV=" + fmt(hrv30 * 100.0, 1) + "% — ";
         bool rich  = (hrv30 > 0.01) && (iv_level > hrv30 * 1.20);
@@ -1321,14 +1355,16 @@ private:
 
         std::string strategy_label = s.strategy;
         // Human-readable strategy names
-        if (s.strategy == "LONG_CALL")          strategy_label = "Long Call";
-        else if (s.strategy == "LONG_PUT")       strategy_label = "Long Put";
-        else if (s.strategy == "CSP")            strategy_label = "Cash-Secured Put";
-        else if (s.strategy == "CC")             strategy_label = "Covered Call";
-        else if (s.strategy == "BULL_CALL_SPREAD") strategy_label = "Bull Call Spread";
-        else if (s.strategy == "BEAR_PUT_SPREAD")  strategy_label = "Bear Put Spread";
-        else if (s.strategy == "STRADDLE")       strategy_label = "Long Straddle";
-        else if (s.strategy == "STRANGLE")       strategy_label = "Long Strangle";
+        if (s.strategy == "LONG_CALL")             strategy_label = "Long Call";
+        else if (s.strategy == "LONG_PUT")          strategy_label = "Long Put";
+        else if (s.strategy == "LEAP_CALL")         strategy_label = "LEAP Call (180d+)";
+        else if (s.strategy == "LEAP_PUT")          strategy_label = "LEAP Put (180d+)";
+        else if (s.strategy == "CSP")               strategy_label = "Cash-Secured Put";
+        else if (s.strategy == "CC")                strategy_label = "Covered Call";
+        else if (s.strategy == "BULL_CALL_SPREAD")  strategy_label = "Bull Call Spread";
+        else if (s.strategy == "BEAR_PUT_SPREAD")   strategy_label = "Bear Put Spread";
+        else if (s.strategy == "STRADDLE")          strategy_label = "Long Straddle";
+        else if (s.strategy == "STRANGLE")          strategy_label = "Long Strangle";
 
         bool unlimited_reward = (s.max_reward > 999990.0);
         std::string reward_str = unlimited_reward ? "Unlimited" : "$" + fmt(s.max_reward, 0);
@@ -1449,8 +1485,10 @@ private:
         double iv_sigma = iv_data.iv_level;
         double rfr      = 0.05;
 
+        double sma_atrs = (d.atr14 > 0) ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
         DirectionalBias bias     = computeBias(d);
-        std::string     strategy = selectStrategy(bias, iv_rank, iv_sigma, d.hrv30, tier);
+        std::string     strategy = selectStrategy(bias, iv_rank, iv_sigma, d.hrv30, tier,
+                                                  sma_atrs, d.rsi14);
 
         double regime_clearance = regimeConfidence(regime.current_regime, strategy);
         if (regime_clearance < 1e-6) {
