@@ -4,6 +4,7 @@
 #include "../shared/RegimeStateMachine.hpp"
 #include "../shared/TelegramNotifier.hpp"
 #include "OptionEngine.hpp"
+#include "EquitySignalGenerator.hpp"
 #include "OptionsSignalGenerator.hpp"
 #include "PositionManager.hpp"
 #include <atomic>
@@ -163,6 +164,13 @@ private:
     // Options signal scanner profiles (configured from env vars in the constructor)
     nox::options_signal::RiskProfile optionsBotProfile_;
     nox::options_signal::RiskProfile optionsPersonalProfile_;
+
+    // Equity signal scanner config (independent of Skeptic)
+    std::vector<std::string> equityWatchlist_;
+    int    equityScanIntervalMinutes_ = 30;
+    int    equityMaxSignals_          = 2;
+    bool   equityScanEnabled_         = true;
+    bool   equityBypassHours_         = false;
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
     // SIGTERM sets running_ = false and calls shutdown(), which stops the HTTP
@@ -1005,6 +1013,30 @@ public:
             optionsPersonalProfile_.max_signals_per_scan =
                 envInt("OPTIONS_PERSONAL_MAX_SIGNALS", 2);
 
+            // ── Equity signal scanner (independent of Skeptic) ─────────────────
+            equityScanEnabled_ = envBool("EQUITY_SCAN_ENABLED") ||
+                [](){ const char* v = std::getenv("EQUITY_SCAN_ENABLED");
+                      return !v || std::string(v) == ""; }(); // default on if unset
+            // Honour explicit false
+            if (const char* v = std::getenv("EQUITY_SCAN_ENABLED")) {
+                std::string sv(v);
+                std::transform(sv.begin(), sv.end(), sv.begin(),
+                    [](unsigned char c){ return std::tolower(c); });
+                equityScanEnabled_ = (sv == "true" || sv == "1" || sv == "yes" || sv == "");
+            }
+            equityWatchlist_ = parseWatchlist(
+                envStr("EQUITY_SCAN_WATCHLIST", "AAPL,MSFT,NVDA,TSLA,AMZN,META,GOOGL,AMD"));
+            equityScanIntervalMinutes_ = envInt("EQUITY_SCAN_INTERVAL_MINUTES", 30);
+            equityMaxSignals_          = envInt("EQUITY_SCAN_MAX_SIGNALS", 2);
+            equityBypassHours_         = envBool("EQUITY_SCAN_BYPASS_HOURS");
+
+            Logger::log("INFO", "[EQUITY_SCAN] " +
+                std::string(equityScanEnabled_ ? "ENABLED" : "DISABLED") +
+                " | Watchlist=" + std::to_string(equityWatchlist_.size()) + " tickers" +
+                " | Interval=" + std::to_string(equityScanIntervalMinutes_) + "min" +
+                " | MaxSignals=" + std::to_string(equityMaxSignals_) +
+                (equityBypassHours_ ? " | BypassHours=ON" : ""));
+
             Logger::log("INFO", "[OPTIONS_SIGNAL] BOT profile: AutoExecute="
                 + std::string(optionsBotProfile_.auto_execute ? "ON" : "OFF (advisory)")
                 + " | Watchlist=" + std::to_string(optionsBotProfile_.watchlist.size()) + " tickers"
@@ -1033,9 +1065,16 @@ public:
             positionManager_->start_monitoring();
             Logger::log("INFO", "[POS_MANAGER] Position Manager initialized and monitoring thread started.");
         } catch (const std::exception& e) {
-            std::cerr << "[FATAL] [POS_MANAGER] Failed to initialize Position Manager: "
-                      << e.what() << ". Refusing to start." << std::endl;
-            std::exit(1);
+            Logger::log("WARN", "[POS_MANAGER] Failed to initialize Position Manager: " +
+                std::string(e.what()) + ". Options position tracking disabled; signal processing continues.");
+            TelegramNotifier::sendMessage(
+                "⚠️ *Position Manager Unavailable*\n"
+                "────────────────────────\n"
+                "SQLite init failed: `" + std::string(e.what()) + "`\n"
+                "Options position tracking is disabled.\n"
+                "Signal processing and order execution are unaffected."
+            );
+            positionManager_ = nullptr;
         }
 
 #ifdef IBKR_ENABLED
@@ -1343,6 +1382,39 @@ public:
 
         launchOptionsThread(optionsBotProfile_);
         launchOptionsThread(optionsPersonalProfile_);
+
+        // ── Equity signal scanner thread ──────────────────────────────────────
+        if (equityScanEnabled_) {
+            option_threads_.emplace_back([this]() {
+                std::string tg_token = std::getenv("TELEGRAM_BOT_TOKEN") ? std::getenv("TELEGRAM_BOT_TOKEN") : "";
+                std::string tg_chat  = std::getenv("TELEGRAM_CHAT_ID")   ? std::getenv("TELEGRAM_CHAT_ID")   : "";
+
+                nox::equity_signal::EquitySignalGenerator scanner(
+                    secret, tg_token, tg_chat,
+                    equityWatchlist_, equityMaxSignals_, equityBypassHours_);
+
+                // Brief startup delay so the HTTP server is listening before
+                // the first scan tries to POST back to localhost:8080.
+                std::unique_lock<std::mutex> lk(stop_mutex_);
+                stop_cv_.wait_for(lk, std::chrono::seconds(15),
+                    [this] { return !running_.load(); });
+                if (!running_.load()) return;
+                lk.unlock();
+
+                while (running_.load()) {
+                    try {
+                        scanner.run_scan();
+                    } catch (const std::exception& e) {
+                        Logger::log("WARN", "[EQUITY_SCAN] Scan exception: " + std::string(e.what()));
+                    }
+                    std::unique_lock<std::mutex> slk(stop_mutex_);
+                    stop_cv_.wait_for(slk,
+                        std::chrono::minutes(equityScanIntervalMinutes_),
+                        [this] { return !running_.load(); });
+                }
+                Logger::log("INFO", "[EQUITY_SCAN] Thread exiting.");
+            });
+        }
         // ────────────────────────────────────────────────────────────────────
 
         // Install SIGTERM/SIGINT handlers now that s_instance_ is set and

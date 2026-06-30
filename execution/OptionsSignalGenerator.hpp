@@ -1215,8 +1215,8 @@ private:
             " | ATR(14): $" + fmt(s.atr) + "\n"
             "\n🌐 *Macro Regime:* " + regime.log_message + " " + regime_emoji +
             " (VIX " + fmt(vix, 1) + ")\n"
-            "🌡️ *Regime Clearance:* " + std::to_string(conf_pct) + "% "
-                "(100=RISK_ON · 65=TRANSITION · 0=RISK_OFF)\n"
+            "🌡️ *Regime Gate:* " + std::to_string(conf_pct) + "% "
+                "(RISK_ON=100 · TRANSITION=65 · RISK_OFF=0 — not signal quality)\n"
             "\n📋 _" + s.rationale + "_" +
             fc_footer + "\n"
             "⚠️ _Advisory only — manual execution required._";
