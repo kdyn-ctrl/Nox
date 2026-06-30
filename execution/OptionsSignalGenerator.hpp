@@ -174,18 +174,21 @@ struct ScoredSignal {
     double sma_distance_atrs = 0.0; // how far price is from SMA20 in ATR units
     double vol_deviation     = 0.0; // abs(IV/HRV - 1.0)
     double rsi_extremity     = 0.0; // abs(RSI - 50) / 50
+    double vol_ratio         = 1.0; // recent 5-day avg volume / 20-day avg
 };
 
 // ─── Structures ───────────────────────────────────────────────────────────────
 
 struct UnderlyingData {
-    double price    = 0.0;
-    double sma20    = 0.0;
-    double sma50    = 0.0;
-    double rsi14    = 0.0;
-    double atr14    = 0.0;
-    double hrv30    = 0.20; // 30-day historical realized volatility (annualized)
-    bool   valid    = false;
+    double price     = 0.0;
+    double sma20     = 0.0;
+    double sma50     = 0.0;
+    double rsi14     = 0.0;
+    double atr14     = 0.0;
+    double hrv30     = 0.20; // 30-day historical realized volatility (annualized)
+    double vol20_avg = 0.0;  // 20-day average daily volume
+    double vol_ratio = 1.0;  // recent 5-day avg volume / 20-day avg (>1.2 = expanding)
+    bool   valid     = false;
 };
 
 // Returned by fetchIVData — actual IV level from Alpaca snapshot + display rank
@@ -375,7 +378,8 @@ public:
                 " | score=" + fmt(sc.quality_score, 2) +
                 " (SMA=" + fmt(sc.sma_distance_atrs, 1) + "xATR" +
                 " vol=" + fmt(sc.vol_deviation * 100.0, 0) + "%" +
-                " RSI=" + fmt(sc.signal.rsi, 0) + ")");
+                " RSI=" + fmt(sc.signal.rsi, 0) +
+                " VolRatio=" + fmt(sc.vol_ratio, 2) + "x)");
             dispatched++;
         }
 
@@ -522,10 +526,16 @@ private:
         sc.vol_deviation   = (sig.hrv30 > 0.01)
             ? std::abs(sig.iv_level / sig.hrv30 - 1.0) : 0.0;
         sc.rsi_extremity   = std::abs(sig.rsi - 50.0) / 50.0;
-        // Weights: trend conviction matters most, vol signal second, RSI third
-        sc.quality_score   = sc.sma_distance_atrs * 0.50
-                           + sc.vol_deviation      * 0.30
-                           + sc.rsi_extremity      * 0.20;
+        sc.vol_ratio       = d.vol_ratio;
+        // Volume boost: above-average volume strengthens the setup.
+        // Capped at 2× so a single-day spike doesn't dominate.
+        // At 1.0× (average) boost = 0.0; at 2.0× boost = 1.0.
+        double vol_boost   = std::max(0.0, std::min(d.vol_ratio, 2.0) - 1.0);
+        // Weights: trend conviction (45%), vol signal (25%), RSI (15%), volume (15%)
+        sc.quality_score   = sc.sma_distance_atrs * 0.45
+                           + sc.vol_deviation      * 0.25
+                           + sc.rsi_extremity      * 0.15
+                           + vol_boost             * 0.15;
         return sc;
     }
 
@@ -842,16 +852,20 @@ private:
             const auto& ohlcv = body.at("chart").at("result").at(0)
                                      .at("indicators").at("quote").at(0);
 
-            const auto& raw_closes = ohlcv.at("close");
-            const auto& raw_highs  = ohlcv.at("high");
-            const auto& raw_lows   = ohlcv.at("low");
+            const auto& raw_closes  = ohlcv.at("close");
+            const auto& raw_highs   = ohlcv.at("high");
+            const auto& raw_lows    = ohlcv.at("low");
+            const auto& raw_volumes = ohlcv.at("volume");
 
-            std::vector<double> closes, highs, lows;
+            std::vector<double> closes, highs, lows, volumes;
             for (size_t i = 0; i < raw_closes.size(); ++i) {
                 if (!raw_closes[i].is_null() && !raw_highs[i].is_null() && !raw_lows[i].is_null()) {
                     closes.push_back(raw_closes[i].get<double>());
                     highs.push_back(raw_highs[i].get<double>());
                     lows.push_back(raw_lows[i].get<double>());
+                    double v = (i < raw_volumes.size() && !raw_volumes[i].is_null())
+                               ? raw_volumes[i].get<double>() : 0.0;
+                    volumes.push_back(v);
                 }
             }
             if (closes.size() < 50) return {};
@@ -900,14 +914,30 @@ private:
             }
             double hrv30 = std::sqrt(hrv_sq_sum / 30.0 * 252.0);
 
+            // Volume: 20-day average and recent 5-day vs baseline ratio.
+            // vol_ratio > 1.2 = expanding volume (confirms breakouts and trend moves).
+            // Fails neutral (1.0) when volume data is unavailable.
+            double vol20_avg = 0.0, vol5_avg = 0.0;
+            if (volumes.size() >= 20) {
+                for (size_t i = volumes.size() - 20; i < volumes.size(); ++i) vol20_avg += volumes[i];
+                vol20_avg /= 20.0;
+            }
+            if (volumes.size() >= 5) {
+                for (size_t i = volumes.size() - 5; i < volumes.size(); ++i) vol5_avg += volumes[i];
+                vol5_avg /= 5.0;
+            }
+            double vol_ratio = (vol20_avg > 1000.0) ? vol5_avg / vol20_avg : 1.0;
+
             UnderlyingData d;
-            d.price  = closes.back();
-            d.sma20  = sma20;
-            d.sma50  = sma50;
-            d.rsi14  = rsi;
-            d.atr14  = atr_sum / 14.0;
-            d.hrv30  = hrv30;
-            d.valid  = true;
+            d.price     = closes.back();
+            d.sma20     = sma20;
+            d.sma50     = sma50;
+            d.rsi14     = rsi;
+            d.atr14     = atr_sum / 14.0;
+            d.hrv30     = hrv30;
+            d.vol20_avg = vol20_avg;
+            d.vol_ratio = vol_ratio;
+            d.valid     = true;
             return d;
         } catch (...) {}
         return {};
@@ -1018,15 +1048,17 @@ private:
 
     std::string selectStrategy(DirectionalBias bias, double /*iv_rank*/, double iv_level,
                                double hrv, const std::string& tier,
-                               double sma_atrs = 0.0, double rsi = 50.0) const {
-        // Breakout profile: strong trend displacement + RSI in momentum zone → LEAP
-        // RSI 55–78 for bullish breakouts, 22–45 for bearish, to avoid chasing exhaustion
+                               double sma_atrs = 0.0, double rsi = 50.0,
+                               bool above_sma50 = true) const {
+        // Breakout profile: strong displacement from SMA20 + SMA50 alignment + RSI momentum zone.
+        // SMA50 check prevents LEAP signals on counter-trend bounces — price must be on the right
+        // side of the medium-term trend before committing to a 6-month directional contract.
         if (profile_.is_breakout_profile && sma_atrs >= profile_.breakout_sma_atrs_min) {
-            if (bias == DirectionalBias::Bullish && rsi >= 55.0 && rsi <= 78.0)
+            if (bias == DirectionalBias::Bullish && above_sma50 && rsi >= 55.0 && rsi <= 78.0)
                 return "LEAP_CALL";
-            if (bias == DirectionalBias::Bearish && rsi >= 22.0 && rsi <= 45.0)
+            if (bias == DirectionalBias::Bearish && !above_sma50 && rsi >= 22.0 && rsi <= 45.0)
                 return "LEAP_PUT";
-            // Breakout profile but RSI outside momentum zone — fall through to normal selection
+            // Breakout profile but SMA50 or RSI not aligned — fall through to normal selection
         }
 
         bool vol_rich  = (hrv > 0.01) && (iv_level > hrv * 1.20);
@@ -1485,10 +1517,11 @@ private:
         double iv_sigma = iv_data.iv_level;
         double rfr      = 0.05;
 
-        double sma_atrs = (d.atr14 > 0) ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
+        double sma_atrs  = (d.atr14 > 0) ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
+        bool   above_50  = (d.price > d.sma50);
         DirectionalBias bias     = computeBias(d);
         std::string     strategy = selectStrategy(bias, iv_rank, iv_sigma, d.hrv30, tier,
-                                                  sma_atrs, d.rsi14);
+                                                  sma_atrs, d.rsi14, above_50);
 
         double regime_clearance = regimeConfidence(regime.current_regime, strategy);
         if (regime_clearance < 1e-6) {
