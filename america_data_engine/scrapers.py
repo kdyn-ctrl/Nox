@@ -12,7 +12,7 @@ HTTP_TIMEOUT = (5, 10)
 
 # SEC EDGAR requires a descriptive User-Agent or it returns 403. Match the
 # convention already used by the heartbeat's EDGAR scraper.
-SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "Nox/1.0 openclaw@vanhellsing.tech")
+SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "Nox/1.0 fairydestroyasaur856@gmail.com")
 
 # ---------------------------------------------------------------------------
 # WS1 — Headline sentiment scoring (Contradiction Vector input).

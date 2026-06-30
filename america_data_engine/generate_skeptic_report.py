@@ -116,8 +116,8 @@ def _score_insider(data: dict) -> tuple[str, list[str]]:
     bullets = []
     for s in signals:
         ticker = s.get("ticker", "?")
-        n = s.get("distinct_insiders", 0)
-        roles = s.get("roles", [])
+        n = s.get("insider_count", s.get("distinct_insiders", 0))
+        roles = s.get("insiders", s.get("roles", []))
         bullets.append(f"{ticker}: {n} insider(s) — {', '.join(roles)}")
     if not signals:
         bullets.append("No insider cluster signals detected.")
@@ -132,7 +132,7 @@ def _score_alt_macro(data: dict) -> tuple[str, list[str]]:
     for r in regions:
         verdict = r.get("verdict", "NO_DATA")
         region = r.get("region", "?")
-        bias = r.get("commodity_bias", "")
+        bias = r.get("bias", r.get("commodity_bias", ""))
         reason = r.get("reason", "")
         line = f"{region}: {verdict}"
         if bias:

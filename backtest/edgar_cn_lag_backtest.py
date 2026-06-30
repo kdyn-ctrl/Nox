@@ -35,7 +35,7 @@ from scipy import stats
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-EDGAR_HEADERS = {"User-Agent": "Nox/1.0 openclaw@vanhellsing.tech"}
+EDGAR_HEADERS = {"User-Agent": "Nox/1.0 fairydestroyasaur856@gmail.com"}
 BENCHMARK_TICKER = "MCHI"
 DEFAULT_START = "2022-01-01"
 DEFAULT_END = "2025-12-31"

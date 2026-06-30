@@ -403,7 +403,7 @@ private:
                 try { strike = std::stod(occ.substr(i + 7, 8)) / 1000.0; } catch (...) { continue; }
                 if (strike <= 0.0) continue;
 
-                if (positionManager_->has_open_position(underlying)) { skipped++; continue; }
+                if (positionManager_->has_open_position_by_contract(underlying, strike, expiry, opt_type)) { skipped++; continue; }
 
                 // Prefer avg_entry_price (real fill); fall back to current_price
                 double entry_price = 0.0;
@@ -1714,7 +1714,11 @@ public:
 
                 if (root_payload.is_array()) {
                     for (const auto& item : root_payload) {
-                        process_single_chunk(item);
+                        try {
+                            process_single_chunk(item);
+                        } catch (const std::exception& ex) {
+                            Logger::log("ERROR", "[EXECUTION] Error processing array item: " + std::string(ex.what()));
+                        }
                     }
                 } else if (root_payload.is_object()) {
                     process_single_chunk(root_payload);

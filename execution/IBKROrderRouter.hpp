@@ -101,11 +101,21 @@ public:
         const std::string expiry = to_ibkr_expiry(sig.expiry_date);
         const std::string s      = sig.strategy;
 
+        // Covered call requires 100 shares per contract as collateral.
+        // We cannot automatically query IBKR positions from this router, so we
+        // abort and require manual verification. Do NOT route a naked short call.
+        if (s == "CC") {
+            throw std::runtime_error(
+                "IBKROrderRouter: CC (covered call) blocked — collateral cannot be "
+                "auto-verified via IBKR from this router. Confirm you hold " +
+                std::to_string(qty_contracts * 100) + " shares of " +
+                sig.underlying + " in IBKR, then execute manually.");
+        }
+
         double mid = sig.entry_price; // BS theoretical mid — starting limit price
         if      (s == "LONG_CALL")        return route_single(sig, expiry, sig.strike,  "C", "BUY",  qty_contracts, mid, true);
         else if (s == "LONG_PUT")         return route_single(sig, expiry, sig.strike,  "P", "BUY",  qty_contracts, mid, true);
         else if (s == "CSP")              return route_single(sig, expiry, sig.strike,  "P", "SELL", qty_contracts, mid, false);
-        else if (s == "CC")               return route_single(sig, expiry, sig.strike,  "C", "SELL", qty_contracts, mid, false);
         else if (s == "BULL_CALL_SPREAD") return route_spread(sig, expiry, "C", qty_contracts);
         else if (s == "BEAR_PUT_SPREAD")  return route_spread(sig, expiry, "P", qty_contracts);
         else if (s == "STRADDLE")         return route_straddle(sig, expiry, qty_contracts);

@@ -773,36 +773,32 @@ private:
         int today_year, today_month, today_day;
         std::sscanf(today_str.c_str(), "%d-%d-%d", &today_year, &today_month, &today_day);
 
+        // Convert a broken-down date to UTC epoch seconds using std::mktime.
+        // mktime interprets the struct in local time but we only need the *delta*
+        // between two dates — the TZ offset cancels out as long as both dates are
+        // converted with the same call, which they are.
+        auto date_to_time_t = [](int y, int m, int d) -> std::time_t {
+            std::tm t{};
+            t.tm_year = y - 1900;
+            t.tm_mon  = m - 1;
+            t.tm_mday = d;
+            t.tm_hour = 12; // midday to avoid DST edge issues
+            return std::mktime(&t);
+        };
+
+        std::time_t today_t = date_to_time_t(today_year, today_month, today_day);
+
         // Check each earnings event for this ticker
         for (const auto& event : it->second) {
             int event_year, event_month, event_day;
-            std::sscanf(event.date.c_str(), "%d-%d-%d", &event_year, &event_month, &event_day);
+            if (std::sscanf(event.date.c_str(), "%d-%d-%d",
+                            &event_year, &event_month, &event_day) != 3) continue;
 
-            // Simple date comparison: convert both to day-of-year for same year, else compare years
-            auto days_until_event = [](int y1, int m1, int d1, int y2, int m2, int d2) -> long {
-                // Count days from date1 to date2
-                // This is a simplified comparison — proper implementation would use chrono
-                if (y1 != y2) {
-                    return y2 > y1 ? 1000 : -1000; // Different years, approximate
-                }
+            std::time_t event_t = date_to_time_t(event_year, event_month, event_day);
+            if (today_t == (std::time_t)-1 || event_t == (std::time_t)-1) continue;
 
-                // Same year: convert month/day to day-of-year
-                int days_in_month[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-                if ((y1 % 4 == 0 && y1 % 100 != 0) || (y1 % 400 == 0)) {
-                    days_in_month[2] = 29; // Leap year
-                }
-
-                int doy1 = d1;
-                for (int i = 1; i < m1; ++i) doy1 += days_in_month[i];
-
-                int doy2 = d2;
-                for (int i = 1; i < m2; ++i) doy2 += days_in_month[i];
-
-                return static_cast<long>(doy2 - doy1);
-            };
-
-            long days_diff = days_until_event(today_year, today_month, today_day,
-                                               event_year, event_month, event_day);
+            long days_diff = static_cast<long>(
+                std::difftime(event_t, today_t) / 86400.0 + 0.5); // round to nearest day
 
             // Earnings within 5 days (inclusive of today)
             if (days_diff >= 0 && days_diff <= 5) {
@@ -1839,14 +1835,26 @@ private:
                 bool is_short_premium = (sig.strategy == "CSP" || sig.strategy == "CC");
                 std::string profile_type = is_short_premium ? "short_premium" : "long";
 
+                // Use the actual filled qty, not the requested qty.
+                // A partial fill means fewer contracts are really held.
+                int qty_to_record = (result.filled_qty > 0) ? result.filled_qty : profile_.qty_contracts;
+                if (result.filled_qty > 0 && result.filled_qty < profile_.qty_contracts) {
+                    log("WARN", "[OPTIONS_EXEC] Partial fill: " + std::to_string(result.filled_qty)
+                        + " of " + std::to_string(profile_.qty_contracts) + " contracts filled for "
+                        + sig.underlying + " — recording actual fill only.");
+                    sendTelegram("⚠️ *Partial Fill*: " + sig.underlying + " " + sig.strategy
+                        + " — " + std::to_string(result.filled_qty) + "/"
+                        + std::to_string(profile_.qty_contracts) + " contracts filled.");
+                }
                 positionManager_->add_position(
                     sig.underlying, opt_type, sig.strike,
-                    profile_.qty_contracts, sig.entry_price,
+                    qty_to_record, sig.entry_price,
                     today_oss.str(), profile_type, sig.expiry_date
                 );
                 log("INFO", "[OPTIONS_EXEC][POS_MANAGER] Recorded: " + sig.underlying +
                     " " + opt_type + " $" + fmt(sig.strike, 0) +
-                    " exp=" + sig.expiry_date + " profile=" + profile_type);
+                    " exp=" + sig.expiry_date + " profile=" + profile_type +
+                    " qty=" + std::to_string(qty_to_record));
             }
         } else {
             log("WARN", "[OPTIONS_EXEC] Order failed — " + result.message);

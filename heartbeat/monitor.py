@@ -3,6 +3,8 @@ import re
 import sys
 import telebot
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import anthropic
 import schedule
 import time
@@ -237,6 +239,21 @@ def _log_parsing_failure(ticker: str, filing_type: str, error_msg: str) -> None:
 # block indefinitely. The tuple form enforces both independently.
 HTTP_TIMEOUT = (5, 10)  # (connect seconds, read seconds)
 
+# Shared session with automatic retry + backoff on transient failures and rate-limits.
+# All outbound HTTP that can tolerate retries should use _http_session.get/post.
+_retry_strategy = Retry(
+    total=3,
+    backoff_factor=1.0,          # sleep 1s, 2s, 4s between retries
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS"],
+    raise_on_status=False,
+)
+_http_adapter = HTTPAdapter(max_retries=_retry_strategy)
+_http_session = requests.Session()
+_http_session.mount("https://", _http_adapter)
+_http_session.mount("http://",  _http_adapter)
+
+
 def get_alpaca_portfolio():
     headers = {'APCA-API-KEY-ID': ALPACA_API, 'APCA-API-SECRET-KEY': ALPACA_SEC}
     try:
@@ -292,9 +309,9 @@ def get_latest_sec_filing(ticker: str) -> str:
         f"https://www.sec.gov/cgi-bin/browse-edgar"
         f"?action=getcompany&CIK={ticker}&type={filing_type}&output=atom"
     )
-    headers = {'User-Agent': 'Nox/1.0 openclaw@vanhellsing.tech'}
+    headers = {'User-Agent': 'Nox/1.0 fairydestroyasaur856@gmail.com'}
     try:
-        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        resp = _http_session.get(url, headers=headers, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200:
             return f"SEC feed returned {resp.status_code} for {ticker}."
 
@@ -316,7 +333,7 @@ def get_latest_sec_filing(ticker: str) -> str:
         if not primary_url:
             return f"Could not resolve primary {filing_type} document for {ticker}."
 
-        doc_res = requests.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
+        doc_res = _http_session.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
         if doc_res.status_code != 200:
             return f"Primary document fetch returned {doc_res.status_code} for {ticker}."
 
@@ -548,7 +565,7 @@ def fetch_bars(ticker: str, limit: int = 220) -> dict | None:
         "APCA-API-SECRET-KEY": ALPACA_SEC,
     }
     try:
-        resp = requests.get(
+        resp = _http_session.get(
             f"{ALPACA_DATA_URL}/v2/stocks/{ticker}/bars",
             headers=headers,
             params={"timeframe": "1Day", "limit": limit, "adjustment": "raw", "feed": "iex"},
@@ -589,7 +606,7 @@ def fetch_batch_bars(tickers: list[str], limit: int = 60) -> dict[str, dict]:
     for i in range(0, len(tickers), CHUNK):
         chunk = tickers[i:i + CHUNK]
         try:
-            resp = requests.get(
+            resp = _http_session.get(
                 f"{ALPACA_DATA_URL}/v2/stocks/bars",
                 headers=headers,
                 params={
@@ -633,7 +650,7 @@ def fetch_batch_snapshots(tickers: list[str]) -> dict[str, dict]:
     for i in range(0, len(tickers), CHUNK):
         chunk = tickers[i:i + CHUNK]
         try:
-            resp = requests.get(
+            resp = _http_session.get(
                 f"{ALPACA_DATA_URL}/v2/stocks/snapshots",
                 headers=headers,
                 params={"symbols": ",".join(chunk), "feed": "iex"},
@@ -656,8 +673,8 @@ def fetch_batch_snapshots(tickers: list[str]) -> dict[str, dict]:
                         "pct_chg": pct_chg,
                         "activity": vol * pct_chg,  # rank by dollar-volume × % move
                     }
-                except Exception:
-                    pass
+                except Exception as inner_e:
+                    logger.debug(f"fetch_batch_snapshots: bad snapshot for ticker in chunk {i//CHUNK}: {inner_e}")
         except Exception as e:
             logger.warning(f"fetch_batch_snapshots chunk {i//CHUNK} failed: {e}")
         time.sleep(0.5)
@@ -697,7 +714,7 @@ def fetch_market_universe() -> list[str]:
         if page_token:
             params["page_token"] = page_token
         try:
-            resp = requests.get(
+            resp = _http_session.get(
                 f"{ALPACA_BROKER_URL}/v2/assets",
                 headers=headers,
                 params=params,
@@ -728,7 +745,7 @@ def fetch_market_universe() -> list[str]:
 def fetch_vix_level() -> float:
     """Current VIX via Yahoo Finance (free, no API key)."""
     try:
-        resp = requests.get(
+        resp = _http_session.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX",
             params={"interval": "1d", "range": "1d"},
             headers={"User-Agent": "Mozilla/5.0"},
@@ -1032,7 +1049,8 @@ def _split_scout_sections(text: str) -> list[str]:
 def run_scout_protocol():
     try:
         news_context    = get_us_news_context()
-        sec_context     = "\n\n".join([get_latest_sec_filing(t) for t in ["NVDA", "BABA"]])
+        scout_tickers   = WATCHLIST[:6] if len(WATCHLIST) >= 6 else WATCHLIST
+        sec_context     = "\n\n".join([get_latest_sec_filing(t) for t in scout_tickers])
         chinese_context = get_chinese_market_context()
 
         response = claude.messages.create(
@@ -1089,9 +1107,8 @@ def fetch_options_chain_iv(ticker: str) -> float | None:
     }
 
     try:
-        # Alpaca options chains endpoint — paper trading API
-        url = f"https://paper-api.alpaca.markets/v1beta3/options/chains/{ticker}"
-        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{ticker}"
+        resp = _http_session.get(url, headers=headers, timeout=HTTP_TIMEOUT)
 
         if resp.status_code != 200:
             logger.warning(f"Alpaca options chain request failed for {ticker}: HTTP {resp.status_code}")
@@ -1173,8 +1190,8 @@ def fetch_iv_skew(ticker: str) -> dict:
         "APCA-API-SECRET-KEY": ALPACA_SEC,
     }
     try:
-        url = f"https://paper-api.alpaca.markets/v1beta3/options/chains/{ticker}"
-        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{ticker}"
+        resp = _http_session.get(url, headers=headers, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200:
             return {"ticker": ticker, "method": "error",
                     "error": f"chain HTTP {resp.status_code}"}
@@ -1733,6 +1750,17 @@ def send_status(message):
             reserved = r'_*[]()~`>#+-=|{}.!'
             return re.sub(f'([{re.escape(reserved)}])', r'\\\1', str(text))
 
+        try:
+            _spy, _spy_sma, _vix = fetch_spy_regime()
+            if _vix > 25 or (_spy > 0 and _spy_sma > 0 and _spy < _spy_sma):
+                _regime_label = "RISK_OFF"
+            elif _vix > 20:
+                _regime_label = "TRANSITION"
+            else:
+                _regime_label = "RISK_ON"
+        except Exception:
+            _regime_label = "UNKNOWN"
+
         separator = "─" * 24
         status_msg = (
             f"🦅 *Nox System Health Status*\n"
@@ -1742,7 +1770,7 @@ def send_status(message):
             f"🇨🇳 *China Data Engine:* {esc(data_status)} \\(Cache updated: {esc(data_cache_age)}\\)\n"
             f"🇺🇸 *America Data Engine:* {esc(america_data_status)} \\(Cache updated: {esc(america_data_cache_age)}\\)\n"
             f"📚 *Memory Bank:* {esc(audit_count)} Audits \\| {esc(filing_count)} Processed Filings\n"
-            f"📊 *Current Market Regime:* `RISK_ON`"
+            f"📊 *Current Market Regime:* `{_regime_label}` \\(VIX: {esc(round(_vix, 1))}\\)"
         )
         print(f"[STATUS CMD] Assembled status message:\n{status_msg}", flush=True)
         bot.reply_to(message, status_msg, parse_mode='MarkdownV2')
@@ -2091,7 +2119,7 @@ def mark_filing_processed(filing_id):
 # pickup (East Money hot board or Cailian Press). When the lag window closes,
 # we know Chinese retail has discovered the filing — the edge has been consumed.
 
-_CN_DATA_ENGINE_URL = "http://china-data-engine:8001"
+_CN_DATA_ENGINE_URL = "http://china-data-engine:8000"
 _LAG_WINDOW_MAX_HOURS = 48  # auto-expire windows older than this
 
 
@@ -2347,12 +2375,12 @@ def poll_sec_edgar():
         ("8-K", "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"),
         ("6-K", "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=6-K&output=atom"),
     ]
-    headers = {"User-Agent": "Nox/1.0 openclaw@vanhellsing.tech"}
+    headers = {"User-Agent": "Nox/1.0 fairydestroyasaur856@gmail.com"}
 
     while True:
         for feed_type, sec_url in SEC_FEEDS:
             try:
-                response = requests.get(sec_url, headers=headers, timeout=HTTP_TIMEOUT)
+                response = _http_session.get(sec_url, headers=headers, timeout=HTTP_TIMEOUT)
                 if response.status_code != 200:
                     print(f"[WARN] [HEARTBEAT] SEC {feed_type} feed returned {response.status_code}.", flush=True)
                     continue
@@ -2418,7 +2446,7 @@ def resolve_primary_document(index_url: str, headers: dict, filing_type: str = "
     document's href. Falls back to the first .htm file if no typed match.
     """
     try:
-        idx_res = requests.get(index_url, headers=headers, timeout=HTTP_TIMEOUT)
+        idx_res = _http_session.get(index_url, headers=headers, timeout=HTTP_TIMEOUT)
         if idx_res.status_code != 200:
             print(f"[WARN] [HEARTBEAT] Index page returned {idx_res.status_code}: {index_url}", flush=True)
             return None
@@ -2551,7 +2579,7 @@ def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8
     3.  Routes to Heavyweight Lane (background thread, chunked analysis) for
         larger documents to prevent blocking the main SEC polling loop.
     """
-    headers = {"User-Agent": "Nox/1.0 openclaw@vanhellsing.tech"}
+    headers = {"User-Agent": "Nox/1.0 fairydestroyasaur856@gmail.com"}
     try:
         primary_url = resolve_primary_document(filing_url, headers, filing_type)
         if not primary_url:
@@ -2559,7 +2587,7 @@ def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8
             return
 
         print(f"[INFO] [HEARTBEAT] Fetching primary {filing_type} doc for {ticker}: {primary_url}", flush=True)
-        doc_res = requests.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
+        doc_res = _http_session.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
         if doc_res.status_code != 200:
             return
 
@@ -3168,4 +3196,9 @@ if __name__ == "__main__":
     threading.Thread(target=_start_iv_http_server, daemon=True).start()
     threading.Thread(target=_lag_monitor_loop, daemon=True).start()  # WS7
 
-    bot.infinity_polling()
+    while True:
+        try:
+            bot.infinity_polling(none_stop=True, timeout=30, long_polling_timeout=20)
+        except Exception as e:
+            print(f"[CRITICAL] [HEARTBEAT] Telegram polling crashed: {e}. Restarting in 10s…", flush=True)
+            time.sleep(10)
