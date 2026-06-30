@@ -45,9 +45,10 @@ struct AlpacaContract {
 // ─── Order result ─────────────────────────────────────────────────────────────
 
 struct OrderResult {
-    bool        success   = false;
+    bool        success    = false;
     std::string order_id;
     std::string message;
+    int         filled_qty = 0; // actual contracts filled (may be < requested on partial fill)
 };
 
 // ─── OptionsOrderRouter ───────────────────────────────────────────────────────
@@ -273,6 +274,20 @@ private:
         }
     }
 
+    // Returns the number of contracts actually filled so far (from Alpaca's filled_qty field).
+    int fetchFilledQty(const std::string& order_id) const {
+        try {
+            auto cli = makeClient();
+            auto res = cli.Get(("/v2/orders/" + order_id).c_str(), authHeaders());
+            if (!res || res->status != 200) return 0;
+            json body = json::parse(res->body);
+            std::string fq = body.value("filled_qty", "0");
+            return static_cast<int>(std::stod(fq));
+        } catch (...) {
+            return 0;
+        }
+    }
+
     void cancelAlpacaOrder(const std::string& order_id) const {
         try {
             auto cli = makeClient();
@@ -327,8 +342,16 @@ private:
             for (int sec = 0; sec < 30; ++sec) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 std::string status = checkOrderFill(result.order_id);
-                if (status == "filled" || status == "partially_filled") {
+                if (status == "filled") {
+                    result.filled_qty = fetchFilledQty(result.order_id);
                     filled = true;
+                    break;
+                }
+                if (status == "partially_filled") {
+                    // Wait the full 30s — Alpaca may finish the fill.
+                    // If still partial at timeout, record only the filled portion.
+                    result.filled_qty = fetchFilledQty(result.order_id);
+                    filled = true; // accept partial fill; don't retry into the spread
                     break;
                 }
                 if (status == "cancelled" || status == "rejected" || status == "expired") break;
@@ -351,7 +374,7 @@ private:
         std::string side = is_short_premium ? "buy" : "sell";
         json order = {
             {"symbol",          occ_symbol},
-            {"qty",             std::to_string(quantity)},
+            {"qty",             quantity},
             {"side",            side},
             {"time_in_force",   "day"},
             {"position_effect", "close"}
@@ -383,7 +406,7 @@ private:
 
         json order = {
             {"symbol",          contract.occ_symbol},
-            {"qty",             std::to_string(qty_contracts)},
+            {"qty",             qty_contracts},
             {"side",            side},
             {"time_in_force",   "day"},
             {"position_effect", "open"}
@@ -417,18 +440,18 @@ private:
             {"type",          "market"},
             {"order_class",   "mleg"},
             {"time_in_force", "day"},
-            {"qty",           std::to_string(qty_contracts)},
+            {"qty",           qty_contracts},
             {"legs", json::array({
                 {
                     {"symbol",          buy_leg.occ_symbol},
                     {"side",            "buy"},
-                    {"ratio_qty",       "1"},
+                    {"ratio_qty",       1},
                     {"position_effect", "open"}
                 },
                 {
                     {"symbol",          sell_leg.occ_symbol},
                     {"side",            "sell"},
-                    {"ratio_qty",       "1"},
+                    {"ratio_qty",       1},
                     {"position_effect", "open"}
                 }
             })}
@@ -454,18 +477,18 @@ private:
             {"type",          "market"},
             {"order_class",   "mleg"},
             {"time_in_force", "day"},
-            {"qty",           std::to_string(qty_contracts)},
+            {"qty",           qty_contracts},
             {"legs", json::array({
                 {
                     {"symbol",          call_leg.occ_symbol},
                     {"side",            "buy"},
-                    {"ratio_qty",       "1"},
+                    {"ratio_qty",       1},
                     {"position_effect", "open"}
                 },
                 {
                     {"symbol",          put_leg.occ_symbol},
                     {"side",            "buy"},
-                    {"ratio_qty",       "1"},
+                    {"ratio_qty",       1},
                     {"position_effect", "open"}
                 }
             })}
@@ -492,18 +515,18 @@ private:
             {"type",          "market"},
             {"order_class",   "mleg"},
             {"time_in_force", "day"},
-            {"qty",           std::to_string(qty_contracts)},
+            {"qty",           qty_contracts},
             {"legs", json::array({
                 {
                     {"symbol",          call_leg.occ_symbol},
                     {"side",            "buy"},
-                    {"ratio_qty",       "1"},
+                    {"ratio_qty",       1},
                     {"position_effect", "open"}
                 },
                 {
                     {"symbol",          put_leg.occ_symbol},
                     {"side",            "buy"},
-                    {"ratio_qty",       "1"},
+                    {"ratio_qty",       1},
                     {"position_effect", "open"}
                 }
             })}

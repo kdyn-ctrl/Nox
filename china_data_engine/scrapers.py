@@ -1,11 +1,41 @@
 import requests
 import akshare as ak
+import threading
 from typing import Dict, Any, List
 
 # RULE-008: All HTTP calls use a (connect_timeout, read_timeout) tuple.
 # A scalar timeout=10 only sets the read timeout — the connection can still
 # block indefinitely. The tuple form enforces both independently.
 HTTP_TIMEOUT = (5, 10)
+
+# AkShare uses its own HTTP layer and exposes no timeout parameter.
+# Wrap calls with a hard wall-clock timeout using a daemon thread so a
+# hung AkShare request never blocks the 15-minute APScheduler refresh.
+def _akshare_call(func, timeout_seconds: int = 20):
+    """
+    Run `func()` in a daemon thread and return its result within timeout_seconds.
+    Returns None and prints a warning if the call hangs or raises.
+    """
+    result = [None]
+    exc    = [None]
+
+    def _run():
+        try:
+            result[0] = func()
+        except Exception as e:
+            exc[0] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_seconds)
+    if t.is_alive():
+        print(f"[WARN] [CHINA] AkShare call {func.__name__ if hasattr(func, '__name__') else func} "
+              f"timed out after {timeout_seconds}s — skipping.", flush=True)
+        return None
+    if exc[0] is not None:
+        print(f"[WARN] [CHINA] AkShare call raised: {exc[0]}", flush=True)
+        return None
+    return result[0]
 
 
 def fetch_eastmoney_hot_board() -> List[Dict[str, Any]]:
@@ -27,7 +57,7 @@ def fetch_eastmoney_hot_board() -> List[Dict[str, Any]]:
     ]
     for func_name, func in CANDIDATES:
         try:
-            df = func()
+            df = _akshare_call(func)
             if df is None or df.empty:
                 print(f"[WARN] [SCRAPER] {func_name} returned empty dataframe, trying next.", flush=True)
                 continue
@@ -87,7 +117,7 @@ def fetch_china_pmi() -> Dict[str, Any]:
 
     # 1. Fetch Official Manufacturing PMI
     try:
-        df_mfg = ak.macro_china_pmi_yearly()
+        df_mfg = _akshare_call(ak.macro_china_pmi_yearly)
         if not df_mfg.empty:
             latest = df_mfg.iloc[-1]
             mfg_val = latest.get('今值')
@@ -103,7 +133,7 @@ def fetch_china_pmi() -> Dict[str, Any]:
 
     # 2. Fetch Official Non-Manufacturing PMI
     try:
-        df_non_mfg = ak.macro_china_non_man_pmi()
+        df_non_mfg = _akshare_call(ak.macro_china_non_man_pmi)
         if not df_non_mfg.empty:
             latest = df_non_mfg.iloc[-1]
             non_mfg_val = latest.get('今值')
@@ -130,8 +160,8 @@ def fetch_pboc_lpr() -> Dict[str, Any]:
     Returns a dict with normalised English keys. Empty dict on failure.
     """
     try:
-        df = ak.macro_china_lpr()
-        if df.empty:
+        df = _akshare_call(ak.macro_china_lpr)
+        if df is None or df.empty:
             print("[WARN] [SCRAPER] PBOC LPR dataframe was empty.", flush=True)
             return {}
         latest = df.iloc[-1]
@@ -178,7 +208,7 @@ def fetch_cailian_news() -> List[Dict[str, str]]:
         if len(result) >= 10:
             break
         try:
-            df = ak.stock_news_em(symbol=ticker)
+            df = _akshare_call(lambda: ak.stock_news_em(symbol=ticker))
             if df is None or df.empty:
                 print(f"[WARN] [SCRAPER] stock_news_em returned empty for {ticker}.", flush=True)
                 continue

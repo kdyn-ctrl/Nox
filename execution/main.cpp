@@ -218,6 +218,7 @@ private:
     // Options signal scanner profiles (configured from env vars in the constructor)
     nox::options_signal::RiskProfile optionsBotProfile_;
     nox::options_signal::RiskProfile optionsPersonalProfile_;
+    nox::options_signal::RiskProfile optionsBreakoutProfile_;
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
     // SIGTERM sets running_ = false and calls shutdown(), which stops the HTTP
@@ -351,6 +352,107 @@ private:
         } catch (const std::exception& e) {
             Logger::log("WARN", "[CN-RULE-002] Failed to parse positions file: " +
                         std::string(e.what()) + ". Starting with empty T+1 map.");
+        }
+    }
+
+    // Gap 2 fix: on startup, seed any options positions open in Alpaca that aren't
+    // in the local SQLite DB. Handles positions entered before a crash or restart
+    // (including the pre-Gap-1 era when add_position() was never called).
+    // Uses avg_entry_price from Alpaca as the tracked entry so exit-rule ratios
+    // are calibrated to the real fill rather than an arbitrary current price.
+    void reconcilePositionsFromBroker() {
+        Logger::log("INFO", "[RECONCILE] Checking Alpaca for untracked options positions...");
+        try {
+            httplib::Client cli(alpacaBaseUrl);
+            cli.set_connection_timeout(std::chrono::seconds(5));
+            cli.set_read_timeout(std::chrono::seconds(10));
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID",     apiKey},
+                {"APCA-API-SECRET-KEY", apiSec}
+            };
+            auto res = cli.Get("/v2/positions", headers);
+            if (!res || res->status != 200) {
+                Logger::log("WARN", "[RECONCILE] /v2/positions returned " +
+                            std::to_string(res ? res->status : 0) + " — skipping.");
+                return;
+            }
+            auto body = json::parse(res->body);
+            if (!body.is_array()) {
+                Logger::log("WARN", "[RECONCILE] Unexpected response format — skipping.");
+                return;
+            }
+            int added = 0, skipped = 0;
+            for (const auto& pos : body) {
+                if (pos.value("asset_class", "") != "us_option") continue;
+                std::string occ = pos.value("symbol", "");
+                if (occ.empty()) continue;
+
+                // Parse OCC symbol: UNDERLYING(1-5) + YYMMDD(6) + C|P(1) + STRIKE(8)
+                // Example: AAPL240119C00150000 → underlying=AAPL, exp=2024-01-19, call, $150.000
+                size_t i = 0;
+                while (i < occ.size() && std::isalpha(static_cast<unsigned char>(occ[i]))) ++i;
+                if (i == 0 || occ.size() < i + 15) continue; // malformed OCC
+
+                std::string underlying = occ.substr(0, i);
+                std::string yymmdd     = occ.substr(i, 6);
+                std::string expiry     = "20" + yymmdd.substr(0, 2) + "-"
+                                                + yymmdd.substr(2, 2) + "-"
+                                                + yymmdd.substr(4, 2);
+                std::string opt_type   = (occ[i + 6] == 'C') ? "call" : "put";
+                double strike = 0.0;
+                try { strike = std::stod(occ.substr(i + 7, 8)) / 1000.0; } catch (...) { continue; }
+                if (strike <= 0.0) continue;
+
+                if (positionManager_->has_open_position_by_contract(underlying, strike, expiry, opt_type)) { skipped++; continue; }
+
+                // Prefer avg_entry_price (real fill); fall back to current_price
+                double entry_price = 0.0;
+                auto tryParse = [](const json& j, const char* key) -> double {
+                    if (!j.contains(key)) return 0.0;
+                    const auto& v = j[key];
+                    try {
+                        if (v.is_number()) return v.get<double>();
+                        if (v.is_string()) return std::stod(v.get<std::string>());
+                    } catch (...) {}
+                    return 0.0;
+                };
+                entry_price = tryParse(pos, "avg_entry_price");
+                if (entry_price <= 0.0) entry_price = tryParse(pos, "current_price");
+                if (entry_price <= 0.0) entry_price = 1.0; // safe fallback; ratios still fire
+
+                int qty = 1;
+                if (pos.contains("qty")) {
+                    const auto& q = pos["qty"];
+                    try {
+                        if (q.is_number()) qty = std::abs(q.get<int>());
+                        else if (q.is_string()) qty = std::abs(std::stoi(q.get<std::string>()));
+                    } catch (...) {}
+                }
+
+                std::string side         = pos.value("side", "long");
+                std::string profile_type = (side == "short") ? "short_premium" : "long";
+                std::string today        = get_today_date_string();
+
+                positionManager_->add_position(underlying, opt_type, strike, qty,
+                                               entry_price, today, profile_type, expiry);
+                added++;
+                Logger::log("INFO", "[RECONCILE] Seeded orphan: " + underlying +
+                            " " + opt_type + " $" + std::to_string(strike) +
+                            " exp=" + expiry + " entry=$" + std::to_string(entry_price));
+            }
+            Logger::log("INFO", "[RECONCILE] Done — seeded=" + std::to_string(added) +
+                        ", already-tracked=" + std::to_string(skipped) + ".");
+            if (added > 0) {
+                TelegramNotifier::sendMessage(
+                    "🔄 *Startup Reconciliation*\n"
+                    "────────────────────────\n"
+                    "• Seeded *" + std::to_string(added) + "* untracked option position(s) from Alpaca.\n"
+                    "• These were open before the last engine restart.\n"
+                    "_Exit rules (50% profit / 21 DTE / stop-loss) are now active._"
+                );
+            }
+        } catch (const std::exception& e) {
+            Logger::log("WARN", "[RECONCILE] Exception: " + std::string(e.what()));
         }
     }
 
@@ -1101,6 +1203,21 @@ public:
             optionsPersonalProfile_.max_signals_per_scan =
                 envInt("OPTIONS_PERSONAL_MAX_SIGNALS", 2);
 
+            // ── BREAKOUT profile — LEAP advisory signals on breakout setups ───
+            optionsBreakoutProfile_ = nox::options_signal::RiskProfile::breakout();
+            optionsBreakoutProfile_.watchlist = parseWatchlist(
+                envStr("OPTIONS_BREAKOUT_WATCHLIST",
+                       "SPY,QQQ,IWM,AAPL,MSFT,NVDA,AMD,TSLA,AMZN,META,GOOGL,NFLX,COIN,PLTR,MSTR,SHOP,ARKK,SOXX,GLD,XLF"));
+            optionsBreakoutProfile_.scan_interval_minutes =
+                envInt("OPTIONS_BREAKOUT_SCAN_INTERVAL_MINUTES", 30);
+            optionsBreakoutProfile_.auto_execute = false; // always advisory
+            optionsBreakoutProfile_.qty_contracts =
+                envInt("OPTIONS_BREAKOUT_QTY_CONTRACTS", 1);
+            optionsBreakoutProfile_.free_capital_amount =
+                envDbl("OPTIONS_BREAKOUT_FREE_CAPITAL_AMOUNT", 0.0);
+            optionsBreakoutProfile_.max_signals_per_scan =
+                envInt("OPTIONS_BREAKOUT_MAX_SIGNALS", 2);
+
             Logger::log("INFO", "[OPTIONS_SIGNAL] BOT profile: AutoExecute="
                 + std::string(optionsBotProfile_.auto_execute ? "ON" : "OFF (advisory)")
                 + " | Watchlist=" + std::to_string(optionsBotProfile_.watchlist.size()) + " tickers"
@@ -1139,6 +1256,7 @@ public:
             positionManager_ = std::make_unique<PositionManager>(memory_bank_path_, *order_router);
             positionManager_->start_monitoring();
             Logger::log("INFO", "[POS_MANAGER] Position Manager initialized at " + memory_bank_path_);
+            reconcilePositionsFromBroker();
         } catch (const std::exception& e) {
             std::cerr << "[FATAL] [POS_MANAGER] Failed to initialize Position Manager: "
                       << e.what() << ". Refusing to start." << std::endl;
@@ -1275,6 +1393,153 @@ public:
                 {"last_analyst_report", last_analyst_report_time.empty() ? "Never" : last_analyst_report_time}
             };
             res.set_content(response.dump(), "application/json");
+        });
+
+        // Daily end-of-day report: aggregates positions, P&L, Greeks, and signals
+        svr.Get("/daily-report", [this](const httplib::Request&, httplib::Response& res) {
+            try {
+                // Fetch account equity and portfolio value
+                double equity = fetch_account_equity();
+                if (equity <= 0.0) {
+                    res.status = 500;
+                    res.set_content("Failed to fetch account equity", "text/plain");
+                    return;
+                }
+
+                auto positions = positionManager_->get_open_positions_public();
+
+                // Calculate Greeks and P&L
+                double total_delta = 0.0, total_gamma = 0.0;
+                double total_theta = 0.0, total_vega  = 0.0;
+                double notional    = 0.0;
+                double unrealized_pnl = 0.0;
+
+                for (const auto& pos : positions) {
+                    double expiry_years = 0.0;
+                    {
+                        auto now    = std::chrono::system_clock::now();
+                        auto time_t = std::chrono::system_clock::to_time_t(now);
+                        std::tm tm_now{};
+                        gmtime_r(&time_t, &tm_now);
+
+                        int ey, em, ed;
+                        std::sscanf(pos.expiration_date.c_str(), "%d-%d-%d", &ey, &em, &ed);
+                        int days_exp = (ey - (1900 + tm_now.tm_year)) * 365
+                                     + (em - 1 - tm_now.tm_mon) * 30
+                                     + (ed - tm_now.tm_mday);
+                        expiry_years = std::max(0.0, days_exp / 365.0);
+                    }
+
+                    nox::options::OptionContract contract;
+                    contract.underlying     = pos.strike;
+                    contract.strike         = pos.strike;
+                    contract.expiry         = expiry_years;
+                    contract.risk_free_rate = 0.05;
+                    contract.volatility     = 0.25;
+                    contract.type = (pos.option_type == "call")
+                                    ? nox::options::OptionType::Call
+                                    : nox::options::OptionType::Put;
+
+                    auto g = nox::options::compute_greeks(contract, false);
+                    double sign = (pos.profile_type == "short_premium") ? -1.0 : 1.0;
+
+                    total_delta += g.delta * sign * pos.quantity * 100.0;
+                    total_gamma += g.gamma * sign * pos.quantity * 100.0;
+                    total_theta += g.theta * sign * pos.quantity * 100.0;
+                    total_vega  += g.vega  * sign * pos.quantity * 100.0;
+                    notional    += pos.entry_price * pos.quantity * 100.0;
+
+                    // Rough P&L estimate: (current_price - entry_price) * qty * 100
+                    // Uses entry price as proxy for current
+                    unrealized_pnl += (g.price - pos.entry_price) * pos.quantity * 100.0 * sign;
+                }
+
+                // Collect recent signals
+                {
+                    std::lock_guard<std::mutex> lock(signal_log_mutex_);
+                    int buy_count = 0, sell_count = 0, hold_count = 0;
+                    for (const auto& e : signal_log_) {
+                        if (e.action == "BUY") buy_count++;
+                        else if (e.action == "SELL") sell_count++;
+                        else if (e.action == "HOLD") hold_count++;
+                    }
+
+                    // Calculate drawdown
+                    {
+                        std::lock_guard<std::mutex> dd_lock(peak_equity_mutex_);
+                        double drawdown_pct = (peak_equity_ > 0.0)
+                            ? ((peak_equity_ - equity) / peak_equity_) * 100.0
+                            : 0.0;
+
+                        std::ostringstream report;
+                        report << "📊 *END-OF-DAY TRADING REPORT*\n"
+                               << "════════════════════════════════════════\n\n"
+                               << "*ACCOUNT SUMMARY*\n"
+                               << "• *Equity:* $" << std::fixed << std::setprecision(2) << equity << "\n"
+                               << "• *Peak Equity:* $" << peak_equity_ << "\n"
+                               << "• *Drawdown:* " << drawdown_pct << "%\n"
+                               << "• *Circuit Breaker:* " << (scanner_halt_drawdown_.load() ? "🔴 ACTIVE" : "🟢 NORMAL") << "\n\n";
+
+                        report << "*SIGNAL FLOW*\n"
+                               << "• *BUY signals:* " << buy_count << "\n"
+                               << "• *SELL signals:* " << sell_count << "\n"
+                               << "• *HOLD signals:* " << hold_count << "\n"
+                               << "• *Total processed:* " << (buy_count + sell_count + hold_count) << "\n\n";
+
+                        report << "*POSITIONS SUMMARY*\n"
+                               << "• *Open options:* " << positions.size() << "\n"
+                               << "• *Total notional:* $" << notional << "\n"
+                               << "• *Unrealized P&L:* $" << unrealized_pnl << "\n\n";
+
+                        if (positions.size() > 0) {
+                            report << "*PORTFOLIO GREEKS*\n"
+                                   << "• *Delta:* " << std::round(total_delta * 1000.0) / 1000.0 << "\n"
+                                   << "• *Gamma:* " << std::round(total_gamma * 10000.0) / 10000.0 << "\n"
+                                   << "• *Theta:* " << std::round(total_theta * 100.0) / 100.0 << " per day\n"
+                                   << "• *Vega:* " << std::round(total_vega * 100.0) / 100.0 << "\n\n";
+                        }
+
+                        report << "*OPEN POSITIONS*\n";
+                        if (positions.empty()) {
+                            report << "_(None)_\n";
+                        } else {
+                            for (const auto& pos : positions) {
+                                report << "• " << pos.ticker << " " << pos.option_type << " $"
+                                       << std::fixed << std::setprecision(2) << pos.strike
+                                       << " exp:" << pos.expiration_date << " qty:" << pos.quantity << "\n";
+                            }
+                        }
+
+                        report << "\n_Report generated at market close_\n";
+
+                        std::string telegram_msg = report.str();
+                        TelegramNotifier::sendMessage(telegram_msg);
+
+                        json response = {
+                            {"status", "report_generated"},
+                            {"equity", equity},
+                            {"drawdown_pct", drawdown_pct},
+                            {"open_positions", static_cast<int>(positions.size())},
+                            {"signals_today", {
+                                {"buy", buy_count},
+                                {"sell", sell_count},
+                                {"hold", hold_count}
+                            }},
+                            {"greeks", {
+                                {"delta", std::round(total_delta * 1000.0) / 1000.0},
+                                {"gamma", std::round(total_gamma * 10000.0) / 10000.0},
+                                {"theta", std::round(total_theta * 100.0) / 100.0},
+                                {"vega", std::round(total_vega * 100.0) / 100.0}
+                            }},
+                            {"unrealized_pnl", unrealized_pnl}
+                        };
+                        res.set_content(response.dump(2), "application/json");
+                    }
+                }
+            } catch (const std::exception& e) {
+                res.status = 500;
+                res.set_content(std::string("Report generation failed: ") + e.what(), "text/plain");
+            }
         });
 
         // Returns the last 50 authenticated signals received by the webhook.
@@ -1449,7 +1714,11 @@ public:
 
                 if (root_payload.is_array()) {
                     for (const auto& item : root_payload) {
-                        process_single_chunk(item);
+                        try {
+                            process_single_chunk(item);
+                        } catch (const std::exception& ex) {
+                            Logger::log("ERROR", "[EXECUTION] Error processing array item: " + std::string(ex.what()));
+                        }
                     }
                 } else if (root_payload.is_object()) {
                     process_single_chunk(root_payload);
@@ -1491,10 +1760,10 @@ public:
                 std::string tg_token = std::getenv("TELEGRAM_BOT_TOKEN") ? std::getenv("TELEGRAM_BOT_TOKEN") : "";
                 std::string tg_chat  = std::getenv("TELEGRAM_CHAT_ID")   ? std::getenv("TELEGRAM_CHAT_ID")   : "";
 
-                // Pass memory_bank_path_ for open-position deduplication.
+                // Pass memory_bank_path_ for dedup and positionManager_ for Gap 1 fill recording.
                 nox::options_signal::OptionsSignalGenerator generator(
                     alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat, profile,
-                    memory_bank_path_);
+                    memory_bank_path_, positionManager_.get());
 
                 while (running_.load()) {
                     try {
@@ -1528,6 +1797,7 @@ public:
 
         launchOptionsThread(optionsBotProfile_);
         launchOptionsThread(optionsPersonalProfile_);
+        launchOptionsThread(optionsBreakoutProfile_);
         // ────────────────────────────────────────────────────────────────────
 
         // Install SIGTERM/SIGINT handlers now that s_instance_ is set and

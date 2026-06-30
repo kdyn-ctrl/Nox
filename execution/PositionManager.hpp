@@ -16,7 +16,6 @@
 
 // Forward declarations
 namespace nox::options_router { class OptionsOrderRouter; }
-class TelegramNotifier;
 
 struct OptionPosition {
     long id;
@@ -72,6 +71,31 @@ public:
         int count = 0;
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, 0) == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, ticker.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) == SQLITE_ROW)
+                count = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        return count > 0;
+    }
+
+    // Returns true if the exact contract (ticker + strike + expiry + type) is already tracked.
+    // Used during broker reconciliation to avoid deduplicating on underlying alone, which
+    // would silently drop a second contract on the same ticker with a different strike/expiry.
+    bool has_open_position_by_contract(const std::string& ticker,
+                                        double             strike,
+                                        const std::string& expiration_date,
+                                        const std::string& option_type) {
+        std::lock_guard<std::mutex> lock(db_lock_);
+        const char* sql = "SELECT COUNT(*) FROM open_positions "
+                          "WHERE ticker = ? AND ABS(strike - ?) < 0.001 "
+                          "AND expiration_date = ? AND option_type = ?;";
+        sqlite3_stmt* stmt = nullptr;
+        int count = 0;
+        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, 0) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, ticker.c_str(),          -1, SQLITE_TRANSIENT);
+            sqlite3_bind_double(stmt, 2, strike);
+            sqlite3_bind_text(stmt, 3, expiration_date.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 4, option_type.c_str(),     -1, SQLITE_TRANSIENT);
             if (sqlite3_step(stmt) == SQLITE_ROW)
                 count = sqlite3_column_int(stmt, 0);
         }

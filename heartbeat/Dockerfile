@@ -18,7 +18,13 @@ RUN pip install --no-cache-dir \
     anthropic==0.109.2 \
     schedule==1.2.2 \
     beautifulsoup4==4.12.3 \
-    lxml==5.3.0
+    lxml==5.3.0 \
+    # pandas_market_calendars is used by the weekly performance report scheduler
+    # to determine the last NYSE trading day of each week (handles holidays so
+    # the report shifts from Friday to Thursday automatically). It pulls in
+    # pandas, numpy, and exchange_calendars as transitive dependencies — that is
+    # why mem_limit in docker-compose.yml was raised from 768 MB to 1 GB.
+    pandas-market-calendars==4.6.2
 
 # Create the data directory that DB_PATH ('/app/data/memory_bank.db') depends on.
 # Without this sqlite3.connect() raises OperationalError at runtime.

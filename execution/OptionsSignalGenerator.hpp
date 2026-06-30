@@ -6,6 +6,7 @@
 #include "OptionEngine.hpp"
 #include "OptionsSignalTypes.hpp"
 #include "OptionsOrderRouter.hpp"
+#include "PositionManager.hpp"
 #include "../shared/RegimeStateMachine.hpp"
 
 #include <algorithm>
@@ -173,18 +174,26 @@ struct ScoredSignal {
     double sma_distance_atrs = 0.0; // how far price is from SMA20 in ATR units
     double vol_deviation     = 0.0; // abs(IV/HRV - 1.0)
     double rsi_extremity     = 0.0; // abs(RSI - 50) / 50
+    double vol_ratio         = 1.0; // recent 5-day avg volume / 20-day avg
+    double macd_alignment    = 0.0; // 1.0 if histogram confirms directional bias
+    double macd_hist         = 0.0; // raw histogram value (for logging)
 };
 
 // ─── Structures ───────────────────────────────────────────────────────────────
 
 struct UnderlyingData {
-    double price    = 0.0;
-    double sma20    = 0.0;
-    double sma50    = 0.0;
-    double rsi14    = 0.0;
-    double atr14    = 0.0;
-    double hrv30    = 0.20; // 30-day historical realized volatility (annualized)
-    bool   valid    = false;
+    double price     = 0.0;
+    double sma20     = 0.0;
+    double sma50     = 0.0;
+    double rsi14     = 0.0;
+    double atr14     = 0.0;
+    double hrv30     = 0.20; // 30-day historical realized volatility (annualized)
+    double vol20_avg = 0.0;  // 20-day average daily volume
+    double vol_ratio  = 1.0;  // recent 5-day avg volume / 20-day avg (>1.2 = expanding)
+    double macd_line   = 0.0; // MACD line (EMA12 - EMA26)
+    double macd_signal = 0.0; // 9-period EMA of macd_line
+    double macd_hist   = 0.0; // histogram (macd_line - macd_signal)
+    bool   valid      = false;
 };
 
 // Returned by fetchIVData — actual IV level from Alpaca snapshot + display rank
@@ -192,6 +201,20 @@ struct IVData {
     double iv_level = 0.20; // annualized implied volatility (use in Black-Scholes)
     double iv_rank  = 50.0; // within-snapshot relative position (display only)
     bool   vol_rich = false; // iv_level > hrv30 * 1.20 — sell-premium environment
+};
+
+// VIX term structure snapshot — moved to namespace scope so it can be used as a
+// default argument in member function declarations (GCC requires the type to be
+// fully defined with default member initialisers before the class is closed).
+//
+// VIX3M/VIX > 1.05 → contango   → short-vol structurally favoured
+// VIX3M/VIX < 0.95 → backwardation → front vol spiked → avoid selling premium
+struct VixTermStructure {
+    double spot   = -1.0; // ^VIX
+    double vix3m  = -1.0; // ^VIX3M (91-day CBOE index)
+    double ratio  = 1.0;  // vix3m / spot
+    bool   valid  = false;
+    std::string label; // "CONTANGO" | "BACKWARDATION" | "FLAT"
 };
 
 
@@ -202,13 +225,16 @@ public:
     // Profile-driven constructor — all risk parameters come from the RiskProfile.
     // db_path: optional path to the PositionManager SQLite DB for open-position
     //          deduplication (leave empty to disable the check).
+    // position_manager: pointer to the engine's PositionManager so executeSignal()
+    //                   can record fills via add_position() (Gap 1 fix).
     OptionsSignalGenerator(const std::string& alpacaUrl,
                            const std::string& apiKey,
                            const std::string& apiSec,
                            const std::string& tgToken,
                            const std::string& tgChatId,
                            RiskProfile        profile,
-                           const std::string& db_path = "")
+                           const std::string& db_path = "",
+                           PositionManager*   position_manager = nullptr)
         : alpacaUrl_(alpacaUrl)
         , apiKey_(apiKey)
         , apiSec_(apiSec)
@@ -216,6 +242,7 @@ public:
         , tgChatId_(tgChatId)
         , profile_(std::move(profile))
         , dedup_db_path_(db_path)
+        , positionManager_(position_manager)
     {}
 
     // Entry point — called once per scan cycle from the engine's background thread.
@@ -356,7 +383,9 @@ public:
                 " | score=" + fmt(sc.quality_score, 2) +
                 " (SMA=" + fmt(sc.sma_distance_atrs, 1) + "xATR" +
                 " vol=" + fmt(sc.vol_deviation * 100.0, 0) + "%" +
-                " RSI=" + fmt(sc.signal.rsi, 0) + ")");
+                " RSI=" + fmt(sc.signal.rsi, 0) +
+                " VolRatio=" + fmt(sc.vol_ratio, 2) + "x" +
+                " MACDhist=" + fmt(sc.macd_hist, 4) + ")");
             dispatched++;
         }
 
@@ -376,6 +405,7 @@ private:
     std::string tgChatId_;
     RiskProfile profile_;
     std::string dedup_db_path_; // path to PositionManager SQLite DB for dedup
+    PositionManager* positionManager_ = nullptr; // Gap 1: record fills after successful route()
     RegimeStateMachine regimeMachine_;
     nox::liquidity::LiquidityGate liquidity_gate_; // WS5 microstructure gate
 
@@ -438,8 +468,12 @@ private:
 
     // Returns true if a strategy is allowed — tier gates honoured only when enforce_tier_gates is set
     bool strategyAllowed(const std::string& strategy, const std::string& tier) const {
-        if (!profile_.enforce_tier_gates) return true; // personal: all strategies open
+        if (!profile_.enforce_tier_gates) return true; // personal/breakout: all strategies open
 
+        // LEAP strategies are directional longs — same tier rules as LONG_CALL/LONG_PUT
+        if (strategy == "LEAP_CALL" || strategy == "LEAP_PUT") {
+            return true; // allowed at all tiers; capital requirements checked at sizing
+        }
         if (tier == "STARTER") {
             return strategy == "LONG_CALL" || strategy == "LONG_PUT";
         }
@@ -454,6 +488,7 @@ private:
 
     double regimeConfidence(Regime r, const std::string& strategy) const {
         bool is_long_premium = (strategy == "LONG_CALL"  || strategy == "LONG_PUT" ||
+                                strategy == "LEAP_CALL"  || strategy == "LEAP_PUT" ||
                                 strategy == "BULL_CALL_SPREAD" || strategy == "BEAR_PUT_SPREAD" ||
                                 strategy == "STRADDLE"   || strategy == "STRANGLE");
 
@@ -497,10 +532,26 @@ private:
         sc.vol_deviation   = (sig.hrv30 > 0.01)
             ? std::abs(sig.iv_level / sig.hrv30 - 1.0) : 0.0;
         sc.rsi_extremity   = std::abs(sig.rsi - 50.0) / 50.0;
-        // Weights: trend conviction matters most, vol signal second, RSI third
-        sc.quality_score   = sc.sma_distance_atrs * 0.50
-                           + sc.vol_deviation      * 0.30
-                           + sc.rsi_extremity      * 0.20;
+        sc.vol_ratio       = d.vol_ratio;
+        // Volume boost: above-average volume strengthens the setup.
+        // Capped at 2× so a single-day spike doesn't dominate.
+        // At 1.0× (average) boost = 0.0; at 2.0× boost = 1.0.
+        double vol_boost   = std::max(0.0, std::min(d.vol_ratio, 2.0) - 1.0);
+        // MACD alignment: histogram must confirm directional bias.
+        // Bullish strategies want macd_hist > 0; bearish want macd_hist < 0.
+        bool is_bullish = (sig.strategy == "LONG_CALL"  || sig.strategy == "LEAP_CALL" ||
+                           sig.strategy == "BULL_CALL_SPREAD" || sig.strategy == "CC");
+        bool is_bearish = (sig.strategy == "LONG_PUT"   || sig.strategy == "LEAP_PUT" ||
+                           sig.strategy == "BEAR_PUT_SPREAD");
+        sc.macd_hist = d.macd_hist;
+        if ((is_bullish && d.macd_hist > 0.0) || (is_bearish && d.macd_hist < 0.0))
+            sc.macd_alignment = 1.0;
+        // Weights: trend (40%), vol signal (20%), RSI (15%), volume (15%), MACD (10%)
+        sc.quality_score   = sc.sma_distance_atrs * 0.40
+                           + sc.vol_deviation      * 0.20
+                           + sc.rsi_extremity      * 0.15
+                           + vol_boost             * 0.15
+                           + sc.macd_alignment     * 0.10;
         return sc;
     }
 
@@ -562,20 +613,12 @@ private:
 
     // ── Market data: VIX term structure (spot VIX vs 3-month VIX) ───────────
     //
-    // VIX3M/VIX > 1.05 → normal contango → short-vol is structurally favoured
-    // VIX3M/VIX < 0.95 → backwardation → front vol spiked → avoid selling premium
-    // Between 0.95–1.05 → neutral / inconclusive
-    //
+    // VixTermStructure is defined at namespace scope (above the class) so it
+    // can be used as a default function argument without triggering GCC's
+    // "default member initializer required before end of enclosing class" error.
+    // Between 0.95–1.05 → neutral / inconclusive.
     // The ratio is used as a secondary regime signal: backwardation reduces
     // regime_clearance for sell-premium strategies even in RISK_ON regime.
-
-    struct VixTermStructure {
-        double spot   = -1.0; // ^VIX
-        double vix3m  = -1.0; // ^VIX3M (91-day CBOE index)
-        double ratio  = 1.0;  // vix3m / spot
-        bool   valid  = false;
-        std::string label; // "CONTANGO" | "BACKWARDATION" | "FLAT"
-    };
 
     VixTermStructure fetchVixTermStructure() const {
         VixTermStructure ts;
@@ -730,36 +773,32 @@ private:
         int today_year, today_month, today_day;
         std::sscanf(today_str.c_str(), "%d-%d-%d", &today_year, &today_month, &today_day);
 
+        // Convert a broken-down date to UTC epoch seconds using std::mktime.
+        // mktime interprets the struct in local time but we only need the *delta*
+        // between two dates — the TZ offset cancels out as long as both dates are
+        // converted with the same call, which they are.
+        auto date_to_time_t = [](int y, int m, int d) -> std::time_t {
+            std::tm t{};
+            t.tm_year = y - 1900;
+            t.tm_mon  = m - 1;
+            t.tm_mday = d;
+            t.tm_hour = 12; // midday to avoid DST edge issues
+            return std::mktime(&t);
+        };
+
+        std::time_t today_t = date_to_time_t(today_year, today_month, today_day);
+
         // Check each earnings event for this ticker
         for (const auto& event : it->second) {
             int event_year, event_month, event_day;
-            std::sscanf(event.date.c_str(), "%d-%d-%d", &event_year, &event_month, &event_day);
+            if (std::sscanf(event.date.c_str(), "%d-%d-%d",
+                            &event_year, &event_month, &event_day) != 3) continue;
 
-            // Simple date comparison: convert both to day-of-year for same year, else compare years
-            auto days_until_event = [](int y1, int m1, int d1, int y2, int m2, int d2) -> long {
-                // Count days from date1 to date2
-                // This is a simplified comparison — proper implementation would use chrono
-                if (y1 != y2) {
-                    return y2 > y1 ? 1000 : -1000; // Different years, approximate
-                }
+            std::time_t event_t = date_to_time_t(event_year, event_month, event_day);
+            if (today_t == (std::time_t)-1 || event_t == (std::time_t)-1) continue;
 
-                // Same year: convert month/day to day-of-year
-                int days_in_month[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-                if ((y1 % 4 == 0 && y1 % 100 != 0) || (y1 % 400 == 0)) {
-                    days_in_month[2] = 29; // Leap year
-                }
-
-                int doy1 = d1;
-                for (int i = 1; i < m1; ++i) doy1 += days_in_month[i];
-
-                int doy2 = d2;
-                for (int i = 1; i < m2; ++i) doy2 += days_in_month[i];
-
-                return static_cast<long>(doy2 - doy1);
-            };
-
-            long days_diff = days_until_event(today_year, today_month, today_day,
-                                               event_year, event_month, event_day);
+            long days_diff = static_cast<long>(
+                std::difftime(event_t, today_t) / 86400.0 + 0.5); // round to nearest day
 
             // Earnings within 5 days (inclusive of today)
             if (days_diff >= 0 && days_diff <= 5) {
@@ -768,6 +807,45 @@ private:
         }
 
         return false;
+    }
+
+    // ── WS1 — Contradiction Vector: Kelly multiplier ─────────────────────────
+    //
+    // Queries america-data-engine for the latest per-ticker contradiction verdict
+    // before finalizing position sizing. If headline sentiment contradicts live IV
+    // skew (CONTRADICT_BULLISH or CONTRADICT_BEARISH), the Kelly fraction is halved.
+    //
+    // Strict 3s connect / 5s read timeouts per RULE-008. Fails open (1.0 = no cut)
+    // on any network error, parse failure, or missing token — never blocks execution.
+    double fetchWS1KellyMultiplier(const std::string& ticker) const {
+        try {
+            const char* secret = std::getenv("WEBHOOK_SECRET_TOKEN");
+            if (!secret) return 1.0;
+
+            httplib::Client cli("http://america-data-engine:8001");
+            cli.set_connection_timeout(std::chrono::seconds(3));
+            cli.set_read_timeout(std::chrono::seconds(5));
+
+            httplib::Headers headers = {{"X-Nox-Token", secret}};
+            auto res = cli.Get("/contradiction/us", headers);
+            if (!res || res->status != 200) return 1.0;
+
+            auto body = json::parse(res->body);
+            const auto& results = body.at("results");
+
+            for (const auto& entry : results) {
+                if (entry.value("ticker", "") != ticker) continue;
+                std::string verdict = entry.value("verdict", "");
+                if (verdict.rfind("CONTRADICT", 0) == 0) {
+                    log("WARN", "[WS1][KELLY_CUT] " + ticker +
+                        " — contradiction verdict: " + verdict +
+                        " — kelly_fraction halved (0.5x).");
+                    return 0.5;
+                }
+                return 1.0;
+            }
+        } catch (...) {}
+        return 1.0; // fail-safe: intelligence feed unreachable → normal sizing
     }
 
     // ── Market data: Underlying OHLCV (Yahoo Finance) ─────────────────────────
@@ -786,16 +864,20 @@ private:
             const auto& ohlcv = body.at("chart").at("result").at(0)
                                      .at("indicators").at("quote").at(0);
 
-            const auto& raw_closes = ohlcv.at("close");
-            const auto& raw_highs  = ohlcv.at("high");
-            const auto& raw_lows   = ohlcv.at("low");
+            const auto& raw_closes  = ohlcv.at("close");
+            const auto& raw_highs   = ohlcv.at("high");
+            const auto& raw_lows    = ohlcv.at("low");
+            const auto& raw_volumes = ohlcv.at("volume");
 
-            std::vector<double> closes, highs, lows;
+            std::vector<double> closes, highs, lows, volumes;
             for (size_t i = 0; i < raw_closes.size(); ++i) {
                 if (!raw_closes[i].is_null() && !raw_highs[i].is_null() && !raw_lows[i].is_null()) {
                     closes.push_back(raw_closes[i].get<double>());
                     highs.push_back(raw_highs[i].get<double>());
                     lows.push_back(raw_lows[i].get<double>());
+                    double v = (i < raw_volumes.size() && !raw_volumes[i].is_null())
+                               ? raw_volumes[i].get<double>() : 0.0;
+                    volumes.push_back(v);
                 }
             }
             if (closes.size() < 50) return {};
@@ -844,14 +926,82 @@ private:
             }
             double hrv30 = std::sqrt(hrv_sq_sum / 30.0 * 252.0);
 
+            // Volume: 20-day average and recent 5-day vs baseline ratio.
+            // vol_ratio > 1.2 = expanding volume (confirms breakouts and trend moves).
+            // Fails neutral (1.0) when volume data is unavailable.
+            double vol20_avg = 0.0, vol5_avg = 0.0;
+            if (volumes.size() >= 20) {
+                for (size_t i = volumes.size() - 20; i < volumes.size(); ++i) vol20_avg += volumes[i];
+                vol20_avg /= 20.0;
+            }
+            if (volumes.size() >= 5) {
+                for (size_t i = volumes.size() - 5; i < volumes.size(); ++i) vol5_avg += volumes[i];
+                vol5_avg /= 5.0;
+            }
+            double vol_ratio = (vol20_avg > 1000.0) ? vol5_avg / vol20_avg : 1.0;
+
+            // MACD(12,26,9): seed each EMA on the simple average of its first n bars,
+            // then run the remaining bars forward. Only the final values are needed.
+            double macd_line = 0.0, macd_signal_val = 0.0, macd_hist_val = 0.0;
+            if (closes.size() >= 35) { // 26 seed + 9 signal seed minimum
+                auto computeEMA = [](const std::vector<double>& src, size_t start,
+                                     size_t end, size_t n, double seed) {
+                    double k = 2.0 / (n + 1.0);
+                    double ema = seed;
+                    for (size_t i = start; i < end; ++i)
+                        ema = src[i] * k + ema * (1.0 - k);
+                    return ema;
+                };
+                // Seed EMA12 on first 12 closes, EMA26 on first 26 closes
+                double seed12 = 0.0, seed26 = 0.0;
+                for (size_t i = 0; i < 12; ++i) seed12 += closes[i];
+                seed12 /= 12.0;
+                for (size_t i = 0; i < 26; ++i) seed26 += closes[i];
+                seed26 /= 26.0;
+                double ema12_last = computeEMA(closes, 12, closes.size(), 12, seed12);
+                double ema26_last = computeEMA(closes, 26, closes.size(), 26, seed26);
+                // Build a small MACD-line series for the 9-period signal EMA
+                // Collect MACD values starting after the 26-bar seed period
+                size_t macd_start = 26;
+                size_t macd_len   = closes.size() - macd_start;
+                std::vector<double> macd_series;
+                macd_series.reserve(macd_len);
+                {
+                    double e12 = seed12, e26 = seed26;
+                    double k12 = 2.0 / 13.0, k26 = 2.0 / 27.0;
+                    for (size_t i = macd_start; i < closes.size(); ++i) {
+                        e12 = closes[i] * k12 + e12 * (1.0 - k12);
+                        e26 = closes[i] * k26 + e26 * (1.0 - k26);
+                        macd_series.push_back(e12 - e26);
+                    }
+                }
+                macd_line = macd_series.back();
+                if (macd_series.size() >= 9) {
+                    double sig_seed = 0.0;
+                    for (size_t i = 0; i < 9; ++i) sig_seed += macd_series[i];
+                    sig_seed /= 9.0;
+                    double k9 = 2.0 / 10.0;
+                    double sig_ema = sig_seed;
+                    for (size_t i = 9; i < macd_series.size(); ++i)
+                        sig_ema = macd_series[i] * k9 + sig_ema * (1.0 - k9);
+                    macd_signal_val = sig_ema;
+                }
+                macd_hist_val = macd_line - macd_signal_val;
+            }
+
             UnderlyingData d;
-            d.price  = closes.back();
-            d.sma20  = sma20;
-            d.sma50  = sma50;
-            d.rsi14  = rsi;
-            d.atr14  = atr_sum / 14.0;
-            d.hrv30  = hrv30;
-            d.valid  = true;
+            d.price     = closes.back();
+            d.sma20     = sma20;
+            d.sma50     = sma50;
+            d.rsi14     = rsi;
+            d.atr14     = atr_sum / 14.0;
+            d.hrv30       = hrv30;
+            d.vol20_avg   = vol20_avg;
+            d.vol_ratio   = vol_ratio;
+            d.macd_line   = macd_line;
+            d.macd_signal = macd_signal_val;
+            d.macd_hist   = macd_hist_val;
+            d.valid       = true;
             return d;
         } catch (...) {}
         return {};
@@ -961,7 +1111,20 @@ private:
     //               pending the C++ ↔ heartbeat integration (see private roadmap).
 
     std::string selectStrategy(DirectionalBias bias, double /*iv_rank*/, double iv_level,
-                               double hrv, const std::string& tier) const {
+                               double hrv, const std::string& tier,
+                               double sma_atrs = 0.0, double rsi = 50.0,
+                               bool above_sma50 = true) const {
+        // Breakout profile: strong displacement from SMA20 + SMA50 alignment + RSI momentum zone.
+        // SMA50 check prevents LEAP signals on counter-trend bounces — price must be on the right
+        // side of the medium-term trend before committing to a 6-month directional contract.
+        if (profile_.is_breakout_profile && sma_atrs >= profile_.breakout_sma_atrs_min) {
+            if (bias == DirectionalBias::Bullish && above_sma50 && rsi >= 55.0 && rsi <= 78.0)
+                return "LEAP_CALL";
+            if (bias == DirectionalBias::Bearish && !above_sma50 && rsi >= 22.0 && rsi <= 45.0)
+                return "LEAP_PUT";
+            // Breakout profile but SMA50 or RSI not aligned — fall through to normal selection
+        }
+
         bool vol_rich  = (hrv > 0.01) && (iv_level > hrv * 1.20);
         bool vol_cheap = (hrv > 0.01) && (iv_level < hrv * 0.90);
 
@@ -1018,18 +1181,36 @@ private:
         std::string expiry_date;
     };
 
+    struct ContractLiquidity {
+        bool   valid         = false;
+        double bid           = 0.0;
+        double ask           = 0.0;
+        double mid           = 0.0;
+        double spread_pct    = 0.0;  // (ask-bid)/mid
+        int    open_interest = 0;
+        bool   liquid        = false; // true if spread_pct < 0.15 and OI > 50
+    };
+
     ContractParams buildContractParams(const std::string& strategy,
                                        double spot, double atr,
-                                       double rfr, double iv_sigma) const {
+                                       double rfr, double iv_sigma,
+                                       double hrv30 = 0.20) const {
         ContractParams p;
 
         // Target DTE from profile
         int target_dte = profile_.dte_long;
-        if (strategy == "CSP" || strategy == "CC")
+        if (strategy == "LEAP_CALL" || strategy == "LEAP_PUT")
+            target_dte = profile_.dte_leap;
+        else if (strategy == "CSP" || strategy == "CC")
             target_dte = profile_.dte_income;
         else if (strategy == "STRADDLE" || strategy == "STRANGLE" ||
                  strategy == "BULL_CALL_SPREAD" || strategy == "BEAR_PUT_SPREAD")
             target_dte = profile_.dte_spread;
+
+        // Adaptive DTE for directional longs: high realized vol → faster moves →
+        // halve the DTE window so we don't overpay for time in a whipsaw regime.
+        if ((strategy == "LONG_CALL" || strategy == "LONG_PUT") && hrv30 > 0.30)
+            target_dte = std::max(14, target_dte / 2);
 
         p.expiry = target_dte / 365.0;
 
@@ -1082,8 +1263,13 @@ private:
         const double d_long = profile_.delta_long;
         const double d_inc  = profile_.delta_income;
         const double d_wing = profile_.delta_spread_wing;
+        const double d_leap = profile_.delta_leap;
 
-        if (strategy == "LONG_CALL") {
+        if (strategy == "LEAP_CALL") {
+            p.strike = findStrikeForDelta(d_leap, nox::options::OptionType::Call);
+        } else if (strategy == "LEAP_PUT") {
+            p.strike = findStrikeForDelta(d_leap, nox::options::OptionType::Put);
+        } else if (strategy == "LONG_CALL") {
             p.strike = findStrikeForDelta(d_long, nox::options::OptionType::Call);
         } else if (strategy == "LONG_PUT") {
             p.strike = findStrikeForDelta(d_long, nox::options::OptionType::Put);
@@ -1106,6 +1292,103 @@ private:
             p.strike2 = findStrikeForDelta(d_inc, nox::options::OptionType::Put);
         }
         return p;
+    }
+
+    // ── Contract liquidity filter (options chain check via Alpaca v1beta1) ────
+    //
+    // Queries Alpaca's options snapshot for the specific contract we intend to
+    // trade. Checks the live bid-ask spread and open interest; liquid = true when
+    // spread_pct < 15% AND OI > 50. Fails open (liquid=true) on any network
+    // error or missing chain data so a data outage never blocks execution.
+    ContractLiquidity checkContractLiquidity(const std::string& symbol,
+                                              const std::string& expiry_date,
+                                              double strike,
+                                              const std::string& option_type) const {
+        ContractLiquidity result;
+        result.liquid = true; // fail open by default
+
+        try {
+            httplib::Client cli(alpacaUrl_);
+            cli.set_connection_timeout(std::chrono::seconds(5));
+            cli.set_read_timeout(std::chrono::seconds(10));
+
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID",     apiKey_},
+                {"APCA-API-SECRET-KEY", apiSec_}
+            };
+
+            // Narrow band around the target strike (±0.5) so we get only the
+            // intended contract or its immediate neighbours.
+            std::ostringstream path_ss;
+            path_ss << "/v1beta1/options/snapshots/" << symbol
+                    << "?expiration_date=" << expiry_date
+                    << "&strike_price_gte=" << fmt(strike - 0.5, 2)
+                    << "&strike_price_lte=" << fmt(strike + 0.5, 2)
+                    << "&type=" << option_type
+                    << "&feed=indicative";
+
+            auto res = cli.Get(path_ss.str().c_str(), headers);
+            if (!res || res->status != 200) return result;
+
+            auto body = json::parse(res->body);
+            if (!body.contains("snapshots") || body["snapshots"].empty()) return result;
+
+            const auto& snapshots = body["snapshots"];
+
+            // Closest-strike match: parse the OCC symbol's embedded strike field
+            // (last 8 digits / 1000). E.g. AAPL250117C00150000 → $150.000.
+            std::string best_key;
+            double      best_diff = 1e9;
+            for (auto it = snapshots.begin(); it != snapshots.end(); ++it) {
+                const std::string& occ = it.key();
+                if (occ.size() >= 8) {
+                    try {
+                        double s    = std::stod(occ.substr(occ.size() - 8)) / 1000.0;
+                        double diff = std::abs(s - strike);
+                        if (diff < best_diff) { best_diff = diff; best_key = occ; }
+                    } catch (...) {}
+                }
+            }
+            if (best_key.empty()) best_key = snapshots.begin().key();
+
+            const auto& snap = snapshots.at(best_key);
+
+            // Bid/ask: prefer greeks.bid_price / ask_price, then latestQuote.bp/ap
+            double bid = 0.0, ask = 0.0;
+            if (snap.contains("greeks")) {
+                bid = snap["greeks"].value("bid_price", 0.0);
+                ask = snap["greeks"].value("ask_price", 0.0);
+            }
+            if ((bid <= 0.0 || ask <= 0.0) && snap.contains("latestQuote")) {
+                bid = snap["latestQuote"].value("bp", 0.0);
+                ask = snap["latestQuote"].value("ap", 0.0);
+            }
+            if (bid <= 0.0 || ask <= 0.0 || ask < bid) return result;
+
+            // Open interest: try both field name variants, then use |delta|*10000
+            // as a proxy when the snapshot omits the OI field.
+            int oi = 0;
+            if (snap.contains("openInterest") && !snap["openInterest"].is_null())
+                oi = snap["openInterest"].get<int>();
+            else if (snap.contains("open_interest") && !snap["open_interest"].is_null())
+                oi = snap["open_interest"].get<int>();
+            else if (snap.contains("greeks") && snap["greeks"].contains("delta") &&
+                     !snap["greeks"]["delta"].is_null())
+                oi = static_cast<int>(std::abs(snap["greeks"]["delta"].get<double>()) * 10000.0);
+
+            double mid        = (bid + ask) / 2.0;
+            double spread_pct = (mid > 0.0) ? (ask - bid) / mid : 1.0;
+
+            result.valid         = true;
+            result.bid           = bid;
+            result.ask           = ask;
+            result.mid           = mid;
+            result.spread_pct    = spread_pct;
+            result.open_interest = oi;
+            result.liquid        = (spread_pct < 0.15 && oi > 50);
+        } catch (...) {}
+
+        return result;
     }
 
     // ── Signal assembly ───────────────────────────────────────────────────────
@@ -1146,8 +1429,9 @@ private:
         primary.risk_free_rate = rfr;
         primary.volatility     = iv_sigma;
 
-        bool is_call = (strategy == "LONG_CALL" || strategy == "CC" ||
-                        strategy == "BULL_CALL_SPREAD" || strategy == "STRADDLE");
+        bool is_call = (strategy == "LONG_CALL" || strategy == "LEAP_CALL" ||
+                        strategy == "CC" || strategy == "BULL_CALL_SPREAD" ||
+                        strategy == "STRADDLE");
         primary.type   = is_call ? OptionType::Call : OptionType::Put;
         sig.option_type = primary.type;
 
@@ -1157,11 +1441,13 @@ private:
         double contracts  = std::max(1.0, std::floor(max_risk / (g1.price * 100.0)));
 
         // Per-contract P&L geometry
-        if (strategy == "LONG_CALL" || strategy == "LONG_PUT") {
+        if (strategy == "LONG_CALL" || strategy == "LONG_PUT" ||
+            strategy == "LEAP_CALL" || strategy == "LEAP_PUT") {
             sig.entry_price = g1.price;
             sig.max_risk    = g1.price * 100.0 * contracts;
             sig.max_reward  = 999999.0; // theoretically unlimited — sentinel
-            sig.breakeven   = (strategy == "LONG_CALL")
+            bool is_call_side = (strategy == "LONG_CALL" || strategy == "LEAP_CALL");
+            sig.breakeven   = is_call_side
                               ? cp.strike + g1.price
                               : cp.strike - g1.price;
             sig.greeks      = g1;
@@ -1245,9 +1531,17 @@ private:
                                       const UnderlyingData& d,
                                       double iv_rank, double iv_level, double hrv30)
     {
+        bool is_leap = (strategy == "LEAP_CALL" || strategy == "LEAP_PUT");
         std::string r = strategy + " on " +
                         (d.price > d.sma20 ? "bullish" : "bearish") + " bias. ";
-        r += "RSI=" + fmt(d.rsi14) + ", ATR=" + fmt(d.atr14) + ". ";
+        if (is_leap) {
+            double sma_atrs = (d.atr14 > 0) ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
+            r += "Breakout setup: price " + fmt(sma_atrs, 1) +
+                 "x ATR from SMA20 with RSI=" + fmt(d.rsi14, 1) +
+                 " in momentum zone. 180-day expiry gives time to develop. ";
+        } else {
+            r += "RSI=" + fmt(d.rsi14) + ", ATR=" + fmt(d.atr14) + ". ";
+        }
         r += "IV=" + fmt(iv_level * 100.0, 1) + "% (rank " + fmt(iv_rank, 0) +
              "%) vs HRV=" + fmt(hrv30 * 100.0, 1) + "% — ";
         bool rich  = (hrv30 > 0.01) && (iv_level > hrv30 * 1.20);
@@ -1270,14 +1564,16 @@ private:
 
         std::string strategy_label = s.strategy;
         // Human-readable strategy names
-        if (s.strategy == "LONG_CALL")          strategy_label = "Long Call";
-        else if (s.strategy == "LONG_PUT")       strategy_label = "Long Put";
-        else if (s.strategy == "CSP")            strategy_label = "Cash-Secured Put";
-        else if (s.strategy == "CC")             strategy_label = "Covered Call";
-        else if (s.strategy == "BULL_CALL_SPREAD") strategy_label = "Bull Call Spread";
-        else if (s.strategy == "BEAR_PUT_SPREAD")  strategy_label = "Bear Put Spread";
-        else if (s.strategy == "STRADDLE")       strategy_label = "Long Straddle";
-        else if (s.strategy == "STRANGLE")       strategy_label = "Long Strangle";
+        if (s.strategy == "LONG_CALL")             strategy_label = "Long Call";
+        else if (s.strategy == "LONG_PUT")          strategy_label = "Long Put";
+        else if (s.strategy == "LEAP_CALL")         strategy_label = "LEAP Call (180d+)";
+        else if (s.strategy == "LEAP_PUT")          strategy_label = "LEAP Put (180d+)";
+        else if (s.strategy == "CSP")               strategy_label = "Cash-Secured Put";
+        else if (s.strategy == "CC")                strategy_label = "Covered Call";
+        else if (s.strategy == "BULL_CALL_SPREAD")  strategy_label = "Bull Call Spread";
+        else if (s.strategy == "BEAR_PUT_SPREAD")   strategy_label = "Bear Put Spread";
+        else if (s.strategy == "STRADDLE")          strategy_label = "Long Straddle";
+        else if (s.strategy == "STRANGLE")          strategy_label = "Long Strangle";
 
         bool unlimited_reward = (s.max_reward > 999990.0);
         std::string reward_str = unlimited_reward ? "Unlimited" : "$" + fmt(s.max_reward, 0);
@@ -1398,8 +1694,11 @@ private:
         double iv_sigma = iv_data.iv_level;
         double rfr      = 0.05;
 
+        double sma_atrs  = (d.atr14 > 0) ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
+        bool   above_50  = (d.price > d.sma50);
         DirectionalBias bias     = computeBias(d);
-        std::string     strategy = selectStrategy(bias, iv_rank, iv_sigma, d.hrv30, tier);
+        std::string     strategy = selectStrategy(bias, iv_rank, iv_sigma, d.hrv30, tier,
+                                                  sma_atrs, d.rsi14, above_50);
 
         double regime_clearance = regimeConfidence(regime.current_regime, strategy);
         if (regime_clearance < 1e-6) {
@@ -1428,15 +1727,56 @@ private:
             }
         }
 
-        ContractParams cp = buildContractParams(strategy, d.price, d.atr14, rfr, iv_sigma);
+        ContractParams cp = buildContractParams(strategy, d.price, d.atr14, rfr, iv_sigma, d.hrv30);
         if (cp.strike <= 0.0) {
             log("WARN", "[OPTIONS_SCAN] Could not determine valid strike for " + ticker);
             return std::nullopt;
         }
 
+        // Premium affordability gate: skip before any network call if a single
+        // contract would consume more than 8% of the risk budget. Uses a rough
+        // ATM BS estimate (exact premium computed later in assembleSignal).
+        {
+            double prem_estimate = cp.strike * iv_sigma * std::sqrt(cp.expiry) * 0.4;
+            double prem_cost     = prem_estimate * 100.0; // one contract
+            double budget        = computeMaxRisk(effective_capital, tier);
+            if (prem_cost > budget * 0.08) {
+                log("INFO", "[OPTIONS_SCAN][PREM_GATE] " + ticker +
+                    " skipped — est. premium $" + fmt(prem_cost, 0) +
+                    " > 8% of budget ($" + fmt(budget * 0.08, 0) + ").");
+                return std::nullopt;
+            }
+        }
+
+        // Contract liquidity filter — verify the actual options chain before
+        // committing to this signal. Fails open when Alpaca's data is unavailable.
+        {
+            bool is_call_strat = (strategy == "LONG_CALL" || strategy == "LEAP_CALL" ||
+                                  strategy == "CC" || strategy == "BULL_CALL_SPREAD" ||
+                                  strategy == "STRADDLE" || strategy == "STRANGLE");
+            std::string opt_type_str = is_call_strat ? "call" : "put";
+            ContractLiquidity liq = checkContractLiquidity(ticker, cp.expiry_date,
+                                                            cp.strike, opt_type_str);
+            if (liq.valid && !liq.liquid) {
+                log("INFO", "[OPTIONS_SCAN][LIQ_FILTER] " + ticker +
+                    " SKIP — spread=" + fmt(liq.spread_pct * 100.0, 1) +
+                    "% OI=" + std::to_string(liq.open_interest) +
+                    " (need spread<15% and OI>50).");
+                return std::nullopt;
+            }
+        }
+
+        // WS1 — Contradiction Vector check. Query the data engine for this
+        // ticker's latest sentiment-vs-skew verdict immediately before finalizing
+        // the Kelly allocation. CONTRADICT_* verdict → halve the risk budget.
+        // Strict timeout + fail-open so a dead intelligence feed never blocks
+        // execution (per RULE-008).
+        double ws1_mult      = fetchWS1KellyMultiplier(ticker);
+        double kelly_capital = effective_capital * ws1_mult;
+
         OptionsSignal sig = assembleSignal(ticker, d, strategy, cp,
                                            iv_rank, iv_sigma, rfr, regime_clearance,
-                                           tier, fc_mode, effective_capital, d.hrv30);
+                                           tier, fc_mode, kelly_capital, d.hrv30);
 
         std::string alert = formatAlert(sig, vix, regime, vts);
         return scoreSignal(sig, alert, d);
@@ -1444,7 +1784,7 @@ private:
 
     // ── Live order execution via OptionsOrderRouter ───────────────────────────
 
-    void executeSignal(const OptionsSignal& sig) const {
+    void executeSignal(const OptionsSignal& sig) {
         nox::options_router::OptionsOrderRouter router(alpacaUrl_, apiKey_, apiSec_);
 
         // Covered calls require 100 shares per contract as collateral.
@@ -1479,6 +1819,43 @@ private:
                 "• *Expiry:* " + sig.expiry_date + "\n"
                 "• *Order ID:* `" + result.order_id + "`"
             );
+
+            // Gap 1 fix: record fill in PositionManager so the 30-min exit-rule
+            // monitor has a row to act on. Without this, stop-loss / 50% profit /
+            // 21 DTE rules can never fire for options positions.
+            if (positionManager_) {
+                auto now_t = std::chrono::system_clock::to_time_t(
+                                 std::chrono::system_clock::now());
+                std::tm tm_buf{};
+                std::ostringstream today_oss;
+                today_oss << std::put_time(gmtime_r(&now_t, &tm_buf), "%Y-%m-%d");
+
+                std::string opt_type = (sig.option_type == nox::options::OptionType::Call)
+                                       ? "call" : "put";
+                bool is_short_premium = (sig.strategy == "CSP" || sig.strategy == "CC");
+                std::string profile_type = is_short_premium ? "short_premium" : "long";
+
+                // Use the actual filled qty, not the requested qty.
+                // A partial fill means fewer contracts are really held.
+                int qty_to_record = (result.filled_qty > 0) ? result.filled_qty : profile_.qty_contracts;
+                if (result.filled_qty > 0 && result.filled_qty < profile_.qty_contracts) {
+                    log("WARN", "[OPTIONS_EXEC] Partial fill: " + std::to_string(result.filled_qty)
+                        + " of " + std::to_string(profile_.qty_contracts) + " contracts filled for "
+                        + sig.underlying + " — recording actual fill only.");
+                    sendTelegram("⚠️ *Partial Fill*: " + sig.underlying + " " + sig.strategy
+                        + " — " + std::to_string(result.filled_qty) + "/"
+                        + std::to_string(profile_.qty_contracts) + " contracts filled.");
+                }
+                positionManager_->add_position(
+                    sig.underlying, opt_type, sig.strike,
+                    qty_to_record, sig.entry_price,
+                    today_oss.str(), profile_type, sig.expiry_date
+                );
+                log("INFO", "[OPTIONS_EXEC][POS_MANAGER] Recorded: " + sig.underlying +
+                    " " + opt_type + " $" + fmt(sig.strike, 0) +
+                    " exp=" + sig.expiry_date + " profile=" + profile_type +
+                    " qty=" + std::to_string(qty_to_record));
+            }
         } else {
             log("WARN", "[OPTIONS_EXEC] Order failed — " + result.message);
             sendTelegram(
