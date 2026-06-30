@@ -875,21 +875,10 @@ def run_market_scanner() -> None:
         except Exception as e:
             logger.warning(f"[SCANNER] {ticker}: {e}")
 
-    if triggered:
-        msg = (
-            f"📡 *Whole-Market Scanner* — {len(triggered)} signal(s) from "
-            f"{len(top_tickers)} candidates\n"
-            f"_(universe: {len(universe)} tickers · VIX={vix:.1f})_\n\n" +
-            "\n".join(f"• {t}" for t in triggered[:20])  # cap Telegram msg length
-        )
-        if len(triggered) > 20:
-            msg += f"\n_...and {len(triggered) - 20} more_"
-        bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
-    else:
-        logger.info(
-            f"Scanner cycle complete — 0 signals from {len(top_tickers)} candidates "
-            f"(VIX={vix:.1f})."
-        )
+    logger.info(
+        f"Scanner cycle complete — {len(triggered)} signal(s) from "
+        f"{len(top_tickers)} candidates (VIX={vix:.1f}). Use /details to review."
+    )
 
 
 # --- 3. THE SCOUT PROTOCOL (DAILY REPORT) ---
@@ -1728,6 +1717,55 @@ def send_signals(message):
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] /signals command failed: {e}", flush=True)
         bot.reply_to(message, f"⚠️ Failed to fetch signals: {str(e)}")
+
+
+@bot.message_handler(commands=['details'])
+def send_details(message):
+    """
+    /details [n] — Full breakdown of the last N signals received by the execution engine.
+    Shows ticker, action, price, RSI, VIX, and timestamp. Defaults to 5, capped at 20.
+    """
+    try:
+        parts = message.text.strip().split()
+        try:
+            requested = int(parts[1]) if len(parts) > 1 else 5
+            count = max(1, min(requested, 20))
+        except (ValueError, IndexError):
+            count = 5
+
+        resp = requests.get("http://execution-engine:8080/recent-signals", timeout=HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            bot.reply_to(message, f"⚠️ Engine returned HTTP {resp.status_code}.")
+            return
+
+        signals = resp.json()
+        if not signals:
+            bot.reply_to(message, "📭 No signals on record yet.")
+            return
+
+        signals = signals[-count:]
+        lines = []
+        for s in reversed(signals):
+            ts     = s.get('received_at', '?')[:16].replace('T', ' ')
+            ticker = s.get('ticker', '?')
+            action = s.get('action', '?')
+            price  = s.get('price', 0.0)
+            rsi    = s.get('rsi', 0.0)
+            vix    = s.get('vix', 0.0)
+            icon   = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
+            lines.append(
+                f"{icon} *{ticker}* {action}  `{ts}`\n"
+                f"   Price ${price:.2f} · RSI {rsi:.1f} · VIX {vix:.1f}"
+            )
+
+        bot.reply_to(
+            message,
+            f"📋 *Last {len(signals)} signal(s):*\n\n" + "\n\n".join(lines),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"[ERROR] [HEARTBEAT] /details command failed: {e}", flush=True)
+        bot.reply_to(message, f"⚠️ Failed to fetch details: {str(e)}")
 
 
 @bot.message_handler(func=lambda message: True)
