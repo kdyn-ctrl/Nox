@@ -137,6 +137,8 @@ services:
       # Shared watchlist — must match america-data-engine above.
       - NOX_WATCHLIST_US=${NOX_WATCHLIST_US:-AAPL,TSLA,NVDA,MSFT}
       - NOX_WATCHLIST_CN=${NOX_WATCHLIST_CN:-BABA,JD,PDD,BIDU,NIO}
+      - NOX_DAILY_REPORT_TICKERS=${NOX_DAILY_REPORT_TICKERS:-AAPL,TSLA,NVDA,MSFT,BABA,JD,PDD,BIDU}
+      - MAX_DAILY_REPORT_SEC_TICKERS=${MAX_DAILY_REPORT_SEC_TICKERS:-8}
     volumes:
       - ./data:/app/data
       - ./reports:/app/reports

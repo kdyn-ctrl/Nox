@@ -347,6 +347,10 @@ ANTHROPIC_API_KEY               # Claude API key (REQUIRED)
 ALPACA_API_KEY                  # Alpaca API key (REQUIRED)
 ALPACA_SECRET_KEY               # Alpaca secret key (REQUIRED)
 WEBHOOK_SECRET_TOKEN            # Shared webhook secret (REQUIRED)
+
+# Optional heartbeat configuration
+# NOX_DAILY_REPORT_TICKERS       # Comma-separated tickers for SEC context in the daily report
+# MAX_DAILY_REPORT_SEC_TICKERS   # Maximum number of SEC tickers included in the daily report (default 8)
 ```
 
 ## When to Update This Guide
