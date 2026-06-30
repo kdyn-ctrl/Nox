@@ -64,6 +64,12 @@ DOMESTIC_WATCHLIST = [t.strip() for t in _us_raw.split(",") if t.strip()]
 CHINESE_ADRS       = [t.strip() for t in _cn_raw.split(",") if t.strip()]
 WATCHLIST          = DOMESTIC_WATCHLIST + CHINESE_ADRS
 
+# Daily report SEC context is pulled from this configurable ticker list.
+# If NOX_DAILY_REPORT_TICKERS is unset, default to the public watchlist.
+DAILY_REPORT_TICKERS_RAW = os.getenv("NOX_DAILY_REPORT_TICKERS", ",".join(WATCHLIST))
+DAILY_REPORT_TICKERS = [t.strip() for t in DAILY_REPORT_TICKERS_RAW.split(",") if t.strip()] or WATCHLIST
+MAX_DAILY_REPORT_SEC_TICKERS = int(os.getenv("MAX_DAILY_REPORT_SEC_TICKERS", "8"))
+
 # Broad market scanner watchlist — covers all major S&P 500 sectors.
 # TradingView free tier limits you to ~5 alerts; this scanner covers 35+ tickers
 # by fetching bars from Alpaca and computing signals internally.
@@ -959,10 +965,20 @@ def _split_scout_sections(text: str) -> list[str]:
     return final
 
 
+def _send_telegram_section(section: str) -> None:
+    """Send a Telegram section safely so one failed message does not abort the report."""
+    try:
+        bot.send_message(CHAT_ID, section, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"[ERROR] [HEARTBEAT] Failed to send Telegram section: {e}")
+        print(f"[ERROR] [HEARTBEAT] Failed to send Telegram section: {e}", flush=True)
+
+
 def run_scout_protocol():
     try:
         news_context    = get_us_news_context()
-        sec_context     = "\n\n".join([get_latest_sec_filing(t) for t in ["NVDA", "BABA"]])
+        report_tickers  = DAILY_REPORT_TICKERS[:MAX_DAILY_REPORT_SEC_TICKERS]
+        sec_context     = "\n\n".join([get_latest_sec_filing(t) for t in report_tickers])
         chinese_context = get_chinese_market_context()
 
         response = claude.messages.create(
@@ -980,23 +996,27 @@ def run_scout_protocol():
         et_tz = ZoneInfo('America/New_York')
         timestamp = datetime.now(et_tz).strftime('%Y-%m-%d %H:%M ET')
 
-        # Header sent as its own message so sections start clean
+        print(f"[INFO] [HEARTBEAT] Daily audit raw report length: {len(analysis_text or '')} chars", flush=True)
+
         header = (
             f"*NOX DAILY AUDIT*\n"
             f"────────────────────────\n"
             f"{timestamp}"
         )
-        bot.send_message(CHAT_ID, header, parse_mode='Markdown')
+        _send_telegram_section(header)
 
-        # Send each section as its own Telegram message — no mid-section breaks
-        for section in _split_scout_sections(analysis_text):
-            bot.send_message(CHAT_ID, section, parse_mode='Markdown')
+        sections = _split_scout_sections(analysis_text or "No report content was produced.")
+        if not sections:
+            sections = list(smart_split(analysis_text or "No report content was produced.", chars_per_string=3800))
+
+        for section in sections:
+            _send_telegram_section(section)
 
         with db_lock:
             with sqlite3.connect(DB_PATH) as conn:
                 c = conn.cursor()
                 c.execute("INSERT INTO daily_audits (tickers_scanned, claude_analysis) VALUES (?, ?)",
-                          ("NVDA, BABA", analysis_text))
+                          (", ".join(report_tickers), analysis_text))
                 conn.commit()
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] Scout protocol failed: {e}", flush=True)
