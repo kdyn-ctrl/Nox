@@ -567,7 +567,6 @@ private:
                 sig.vix, sig.spy_price, sig.spy_200_sma
             );
             Logger::log("INFO", "[REGIME] " + regime.log_message);
-            TelegramNotifier::sendMessage("📊 *Regime Check:* " + regime.log_message);
             if (regime.capital_multiplier == 0.0) {
                 Logger::log("WARN", "[REGIME] RISK-OFF — new entries halted for " + sig.ticker);
                 TelegramNotifier::sendMessage(
@@ -924,9 +923,12 @@ public:
         require_env("TELEGRAM_BOT_TOKEN");
         require_env("TELEGRAM_CHAT_ID");
 
-        // CN-RULE-001: Board-lot size (default 100 for all A-share boards).
-        // Override with CN_BOARD_LOT_SIZE if a non-standard lot size is needed.
-        cnBoardLotSize = 100;
+        // CN-RULE-001: Board-lot size. Default is 1 (standard for all US-listed equities
+        // and US-listed Chinese ADRs on Alpaca). Set CN_BOARD_LOT_SIZE=100 only when
+        // routing orders to an actual Chinese A-share exchange (where 1手 = 100 shares).
+        // The old default of 100 silently killed every US stock order because
+        // 1% of $100k / typical US price < 100 shares → lot_qty = 0 → abort.
+        cnBoardLotSize = 1;
         const char* lot_env = std::getenv("CN_BOARD_LOT_SIZE");
         if (lot_env && std::string(lot_env) != "") {
             try {
@@ -1303,8 +1305,6 @@ public:
                         return;
                     }
 
-                    TelegramNotifier::sendMessage("🚀 Signal Parsed: " + signal.action + " " + signal.ticker);
-                    
                     process(signal);
                     success_count++;
                 };
