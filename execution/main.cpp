@@ -786,18 +786,11 @@ private:
                             " on " + entry_date + ". Sell gate active until T+1.");
                     }
 
-                    TelegramNotifier::sendMessage(
-                        "🟢 *BUY ORDER EXECUTED*\n"
-                        "────────────────────────\n"
-                        "• *Ticker:* " + sig.ticker + "\n"
-                        "• *Quantity:* " + std::to_string(qty) + " Shares (Dynamic Kelly)\n"
-                        "• *Order ID:* `" + order_id + "`"
-                    );
-
                     // --- Place Trailing Stop Order ---
+                    std::string stop_line;
                     if (sig.atr > 0 && stop_multiplier > 0) {
                         double trail_offset = sig.atr * stop_multiplier;
-                        
+
                         std::stringstream stream;
                         stream << std::fixed << std::setprecision(2) << trail_offset;
                         std::string trail_offset_str = stream.str();
@@ -810,36 +803,37 @@ private:
                             {"time_in_force", "gtc"},
                             {"trail_price", trail_offset_str}
                         };
-                        
-                        std::cout << "[EXECUTION] Placing trailing stop for " << sig.ticker 
+
+                        std::cout << "[EXECUTION] Placing trailing stop for " << sig.ticker
                                   << " with trail offset $" << trail_offset_str << std::endl;
                         auto sl_res = alpaca_cli.Post("/v2/orders", headers, sl_payload.dump(), "application/json");
 
                         if (sl_res && sl_res->status == 200) {
                             json sl_data = json::parse(sl_res->body);
                             std::cout << " [TRAILING STOP PLACED] Order ID: " << sl_data.value("id", "N/A") << std::endl;
-                            TelegramNotifier::sendMessage(
-                                "🛡️ *TRAILING STOP SET*\n"
-                                "────────────────────────\n"
-                                "• *Ticker:* " + sig.ticker + "\n"
-                                "• *Trail Offset:* $" + trail_offset_str
-                            );
+                            stop_line = "\n🛡️ *Stop:* trail $" + trail_offset_str +
+                                        " | ID: `" + sl_data.value("id", "N/A") + "`";
                         } else {
                             std::string sl_status = sl_res ? std::to_string(sl_res->status) : "TIMEOUT";
                             std::string sl_details = sl_res ? sl_res->body : "No response.";
-                            std::cerr << "⚠️ [STOP-LOSS FAILED] Status: " << sl_status 
+                            std::cerr << "⚠️ [STOP-LOSS FAILED] Status: " << sl_status
                                       << ", Details: " << sl_details << std::endl;
-                            TelegramNotifier::sendMessage(
-                                "🚨 *STOP-LOSS FAILED*\n"
-                                "────────────────────────\n"
-                                "• *Ticker:* " + sig.ticker + "\n"
-                                "• *Status Code:* " + sl_status + "\n"
-                                "• *Details:* `" + sl_details + "`"
-                            );
+                            stop_line = "\n⚠️ *Stop failed* HTTP " + sl_status + ": `" + sl_details + "`";
                         }
                     } else {
                         Logger::log("WARN", "[EXECUTION] ATR or multiplier invalid, skipping trailing stop.");
+                        stop_line = "\n⚠️ _No trailing stop — ATR/multiplier invalid_";
                     }
+
+                    // Single combined confirmation message (buy + stop result)
+                    TelegramNotifier::sendMessage(
+                        "🟢 *BUY ORDER EXECUTED*\n"
+                        "────────────────────────\n"
+                        "• *Ticker:* " + sig.ticker + "\n"
+                        "• *Qty:* " + std::to_string(qty) + " shares\n"
+                        "• *Order ID:* `" + order_id + "`" +
+                        stop_line
+                    );
                 } else {
                     std::string status_code = res ? std::to_string(res->status) : "TIMEOUT";
                     std::string details     = res ? res->body : "No response received.";

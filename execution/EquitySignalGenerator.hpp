@@ -360,20 +360,16 @@ private:
 
             if (res && res->status == 200) {
                 log("INFO", "[EQUITY_SCAN] Signal accepted — " + s.ticker);
-                sendTelegram(
-                    "📡 *EQUITY SIGNAL — " + s.ticker + "*\n"
-                    "────────────────────────\n"
-                    "• *Action:* BUY\n"
-                    "• *Price:* $" + fmt(s.price) + "\n"
-                    "• *RSI(14):* " + fmt(s.rsi, 1) + "\n"
-                    "• *ATR(14):* $" + fmt(s.atr) + "\n"
-                    "• *SMA20:* $" + fmt(s.sma20) + " | SMA50: $" + fmt(s.sma50) + "\n"
-                    "• *Score:* " + fmt(s.quality_score) + "\n"
-                    "_Technical momentum setup → execution engine._"
-                );
+                // No Telegram here: execution engine sends "BUY ORDER EXECUTED"
+                // (or a gate-block message) which is the actionable confirmation.
             } else {
                 std::string status = res ? std::to_string(res->status) : "TIMEOUT";
                 log("WARN", "[EQUITY_SCAN] Webhook rejected " + s.ticker + " — HTTP " + status);
+                sendTelegram(
+                    "⚠️ *EQUITY SCAN — Webhook Failed*\n"
+                    "• *Ticker:* " + s.ticker + "\n"
+                    "• *HTTP Status:* " + status
+                );
             }
         } catch (const std::exception& e) {
             log("WARN", "[EQUITY_SCAN] Failed to post signal for " + s.ticker +
