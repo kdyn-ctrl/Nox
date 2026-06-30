@@ -2,14 +2,11 @@
 #include "OptionsOrderRouter.hpp"
 #include "httplib.h"
 #include "nlohmann/json.hpp"
+#include "../shared/TelegramNotifier.hpp"
 #include <thread>
 #include <chrono>
 
-// Forward declare TelegramNotifier to avoid including main.cpp
-class TelegramNotifier {
-public:
-    static void sendMessage(std::string message);
-};
+using TelegramNotifier = nox::TelegramNotifier;
 
 
 // Helper to get current date as YYYY-MM-DD

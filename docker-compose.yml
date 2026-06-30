@@ -101,6 +101,12 @@ services:
       - LIQUIDITY_GATE_WINDOW=${LIQUIDITY_GATE_WINDOW:-50}
       - LIQUIDITY_GATE_MIN_SAMPLES=${LIQUIDITY_GATE_MIN_SAMPLES:-10}
       - LIQUIDITY_GATE_BYPASS=${LIQUIDITY_GATE_BYPASS:-false}
+      # Equity signal scanner — independent momentum scanner to validate pipeline.
+      - EQUITY_SCAN_ENABLED=${EQUITY_SCAN_ENABLED:-true}
+      - EQUITY_SCAN_WATCHLIST=${EQUITY_SCAN_WATCHLIST:-AAPL,MSFT,NVDA,TSLA,AMZN,META,GOOGL,AMD}
+      - EQUITY_SCAN_INTERVAL_MINUTES=${EQUITY_SCAN_INTERVAL_MINUTES:-30}
+      - EQUITY_SCAN_MAX_SIGNALS=${EQUITY_SCAN_MAX_SIGNALS:-2}
+      - EQUITY_SCAN_BYPASS_HOURS=${EQUITY_SCAN_BYPASS_HOURS:-false}
       # Persistence — must match the volume mount below so data survives restarts.
       - MEMORY_BANK_PATH=/app/data/memory_bank.db
       - CN_POSITIONS_PATH=/app/data/china_positions.json
@@ -142,7 +148,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./reports:/app/reports
-    command: sh -c "chown -R root:root /app/data && mkdir -p /app/reports && python -u monitor.py"
+    command: sh -c "mkdir -p /app/reports && python -u monitor.py"
     networks:
       - nox_net
 
