@@ -287,9 +287,6 @@ public:
         for (const auto& sc : candidates) {
             if (dispatched >= limit) break;
             sendTelegram(sc.formatted_alert);
-            // WS5 — microstructure gate. The advisory alert always goes out, but
-            // AUTO-EXECUTION is aborted when the live spread signals a liquidity
-            // vacuum. A great setup filled into a vacuum is a losing trade.
             if (profile_.auto_execute) {
                 double rel_spread = fetchUnderlyingSpread(sc.signal.underlying);
                 auto gate = liquidity_gate_.evaluate(sc.signal.underlying, rel_spread);
@@ -1215,8 +1212,11 @@ private:
             " | ATR(14): $" + fmt(s.atr) + "\n"
             "\n🌐 *Macro Regime:* " + regime.log_message + " " + regime_emoji +
             " (VIX " + fmt(vix, 1) + ")\n"
-            "🌡️ *Regime Gate:* " + std::to_string(conf_pct) + "% "
-                "(RISK_ON=100 · TRANSITION=65 · RISK_OFF=0 — not signal quality)\n"
+            "🌡️ *Regime Gate:* " + (
+                s.confidence >= 1.0 ? "✅ ON" :
+                s.confidence <= 0.0 ? "🔴 OFF" :
+                "⚠️ " + std::to_string(static_cast<int>(std::round(s.confidence * 100.0))) + "% (TRANSITION)"
+            ) + "\n"
             "\n📋 _" + s.rationale + "_" +
             fc_footer + "\n"
             "⚠️ _Advisory only — manual execution required._";
