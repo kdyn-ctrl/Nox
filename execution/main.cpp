@@ -391,12 +391,10 @@ private:
 
         // --- SELL ROUTING: Close open position (enhanced) ---
         if (sig.action == "SELL") {
-            // CN-RULE-002: T+1 Settlement Gate.
-            // Chinese A-share rules prohibit same-day round trips: a position
-            // bought on day T cannot be sold until T+1 or later.
-            // If the sell signal arrives on the same calendar date as the
-            // recorded entry, discard the signal entirely and log CRITICAL.
-            {
+            // CN-RULE-002: T+1 Settlement Gate — only applies to Chinese A-shares.
+            // US equities (cnBoardLotSize == 1) are exempt; only enforce when
+            // routing to a Chinese exchange (cnBoardLotSize == 100).
+            if (cnBoardLotSize > 1) {
                 std::lock_guard<std::mutex> lock(china_positions_mutex_);
                 auto it = china_positions_.find(sig.ticker);
                 if (it != china_positions_.end()) {
@@ -768,9 +766,8 @@ private:
                     std::cout << " [BUY ORDER EXECUTED] Alpaca Order ID: " << order_id << std::endl;
 
                     // CN-RULE-002: Record entry date for T+1 enforcement.
-                    // Use the signal's trade_date if provided (backtester path);
-                    // fall back to today's system date for live execution.
-                    {
+                    // Only for Chinese A-shares (cnBoardLotSize > 1); US equities are exempt.
+                    if (cnBoardLotSize > 1) {
                         std::string entry_date = sig.trade_date.empty()
                             ? get_today_date_string()
                             : sig.trade_date;
