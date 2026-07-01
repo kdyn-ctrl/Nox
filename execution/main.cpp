@@ -238,6 +238,19 @@ private:
     std::map<std::string, ChinaPositionRecord> china_positions_;
     std::mutex china_positions_mutex_;
 
+    // ── Trailing Stop Monitoring ─────────────────────────────────────────────
+    // Tracks open equity positions so we can detect when trailing stops execute.
+    // When a position disappears from Alpaca, we know the stop was hit.
+    struct OpenEquityPosition {
+        std::string ticker;
+        int quantity;
+        double entry_price;
+        std::chrono::system_clock::time_point entry_time;
+    };
+
+    std::map<std::string, OpenEquityPosition> equity_positions_;
+    std::mutex equity_positions_mutex_;
+
     // Returns today's date as "YYYY-MM-DD" in the local system timezone.
     static std::string get_today_date_string() {
         auto now    = std::chrono::system_clock::now();
@@ -300,6 +313,119 @@ private:
             Logger::log("WARN", "[CN-RULE-002] Failed to parse positions file: " +
                         std::string(e.what()) + ". Starting with empty T+1 map.");
         }
+    }
+
+    // Fetch all open positions from Alpaca
+    std::vector<std::string> fetch_open_positions() {
+        std::vector<std::string> tickers;
+        try {
+            httplib::Client alpaca_cli(alpacaBaseUrl);
+            alpaca_cli.set_connection_timeout(std::chrono::seconds(5));
+            alpaca_cli.set_read_timeout(std::chrono::seconds(10));
+
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID",     apiKey},
+                {"APCA-API-SECRET-KEY", apiSec}
+            };
+
+            auto res = alpaca_cli.Get("/v2/positions", headers);
+            if (!res || res->status != 200) {
+                Logger::log("WARN", "[TRAILING_STOP_MONITOR] Failed to fetch positions (HTTP " +
+                            std::to_string(res ? res->status : 0) + ")");
+                return tickers;
+            }
+
+            json positions = json::parse(res->body);
+            if (positions.is_array()) {
+                for (const auto& pos : positions) {
+                    std::string ticker = pos.value("symbol", "");
+                    if (!ticker.empty()) {
+                        tickers.push_back(ticker);
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            Logger::log("WARN", "[TRAILING_STOP_MONITOR] Exception fetching positions: " +
+                        std::string(e.what()));
+        }
+        return tickers;
+    }
+
+    // Monitor equity positions and detect trailing stop executions
+    void monitor_trailing_stops() {
+        Logger::log("INFO", "[TRAILING_STOP_MONITOR] Thread started. Checking for trailing stop fills every 5 minutes.");
+
+        while (running_.load()) {
+            // Sleep with early wakeup on shutdown
+            {
+                std::unique_lock<std::mutex> lk(stop_mutex_);
+                if (stop_cv_.wait_for(lk, std::chrono::minutes(5),
+                                      [this] { return !running_.load(); })) {
+                    break;
+                }
+            }
+
+            if (!running_.load()) break;
+
+            try {
+                std::vector<std::string> current_positions = fetch_open_positions();
+                std::set<std::string> current_tickers(current_positions.begin(), current_positions.end());
+
+                // Check which positions we were tracking have closed
+                std::vector<std::string> closed_tickers;
+                {
+                    std::lock_guard<std::mutex> lock(equity_positions_mutex_);
+                    for (const auto& kv : equity_positions_) {
+                        if (current_tickers.find(kv.first) == current_tickers.end()) {
+                            // Position was tracked but is no longer open — it was closed (likely by trailing stop)
+                            closed_tickers.push_back(kv.first);
+                        }
+                    }
+                }
+
+                // For each closed position, record a synthetic SELL signal
+                for (const auto& ticker : closed_tickers) {
+                    Logger::log("INFO", "[TRAILING_STOP_MONITOR] Position " + ticker +
+                                " detected as closed — likely hit trailing stop.");
+
+                    TradeSignal sell_signal;
+                    sell_signal.ticker = ticker;
+                    sell_signal.action = "SELL";
+                    sell_signal.price = 0.0;  // Price unavailable without additional API call
+                    sell_signal.rsi = 50.0;
+                    sell_signal.vol = 0;
+                    sell_signal.atr = 0.0;
+
+                    // Record this synthetic SELL signal
+                    record_signal(sell_signal);
+
+                    // Log it for visibility
+                    TelegramNotifier::sendMessage(
+                        "🔴 *TRAILING STOP DETECTED*\n"
+                        "────────────────────────\n"
+                        "• *Ticker:* " + ticker + "\n"
+                        "• *Trigger:* Position closed (likely trailing stop hit)\n"
+                        "✅ SELL signal recorded automatically"
+                    );
+
+                    // Remove from tracking
+                    {
+                        std::lock_guard<std::mutex> lock(equity_positions_mutex_);
+                        equity_positions_.erase(ticker);
+                    }
+                }
+
+                if (!closed_tickers.empty()) {
+                    Logger::log("INFO", "[TRAILING_STOP_MONITOR] Detected " +
+                                std::to_string(closed_tickers.size()) + " closed position(s).");
+                }
+
+            } catch (const std::exception& e) {
+                Logger::log("WARN", "[TRAILING_STOP_MONITOR] Exception during monitoring: " +
+                            std::string(e.what()));
+            }
+        }
+        Logger::log("INFO", "[TRAILING_STOP_MONITOR] Thread shutting down.");
     }
 
     // RULE-005: Fetch live equity with exponential-backoff retry (2s -> 4s -> 8s).
@@ -510,6 +636,11 @@ private:
                         std::lock_guard<std::mutex> lock(china_positions_mutex_);
                         china_positions_.erase(sig.ticker);
                         persist_china_positions_locked();
+                    }
+                    // Also remove from equity position tracking (trailing stop monitor)
+                    {
+                        std::lock_guard<std::mutex> lock(equity_positions_mutex_);
+                        equity_positions_.erase(sig.ticker);
                     }
                 } else {
                     std::string status_code = res ? std::to_string(res->status) : "TIMEOUT";
@@ -816,6 +947,19 @@ private:
                         Logger::log("WARN", "[EXECUTION] ATR or multiplier invalid, skipping trailing stop.");
                         stop_line = " | ⚠️ no stop";
                     }
+
+                    // Track this position for trailing stop monitoring
+                    {
+                        std::lock_guard<std::mutex> lock(equity_positions_mutex_);
+                        equity_positions_[sig.ticker] = OpenEquityPosition{
+                            sig.ticker,
+                            qty,
+                            sig.price,
+                            std::chrono::system_clock::now()
+                        };
+                    }
+                    Logger::log("INFO", "[TRAILING_STOP_MONITOR] Tracking position: " +
+                                sig.ticker + " x" + std::to_string(qty));
 
                     // Compact confirmation — one line per trade, details via /details
                     TelegramNotifier::sendMessage(
@@ -1397,6 +1541,14 @@ public:
                 Logger::log("INFO", "[EQUITY_SCAN] Thread exiting.");
             });
         }
+        // ────────────────────────────────────────────────────────────────────
+
+        // ── Trailing Stop Monitor Thread ──────────────────────────────────────
+        // Detects when equity positions close (likely due to trailing stops hitting)
+        // and records them as SELL signals automatically.
+        option_threads_.emplace_back([this]() {
+            monitor_trailing_stops();
+        });
         // ────────────────────────────────────────────────────────────────────
 
         // Install SIGTERM/SIGINT handlers now that s_instance_ is set and
