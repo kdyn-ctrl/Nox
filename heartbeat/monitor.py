@@ -1082,6 +1082,16 @@ def run_scout_protocol():
         sec_failed      = [t for t, (_, ok) in zip(report_tickers, sec_results) if not ok]
         chinese_context, china_ok = get_chinese_market_context()
 
+        # Fetch market regime data (VIX, SPY price, SPY 200-SMA)
+        vix = fetch_vix_level()
+        spy_price, spy_200_sma, _ = fetch_spy_regime()
+        market_regime = (
+            f"• *VIX:* {vix:.1f}\n"
+            f"• *SPY:* ${spy_price:.2f}\n"
+            f"• *SPY 200-SMA:* ${spy_200_sma:.2f}\n"
+            f"• *Status:* {'RISK_OFF' if vix >= 25.0 and spy_price > 0 and spy_price < spy_200_sma else 'RISK_ON'}"
+        )
+
         # Policy: never generate the daily audit from incomplete context — a
         # confident-sounding report built on partial data is worse than no
         # report, since there's no way for the reader to tell "nothing
@@ -1107,9 +1117,10 @@ def run_scout_protocol():
 
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=7000,
+            max_tokens=9000,
             system=SCOUT_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": (
+                f"Market Regime:\n{market_regime}\n\n"
                 f"US Headlines:\n{news_context}\n\n"
                 f"SEC Filings:\n{sec_context}\n\n"
                 f"Chinese Market Intelligence:\n{chinese_context}"
@@ -1636,11 +1647,11 @@ def trigger_report(message):
     """
     /report — Manually triggers the full daily scout protocol on demand.
     Sends an acknowledgement immediately so the user knows it fired,
-    then runs the full pipeline (news + SEC + Chinese market context + Claude)
+    then runs the full pipeline (news + SEC + Chinese market context + market regime + Claude)
     in a background thread so the bot remains responsive during generation.
     """
     try:
-        bot.reply_to(message, "⚙️ *Nox Scout firing now...* Assembling data layers. This takes ~30 seconds.", parse_mode='Markdown')
+        bot.reply_to(message, "⚙️ *Nox Scout firing now...* Assembling data layers (market regime + news + SEC + China intel). Report coming in 40-60 seconds.", parse_mode='Markdown')
         threading.Thread(target=run_scout_protocol, daemon=True).start()
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] /report command failed: {e}", flush=True)
