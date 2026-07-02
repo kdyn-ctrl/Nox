@@ -42,6 +42,9 @@ logs/
 
 # Runtime data
 data/memory_bank.db
+data/memory_bank.db-shm
+data/memory_bank.db-wal
+data/equity_positions.json
 execution/nox_backtest
 execution/third_party/
 reports/
