@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY scrapers.py main.py retry_utils.py ./
+COPY scrapers.py main.py retry_utils.py edgar_cn_lag.py ./
 
 # Port 8000 is the internal-only china-data-engine port. It is NOT exposed to the
 # host — only reachable by other containers on the nox_net bridge network.

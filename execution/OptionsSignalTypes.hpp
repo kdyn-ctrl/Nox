@@ -15,7 +15,8 @@ struct OptionsSignal {
     std::string underlying;
     std::string strategy;       // LONG_CALL / LONG_PUT / CSP / CC /
                                 // BULL_CALL_SPREAD / BEAR_PUT_SPREAD /
-                                // STRADDLE / STRANGLE
+                                // STRADDLE / STRANGLE /
+                                // LEAP_CALL / LEAP_PUT
     std::string expiry_date;    // "YYYY-MM-DD"
     double strike       = 0.0; // primary leg
     double strike2      = 0.0; // second leg (spreads/straddles); 0 = single-leg
@@ -52,9 +53,16 @@ struct RiskProfile {
     double delta_income       = 0.25; // target Δ for income/short legs (CSP, CC)
     double delta_spread_wing  = 0.15; // target Δ for the short wing of spreads
 
+    double delta_leap         = 0.70; // target Δ for LEAP contracts (ITM for intrinsic value)
+
     int    dte_long           = 45;   // DTE for directional longs
     int    dte_income         = 30;   // DTE for income strategies
     int    dte_spread         = 45;   // DTE for spreads/multi-leg
+    int    dte_leap           = 180;  // DTE for LEAP contracts (6-month default)
+
+    // ── Breakout profile ────────────────────────────────────────────────────
+    bool   is_breakout_profile   = false; // true → LEAP_CALL/LEAP_PUT on breakout setups
+    double breakout_sma_atrs_min = 2.0;   // min SMA20 distance in ATRs to qualify as breakout
 
     // ── IV thresholds ───────────────────────────────────────────────────────
     double iv_rank_buy_max    = 30.0; // IV rank ceiling to buy premium (cheap vol zone)
@@ -87,9 +95,11 @@ struct RiskProfile {
         p.delta_long            = 0.45;
         p.delta_income          = 0.25;
         p.delta_spread_wing     = 0.15;
+        p.delta_leap            = 0.70;
         p.dte_long              = 45;
         p.dte_income            = 30;
         p.dte_spread            = 45;
+        p.dte_leap              = 180;
         p.iv_rank_buy_max       = 30.0;
         p.iv_rank_sell_min      = 50.0;
         p.risk_pct_starter      = 0.010;
@@ -118,9 +128,11 @@ struct RiskProfile {
         p.delta_long            = 0.60; // ITM-biased — more intrinsic, less theta drag
         p.delta_income          = 0.30; // slightly closer to the money for more premium
         p.delta_spread_wing     = 0.20; // tighter spread = higher max gain ratio
+        p.delta_leap            = 0.70;
         p.dte_long              = 14;   // gamma plays — 2-week expiry
         p.dte_income            = 21;   // enough theta without overexposure
         p.dte_spread            = 21;   // tighter timeline = more decisive outcome
+        p.dte_leap              = 180;
         p.iv_rank_buy_max       = 50.0; // willing to buy even moderately expensive vol
         p.iv_rank_sell_min      = 40.0; // sell premium at a lower threshold
         p.risk_pct_starter      = 0.020; // 2% — still disciplined but meaningfully sized
@@ -130,6 +142,42 @@ struct RiskProfile {
         p.enforce_tier_gates    = false; // personal capital — no tier restrictions
         p.enforce_regime_gate   = false; // you decide — confidence shown but not blocking
         p.watchlist             = {"SPY", "QQQ", "AAPL", "TSLA", "NVDA", "AMZN", "META"};
+        p.scan_interval_minutes = 30;
+        return p;
+    }
+
+    // ── Factory: breakout-hunting LEAP advisory profile ──────────────────────
+    //
+    // Scans a broader universe for strong trend setups (≥2 ATRs from SMA20 +
+    // RSI in momentum zone) and recommends LEAP calls/puts (180-day default).
+    // LEAPs give directional exposure with far less theta decay than short-dated
+    // longs — ideal when you expect a multi-week move but not an immediate spike.
+    // Always advisory (no auto-execute). All strategies available.
+    static RiskProfile breakout() {
+        RiskProfile p;
+        p.name                  = "BREAKOUT";
+        p.delta_long            = 0.60;
+        p.delta_income          = 0.25;
+        p.delta_spread_wing     = 0.15;
+        p.delta_leap            = 0.70;  // ITM LEAP — high intrinsic, low theta drag
+        p.dte_long              = 45;    // fallback for non-LEAP setups
+        p.dte_income            = 30;
+        p.dte_spread            = 45;
+        p.dte_leap              = 180;   // 6-month window to be right
+        p.iv_rank_buy_max       = 45.0;
+        p.iv_rank_sell_min      = 60.0;
+        p.risk_pct_starter      = 0.015;
+        p.risk_pct_standard     = 0.020;
+        p.risk_pct_advanced     = 0.025;
+        p.risk_pct_free         = 0.020;
+        p.enforce_tier_gates    = false;
+        p.enforce_regime_gate   = false;
+        p.is_breakout_profile   = true;
+        p.breakout_sma_atrs_min = 2.0;   // price must be ≥2 ATRs from SMA20
+        p.watchlist             = {
+            "SPY","QQQ","IWM","AAPL","MSFT","NVDA","AMD","TSLA","AMZN","META",
+            "GOOGL","NFLX","COIN","PLTR","MSTR","SHOP","ARKK","SOXX","GLD","XLF"
+        };
         p.scan_interval_minutes = 30;
         return p;
     }

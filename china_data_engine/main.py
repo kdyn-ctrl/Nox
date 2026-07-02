@@ -2,12 +2,13 @@ import os
 import sys
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, HTTPException, Security, status
+from fastapi import FastAPI, HTTPException, Query, Security, status
 from fastapi.security import APIKeyHeader
 
+from edgar_cn_lag import check_ticker_in_cn_media
 from scrapers import (
     fetch_cailian_news,
     fetch_china_pmi,
@@ -216,4 +217,46 @@ def get_china_sentiment() -> Dict[str, Any]:
         "last_updated": _CACHE["last_updated"],
         "count":        len(_CACHE["hot_board"]),
         "hot_board":    _CACHE["hot_board"],
+    }
+
+
+@app.get(
+    "/lag/check",
+    summary="WS7 — Check whether a CN ADR ticker is mentioned in Chinese retail media",
+    tags=["ws7"],
+    dependencies=[Security(verify_token)],
+)
+def lag_check(ticker: str = Query(..., description="US ADR ticker, e.g. BABA")) -> Dict[str, Any]:
+    """
+    Stateless cache check: inspects the current East Money hot board and Cailian
+    news cache to determine whether a US ADR ticker has been picked up by Chinese
+    retail media.
+
+    lag_open=True means neither East Money nor Cailian currently covers the ticker
+    — the information lag window is open. Called by heartbeat immediately after
+    detecting a new 6-K filing for a CN watchlist ticker.
+
+    Returns:
+        ticker, is_on_hot_board, is_in_cailian, lag_open, cache_age_minutes
+    """
+    presence = check_ticker_in_cn_media(
+        ticker,
+        _CACHE["hot_board"],
+        _CACHE["news_cn"],
+    )
+
+    cache_age_minutes: Optional[float] = None
+    if _CACHE["last_updated"]:
+        from datetime import datetime, timezone
+        last = datetime.fromisoformat(_CACHE["last_updated"])
+        now  = datetime.now(tz=timezone.utc)
+        cache_age_minutes = round((now - last).total_seconds() / 60, 1)
+
+    return {
+        "ticker":            ticker.upper(),
+        "is_on_hot_board":   presence["is_on_hot_board"],
+        "is_in_cailian":     presence["is_in_cailian"],
+        "lag_open":          presence["lag_open"],
+        "cache_age_minutes": cache_age_minutes,
+        "last_updated":      _CACHE["last_updated"],
     }

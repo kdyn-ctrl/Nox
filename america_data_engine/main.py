@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 
 from scrapers import (
-    fetch_alpaca_news,
+    fetch_news_with_fallback,
     fetch_earnings_calendar,
 )
 from contradiction_vector import run_contradiction_check
@@ -68,21 +68,63 @@ _CACHE: Dict[str, Any] = {
     "last_earnings_update": None, # ISO-8601 UTC timestamp of last earnings refresh
     "last_insider_update": None,  # ISO-8601 UTC timestamp of last Form 4 scan
     "last_alt_macro_update": None, # ISO-8601 UTC timestamp of last alt-macro scan
+    "news_volume_history": [],  # rolling window of article counts (for spike detection)
+    "volume_spike_detected": False,  # flag if current count is anomalous
 }
+
+
+def _detect_volume_spike(current_count: int, window_size: int = 4) -> "tuple[bool, float, float]":
+    """
+    Detects if current article count is anomalously high.
+    Returns (is_spike, mean, stddev) where is_spike=True if current > mean + 2sigma.
+    Maintains a rolling window of recent counts.
+    """
+    history = _CACHE["news_volume_history"]
+    history.append(current_count)
+    if len(history) > window_size:
+        history.pop(0)
+
+    if len(history) < 2:
+        return False, float(current_count), 0.0
+
+    mean = sum(history[:-1]) / len(history[:-1])  # exclude current
+    if len(history[:-1]) > 1:
+        variance = sum((x - mean) ** 2 for x in history[:-1]) / len(history[:-1])
+        stddev = variance ** 0.5
+    else:
+        stddev = 0.0
+
+    is_spike = current_count > (mean + 2.0 * stddev) if stddev > 0 else False
+    return is_spike, mean, stddev
 
 
 def _refresh_cache() -> None:
     """
     Background worker — runs on startup and then every 15 minutes via APScheduler.
-    Refreshes news only (lightweight); earnings are refreshed separately every 24h.
-    """
-    print("[INFO] [AMERICA-DATA-ENGINE] Starting scheduled news scrape...", flush=True)
+    Refreshes news via the multi-source fallback chain (Alpaca -> NewsAPI ->
+    Polygon -> RSS), applies volume-spike detection, and runs the Contradiction
+    Vector. Earnings are refreshed separately every 24h.
 
-    news_us = fetch_alpaca_news()
+    fetch_news_with_fallback() returns None only if every source failed
+    outright (data gap — keep the previous cache, do not overwrite with
+    nothing) and [] if sources succeeded but legitimately found no articles
+    (a quiet news day — still a valid, if empty, refresh).
+    """
+    print("[INFO] [AMERICA-DATA-ENGINE] Starting scheduled news scrape with fallback logic...", flush=True)
+
+    news_us = fetch_news_with_fallback()
     if news_us is None:
-        print("[WARN] [AMERICA-DATA-ENGINE] Alpaca news fetch failed after retries; keeping previous cache.", flush=True)
+        print("[WARN] [AMERICA-DATA-ENGINE] All news sources failed after retries; keeping previous cache.", flush=True)
+        _CACHE["volume_spike_detected"] = False
     elif news_us:
         _CACHE["news_us"] = news_us
+
+        # Detect volume spikes (potential noise / breaking-event flood).
+        is_spike, mean, stddev = _detect_volume_spike(len(news_us))
+        _CACHE["volume_spike_detected"] = is_spike
+        if is_spike:
+            print(f"[WARN] [AMERICA-DATA-ENGINE] Volume spike detected: {len(news_us)} articles "
+                  f"(mean: {mean:.1f}, sigma: {stddev:.1f})", flush=True)
 
         # WS1 — cross-check headline sentiment against live IV skew. Wrapped so a
         # heartbeat outage never blocks the (more critical) news cache refresh.
@@ -90,6 +132,11 @@ def _refresh_cache() -> None:
             _CACHE["contradiction"] = run_contradiction_check(news_us)
         except Exception as e:
             print(f"[WARN] [AMERICA-DATA-ENGINE] Contradiction check failed: {e}", flush=True)
+    else:
+        # Legitimate empty result — all reachable sources agreed there's
+        # nothing new. Still record it as "up to date", just with zero items.
+        _CACHE["news_us"] = news_us
+        _CACHE["volume_spike_detected"] = False
 
     _CACHE["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
     print(f"[INFO] [AMERICA-DATA-ENGINE] News refresh complete at {_CACHE['last_updated']}.",

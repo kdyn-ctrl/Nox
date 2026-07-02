@@ -50,3 +50,6 @@ execution/third_party/
 reports/
 /Nox/execution/nox_engine
 .continue/rules/CONTINUE.md
+analyst_agent
+analyst/analyst_agent
+nox_engine

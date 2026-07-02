@@ -29,7 +29,8 @@ def fetch_eastmoney_hot_board() -> List[Dict[str, Any]]:
     ]
     for func_name, func in CANDIDATES:
         df = call_with_retry(func, source=f"EastMoney hot board:{func_name}",
-                              is_failure=lambda d: d is None or d.empty)
+                              is_failure=lambda d: d is None or d.empty,
+                              timeout_seconds=20)
         if df is None:
             print(f"[WARN] [SCRAPER] {func_name} returned empty dataframe after retries, trying next.", flush=True)
             continue
@@ -89,7 +90,8 @@ def fetch_china_pmi() -> Dict[str, Any]:
 
     # 1. Fetch Official Manufacturing PMI
     df_mfg = call_with_retry(ak.macro_china_pmi_yearly, source="China Manufacturing PMI",
-                              is_failure=lambda d: d is None or d.empty)
+                              is_failure=lambda d: d is None or d.empty,
+                              timeout_seconds=20)
     if df_mfg is not None:
         try:
             latest = df_mfg.iloc[-1]
@@ -106,7 +108,8 @@ def fetch_china_pmi() -> Dict[str, Any]:
 
     # 2. Fetch Official Non-Manufacturing PMI
     df_non_mfg = call_with_retry(ak.macro_china_non_man_pmi, source="China Non-Manufacturing PMI",
-                                  is_failure=lambda d: d is None or d.empty)
+                                  is_failure=lambda d: d is None or d.empty,
+                                  timeout_seconds=20)
     if df_non_mfg is not None:
         try:
             latest = df_non_mfg.iloc[-1]
@@ -133,7 +136,8 @@ def fetch_pboc_lpr() -> Dict[str, Any]:
 
     Returns a dict with normalised English keys. Empty dict on failure.
     """
-    df = call_with_retry(ak.macro_china_lpr, source="PBOC LPR", is_failure=lambda d: d is None or d.empty)
+    df = call_with_retry(ak.macro_china_lpr, source="PBOC LPR", is_failure=lambda d: d is None or d.empty,
+                          timeout_seconds=20)
     if df is None:
         print("[ERROR] [SCRAPER] PBOC LPR fetch failed after retries.", flush=True)
         return {}
@@ -182,7 +186,8 @@ def fetch_cailian_news() -> List[Dict[str, str]]:
         if len(result) >= 10:
             break
         df = call_with_retry(lambda t=ticker: ak.stock_news_em(symbol=t), source=f"stock_news_em:{ticker}",
-                              is_failure=lambda d: d is None or d.empty)
+                              is_failure=lambda d: d is None or d.empty,
+                              timeout_seconds=20)
         if df is None:
             print(f"[WARN] [SCRAPER] stock_news_em returned empty for {ticker} after retries.", flush=True)
             continue

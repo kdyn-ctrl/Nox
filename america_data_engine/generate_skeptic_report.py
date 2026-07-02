@@ -31,7 +31,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from scrapers import fetch_alpaca_news, fetch_earnings_calendar
+from scrapers import fetch_news_with_fallback, fetch_earnings_calendar
 from contradiction_vector import run_contradiction_check
 from insider_cluster import detect_insider_clusters
 from alt_macro import run_alt_macro_check
@@ -56,11 +56,11 @@ def _run_contradiction() -> tuple[str, dict, str | None]:
     # failure — it is surfaced in result["data_gaps"] for the report body but
     # does not block generation. Only a total Alpaca news outage does.
     try:
-        print("[WS6] Fetching news for contradiction check...", flush=True)
-        news = fetch_alpaca_news()
+        print("[WS6] Fetching news for contradiction check (multi-source with fallback)...", flush=True)
+        news = fetch_news_with_fallback()
         if news is None:
-            return "contradiction", {}, "Alpaca news fetch failed after retries — cannot run contradiction check."
-        print(f"[WS6] {len(news)} article(s) fetched.", flush=True)
+            return "contradiction", {}, "All news sources failed after retries — cannot run contradiction check."
+        print(f"[WS6] {len(news)} article(s) fetched from primary/backup sources.", flush=True)
         result = run_contradiction_check(news)
         print(f"[WS6] Contradiction check: {len(result.get('results', []))} ticker(s) evaluated.", flush=True)
         return "contradiction", result, None
@@ -138,8 +138,11 @@ def _score_insider(data: dict) -> tuple[str, list[str]]:
     bullets = []
     for s in signals:
         ticker = s.get("ticker", "?")
-        n = s.get("distinct_insiders", 0)
-        roles = s.get("roles", [])
+        # insider_cluster.py's current shape uses insider_count/insiders; the
+        # distinct_insiders/roles fallbacks are kept for compatibility with
+        # any older cached payloads.
+        n = s.get("insider_count", s.get("distinct_insiders", 0))
+        roles = s.get("insiders", s.get("roles", []))
         bullets.append(f"{ticker}: {n} insider(s) — {', '.join(roles)}")
     if not signals:
         bullets.append("No insider cluster signals detected.")
@@ -154,7 +157,9 @@ def _score_alt_macro(data: dict) -> tuple[str, list[str]]:
     for r in regions:
         verdict = r.get("verdict", "NO_DATA")
         region = r.get("region", "?")
-        bias = r.get("commodity_bias", "")
+        # alt_macro.py's current shape uses "bias"; commodity_bias kept as a
+        # fallback for compatibility with any older cached payloads.
+        bias = r.get("bias", r.get("commodity_bias", ""))
         reason = r.get("reason", "")
         line = f"{region}: {verdict}"
         if bias:
