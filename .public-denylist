@@ -1,0 +1,11 @@
+# Paths that must never exist in the public upstream/Nox repo's tree.
+# Checked by scripts/check_public_safe.sh on every push to `upstream` and by
+# CI on every push/PR to `main`. See PUBLIC_PRIVATE_SPLIT.md for the
+# infra-vs-edge rationale behind this list.
+#
+# One path or glob fragment per line; matched as a substring against
+# `git ls-tree -r --name-only`. Lines starting with # are comments.
+
+execution/IBKRClient.cpp
+execution/IBKRClient.hpp
+execution/IBKR_MIGRATION.md

@@ -1,0 +1,16 @@
+title = "Nox gitleaks config"
+
+[extend]
+useDefault = true
+
+# Suppress false positives from placeholder env values in docs/templates
+# (e.g. README snippets and .env.example showing `KEY_NAME=` with no real
+# value, or `KEY=your_key_here` / `KEY=<your-key>` style placeholders).
+# Real secrets always have a live-looking value, so this shouldn't hide
+# anything genuine — see scripts/check_public_safe.sh for how this is used.
+[allowlist]
+description = "Placeholder / empty env values in example docs"
+regexes = [
+  '''=\s*$''',
+  '''=\s*["']?(your[-_].*|<.*>|xxx+|example[-_.@].*|REDACTED|\.\.\.|paper-secret|live-secret)["']?\s*$''',
+]
