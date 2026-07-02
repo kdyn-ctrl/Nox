@@ -3,8 +3,6 @@ import re
 import sys
 import telebot
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import anthropic
 import schedule
 import time
@@ -17,6 +15,8 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from telebot.util import smart_split
 from bs4 import BeautifulSoup
+
+from retry_utils import fetch_with_retry
 
 # --- 1. CONFIGURATION ---
 # RULE-009: Validate all required credentials at startup.
@@ -65,6 +65,12 @@ _cn_raw = os.getenv("NOX_WATCHLIST_CN", "BABA,JD,PDD,BIDU,NIO")
 DOMESTIC_WATCHLIST = [t.strip() for t in _us_raw.split(",") if t.strip()]
 CHINESE_ADRS       = [t.strip() for t in _cn_raw.split(",") if t.strip()]
 WATCHLIST          = DOMESTIC_WATCHLIST + CHINESE_ADRS
+
+# Daily report SEC context is pulled from this configurable ticker list.
+# If NOX_DAILY_REPORT_TICKERS is unset, default to the public watchlist.
+DAILY_REPORT_TICKERS_RAW = os.getenv("NOX_DAILY_REPORT_TICKERS", ",".join(WATCHLIST))
+DAILY_REPORT_TICKERS = [t.strip() for t in DAILY_REPORT_TICKERS_RAW.split(",") if t.strip()] or WATCHLIST
+MAX_DAILY_REPORT_SEC_TICKERS = int(os.getenv("MAX_DAILY_REPORT_SEC_TICKERS", "8"))
 
 # Broad market scanner watchlist — covers all major S&P 500 sectors.
 # TradingView free tier limits you to ~5 alerts; this scanner covers 35+ tickers
@@ -159,6 +165,21 @@ def init_db():
                         source TEXT DEFAULT 'market_scanner'
                     )
                 ''')
+
+                # Additive migration: the execution engine now writes trade_history
+                # (the canonical trade ledger) with these extra columns. Older DBs
+                # created the table without them, so add any that are missing. Must
+                # stay in sync with execution/PositionManager.hpp::initialize_database.
+                c.execute("PRAGMA table_info(trade_history)")
+                existing_cols = {row[1] for row in c.fetchall()}
+                for col, decl in (
+                    ("asset_class", "TEXT DEFAULT 'equity'"),
+                    ("quantity",    "REAL DEFAULT 0"),
+                    ("detail",      "TEXT DEFAULT ''"),
+                ):
+                    if col not in existing_cols:
+                        c.execute(f"ALTER TABLE trade_history ADD COLUMN {col} {decl}")
+
                 # WS7 — Information lag windows: tracks the period between a
                 # material 6-K SEC filing and Chinese retail media pickup.
                 c.execute('''
@@ -215,6 +236,7 @@ def init_db():
                         error_msg   TEXT
                     )
                 ''')
+
                 conn.commit()
     except Exception as e:
         print(f"Database initialization error: {e}")
@@ -232,34 +254,18 @@ def _log_parsing_failure(ticker: str, filing_type: str, error_msg: str) -> None:
     except Exception as e:
         logger.warning(f"_log_parsing_failure DB write failed: {e}")
 
-
 # --- 2. DATA EXTRACTION ---
 # RULE-008: All HTTP calls use a (connect_timeout, read_timeout) tuple.
 # A scalar timeout=10 only sets the read timeout — the connection can still
 # block indefinitely. The tuple form enforces both independently.
 HTTP_TIMEOUT = (5, 10)  # (connect seconds, read seconds)
 
-# Shared session with automatic retry + backoff on transient failures and rate-limits.
-# All outbound HTTP that can tolerate retries should use _http_session.get/post.
-_retry_strategy = Retry(
-    total=3,
-    backoff_factor=1.0,          # sleep 1s, 2s, 4s between retries
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["HEAD", "GET", "OPTIONS"],
-    raise_on_status=False,
-)
-_http_adapter = HTTPAdapter(max_retries=_retry_strategy)
-_http_session = requests.Session()
-_http_session.mount("https://", _http_adapter)
-_http_session.mount("http://",  _http_adapter)
-
-
 def get_alpaca_portfolio():
     headers = {'APCA-API-KEY-ID': ALPACA_API, 'APCA-API-SECRET-KEY': ALPACA_SEC}
     try:
-        acc_resp = requests.get('https://paper-api.alpaca.markets/v2/account',
+        acc_resp = requests.get(f'{ALPACA_BROKER_URL}/v2/account',
                                 headers=headers, timeout=HTTP_TIMEOUT)
-        pos_resp = requests.get('https://paper-api.alpaca.markets/v2/positions',
+        pos_resp = requests.get(f'{ALPACA_BROKER_URL}/v2/positions',
                                 headers=headers, timeout=HTTP_TIMEOUT)
         
         if acc_resp.status_code != 200 or pos_resp.status_code != 200:
@@ -291,7 +297,7 @@ def get_filing_type(ticker: str) -> str:
     return "6-K" if ticker in CHINESE_ADRS else "8-K"
 
 
-def get_latest_sec_filing(ticker: str) -> str:
+def get_latest_sec_filing(ticker: str) -> tuple[str, bool]:
     """
     Fetches the actual text of the latest 8-K or 6-K filing for a ticker.
 
@@ -303,39 +309,48 @@ def get_latest_sec_filing(ticker: str) -> str:
     Token budget: truncated to 8,000 chars for the daily scout. The
     real-time pipeline (process_automated_filing) uses 40,000 chars
     because it sends a dedicated alert and can afford the larger context.
+
+    Returns (text, ok). ok=False only on a genuine fetch/parse failure (feed
+    unreachable, bad status, malformed entry, doc unreachable) — a ticker
+    simply having no recent filing is the common case and reports ok=True,
+    so the daily Scout is not blocked every single day a ticker stays quiet.
     """
     filing_type = get_filing_type(ticker)
     url = (
         f"https://www.sec.gov/cgi-bin/browse-edgar"
         f"?action=getcompany&CIK={ticker}&type={filing_type}&output=atom"
     )
-    headers = {'User-Agent': 'Nox/1.0 fairydestroyasaur856@gmail.com'}
+    headers = {'User-Agent': 'Nox/1.0 openclaw@vanhellsing.tech'}
     try:
-        resp = _http_session.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        resp = fetch_with_retry(url, source=f"SEC {filing_type} feed:{ticker}", headers=headers, timeout=HTTP_TIMEOUT)
+        if resp is None:
+            return f"SEC feed unreachable for {ticker} after retries.", False
         if resp.status_code != 200:
-            return f"SEC feed returned {resp.status_code} for {ticker}."
+            return f"SEC feed returned {resp.status_code} for {ticker}.", False
 
         root = ET.fromstring(resp.content)
         ns = {'atom': 'http://www.w3.org/2005/Atom'}
         entries = root.findall('atom:entry', ns)
         if not entries:
-            return f"No recent {filing_type} filings found for {ticker}."
+            return f"No recent {filing_type} filings found for {ticker}.", True
 
         link_el = entries[0].find('atom:link', ns)
         if link_el is None:
-            return f"No filing index link found in feed for {ticker}."
+            return f"No filing index link found in feed for {ticker}.", False
 
         index_url = link_el.attrib.get('href', '')
         if not index_url:
-            return f"Empty filing index link for {ticker}."
+            return f"Empty filing index link for {ticker}.", False
 
         primary_url = resolve_primary_document(index_url, headers, filing_type)
         if not primary_url:
-            return f"Could not resolve primary {filing_type} document for {ticker}."
+            return f"Could not resolve primary {filing_type} document for {ticker}.", False
 
-        doc_res = _http_session.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
+        doc_res = fetch_with_retry(primary_url, source=f"SEC {filing_type} doc:{ticker}", headers=headers, timeout=HTTP_TIMEOUT)
+        if doc_res is None:
+            return f"Primary document unreachable for {ticker} after retries.", False
         if doc_res.status_code != 200:
-            return f"Primary document fetch returned {doc_res.status_code} for {ticker}."
+            return f"Primary document fetch returned {doc_res.status_code} for {ticker}.", False
 
         soup = BeautifulSoup(doc_res.text, "html.parser")
         for element in soup(["script", "style"]):
@@ -346,46 +361,46 @@ def get_latest_sec_filing(ticker: str) -> str:
         # the item numbers and key disclosures without burning excess tokens.
         cleaned = "\n".join(lines)[:8000]
         print(f"[INFO] [HEARTBEAT] Resolved {filing_type} text for {ticker} ({len(cleaned)} chars).", flush=True)
-        return f"SEC {filing_type} ({ticker}):\n{cleaned}"
+        return f"SEC {filing_type} ({ticker}):\n{cleaned}", True
     except Exception as e:
         print(f"[WARN] [HEARTBEAT] get_latest_sec_filing failed for {ticker}: {e}", flush=True)
-        return f"SEC pull failed for {ticker}: {str(e)}"
+        return f"SEC pull failed for {ticker}: {str(e)}", False
 
 # --- 2.5 CHINESE MARKET INTELLIGENCE (china-data-engine) ---
 
-def query_data_engine(endpoint: str, base_url: str = "http://china-data-engine:8000") -> dict:
+def query_data_engine(endpoint: str, base_url: str = "http://china-data-engine:8000") -> tuple[dict, bool]:
     """
-    Sends an authenticated GET request to an internal china-data-engine microservice.
+    Sends an authenticated GET request to an internal data-engine microservice
+    (china-data-engine or america-data-engine, selected via base_url).
 
-    The china-data-engine runs scrapers on a 15-minute APScheduler cycle and
-    caches results in memory, so this call always returns instantly — no live
-    scrape is triggered. If the china-data-engine is unreachable (e.g., still starting
-    up) we return an empty dict; the caller must handle that gracefully.
+    The data engines run scrapers on their own APScheduler cycle and cache
+    results in memory, so this call always returns instantly — no live scrape
+    is triggered. Retries with backoff before giving up.
 
     Authentication follows the same shared-secret pattern used by the analyst →
     execution webhook (RULE-004): the X-Nox-Token header carries WEBHOOK_SECRET.
     RULE-008 timeouts are enforced via HTTP_TIMEOUT.
+
+    Returns (payload, ok). On failure, payload is {} and ok is False, so the
+    caller can distinguish "reached the engine, cache is just empty" from
+    "could not reach the engine at all" instead of treating both as silence.
     """
     url = f"{base_url}{endpoint}"
     headers = {"X-Nox-Token": WEBHOOK_SECRET}
-    try:
-        res = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-        if res.status_code == 200:
-            return res.json()
-        print(
-            f"[WARN] [HEARTBEAT] china-data-engine at {base_url} returned HTTP {res.status_code} "
-            f"for {endpoint}.",
-            flush=True,
-        )
-    except Exception as e:
-        print(
-            f"[WARN] [HEARTBEAT] Could not reach china-data-engine at {url}: {e}",
-            flush=True,
-        )
-    return {}
+    res = fetch_with_retry(url, source=f"data-engine:{endpoint}", headers=headers, timeout=HTTP_TIMEOUT)
+    if res is None:
+        print(f"[WARN] [HEARTBEAT] Could not reach data engine at {url} after retries.", flush=True)
+        return {}, False
+    if res.status_code == 200:
+        return res.json(), True
+    print(
+        f"[WARN] [HEARTBEAT] data engine at {base_url} returned HTTP {res.status_code} for {endpoint}.",
+        flush=True,
+    )
+    return {}, False
 
 
-def get_chinese_market_context() -> str:
+def get_chinese_market_context() -> tuple[str, bool]:
     """
     Assembles three layers of Chinese market intelligence by querying the
     dedicated china-data-engine microservice over the internal nox_net Docker network.
@@ -402,11 +417,17 @@ def get_chinese_market_context() -> str:
 
     Each endpoint is queried independently so a failure on one source (e.g.,
     the sentiment endpoint) does not suppress PMI or LPR data.
+
+    Returns (text, ok). ok is True only if every underlying data-engine call
+    succeeded — a cache that is reachable but genuinely empty still counts as
+    ok, since that's real data, not a fetch failure.
     """
     sections = []
+    all_ok = True
 
     # --- East Money Hot Board (东方财富人气榜) ---
-    sentiment_payload = query_data_engine("/sentiment/china")
+    sentiment_payload, ok = query_data_engine("/sentiment/china")
+    all_ok = all_ok and ok
     hot_board = sentiment_payload.get("hot_board", [])
     if hot_board:
         lines = [
@@ -423,7 +444,8 @@ def get_chinese_market_context() -> str:
         sections.append("🇨🇳 East Money Hot Board: unavailable.")
 
     # --- China Manufacturing PMI (制造业PMI) ---
-    macro_payload = query_data_engine("/macro/china")
+    macro_payload, ok = query_data_engine("/macro/china")
+    all_ok = all_ok and ok
     pmi = macro_payload.get("pmi", {})
     if pmi:
         mfg     = pmi.get('manufacturing', 'N/A')
@@ -459,7 +481,8 @@ def get_chinese_market_context() -> str:
     # Injected as a fourth context layer for the scout — highest-velocity
     # Chinese-language news source. Claude uses these to detect intraday
     # policy signals that have not yet appeared in English-language feeds.
-    news_payload = query_data_engine("/news/cn")
+    news_payload, ok = query_data_engine("/news/cn")
+    all_ok = all_ok and ok
     news_cn = news_payload.get("news", [])
     if news_cn:
         lines = [
@@ -474,25 +497,30 @@ def get_chinese_market_context() -> str:
     else:
         sections.append("📰 Cailian Press: unavailable.")
 
-    return "\n\n".join(sections)
+    return "\n\n".join(sections), all_ok
 
 
-def get_us_news_context() -> str:
+def get_us_news_context() -> tuple[str, bool]:
     """
-    Assembles US news context by querying the america-china-data-engine.
+    Assembles US news context by querying the america-data-engine.
+
+    Returns (text, ok). ok is False only when the america-data-engine call
+    itself failed after retries — a reachable engine with a genuinely empty
+    news cache still returns ok=True.
     """
-    news_payload = query_data_engine("/news/us", "http://america-data-engine:8001")
+    news_payload, ok = query_data_engine("/news/us", "http://america-data-engine:8001")
     news_us = news_payload.get("news", [])
     if news_us:
         lines = [
             f"- {n.get('headline', '')}"
             for n in news_us[:5] #top 5
         ]
-        print(f"[INFO] [HEARTBEAT] US news received from america-china-data-engine ({len(lines)} headlines).", flush=True)
-        return "\n".join(lines)
+        print(f"[INFO] [HEARTBEAT] US news received from america-data-engine ({len(lines)} headlines).", flush=True)
+        return "\n".join(lines), ok
     else:
-        print("[WARN] [HEARTBEAT] US news from america-china-data-engine was empty.", flush=True)
-        return "US news headlines unavailable."
+        if ok:
+            print("[INFO] [HEARTBEAT] US news from america-data-engine was empty (not a failure).", flush=True)
+        return "US news headlines unavailable.", ok
 
 
 # --- 2.8 BROAD MARKET SCANNER ---
@@ -502,7 +530,10 @@ def get_us_news_context() -> str:
 # No Traefik, no public internet, no TradingView subscription needed.
 
 ALPACA_DATA_URL  = "https://data.alpaca.markets"
-ALPACA_BROKER_URL = "https://paper-api.alpaca.markets"
+# Broker/account host differs paper vs live — must track execution-engine's
+# ALPACA_BASE_URL (same env var name) so reports never silently show the wrong
+# account. Falls back to paper for local runs where the var isn't set.
+ALPACA_BROKER_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 # Minimum liquidity thresholds for the whole-market scanner.
 # Keeps the candidate pool to liquid, optionable names.
@@ -565,7 +596,7 @@ def fetch_bars(ticker: str, limit: int = 220) -> dict | None:
         "APCA-API-SECRET-KEY": ALPACA_SEC,
     }
     try:
-        resp = _http_session.get(
+        resp = requests.get(
             f"{ALPACA_DATA_URL}/v2/stocks/{ticker}/bars",
             headers=headers,
             params={"timeframe": "1Day", "limit": limit, "adjustment": "raw", "feed": "iex"},
@@ -606,7 +637,7 @@ def fetch_batch_bars(tickers: list[str], limit: int = 60) -> dict[str, dict]:
     for i in range(0, len(tickers), CHUNK):
         chunk = tickers[i:i + CHUNK]
         try:
-            resp = _http_session.get(
+            resp = requests.get(
                 f"{ALPACA_DATA_URL}/v2/stocks/bars",
                 headers=headers,
                 params={
@@ -650,7 +681,7 @@ def fetch_batch_snapshots(tickers: list[str]) -> dict[str, dict]:
     for i in range(0, len(tickers), CHUNK):
         chunk = tickers[i:i + CHUNK]
         try:
-            resp = _http_session.get(
+            resp = requests.get(
                 f"{ALPACA_DATA_URL}/v2/stocks/snapshots",
                 headers=headers,
                 params={"symbols": ",".join(chunk), "feed": "iex"},
@@ -673,8 +704,8 @@ def fetch_batch_snapshots(tickers: list[str]) -> dict[str, dict]:
                         "pct_chg": pct_chg,
                         "activity": vol * pct_chg,  # rank by dollar-volume × % move
                     }
-                except Exception as inner_e:
-                    logger.debug(f"fetch_batch_snapshots: bad snapshot for ticker in chunk {i//CHUNK}: {inner_e}")
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning(f"fetch_batch_snapshots chunk {i//CHUNK} failed: {e}")
         time.sleep(0.5)
@@ -714,7 +745,7 @@ def fetch_market_universe() -> list[str]:
         if page_token:
             params["page_token"] = page_token
         try:
-            resp = _http_session.get(
+            resp = requests.get(
                 f"{ALPACA_BROKER_URL}/v2/assets",
                 headers=headers,
                 params=params,
@@ -745,7 +776,7 @@ def fetch_market_universe() -> list[str]:
 def fetch_vix_level() -> float:
     """Current VIX via Yahoo Finance (free, no API key)."""
     try:
-        resp = _http_session.get(
+        resp = requests.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX",
             params={"interval": "1d", "range": "1d"},
             headers={"User-Agent": "Mozilla/5.0"},
@@ -956,21 +987,10 @@ def run_market_scanner() -> None:
         except Exception as e:
             logger.warning(f"[SCANNER] {ticker}: {e}")
 
-    if triggered:
-        msg = (
-            f"📡 *Whole-Market Scanner* — {len(triggered)} signal(s) from "
-            f"{len(top_tickers)} candidates\n"
-            f"_(universe: {len(universe)} tickers · VIX={vix:.1f})_\n\n" +
-            "\n".join(f"• {t}" for t in triggered[:20])  # cap Telegram msg length
-        )
-        if len(triggered) > 20:
-            msg += f"\n_...and {len(triggered) - 20} more_"
-        bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
-    else:
-        logger.info(
-            f"Scanner cycle complete — 0 signals from {len(top_tickers)} candidates "
-            f"(VIX={vix:.1f})."
-        )
+    logger.info(
+        f"Scanner cycle complete — {len(triggered)} signal(s) from "
+        f"{len(top_tickers)} candidates (VIX={vix:.1f}). Use /details to review."
+    )
 
 
 # --- 3. THE SCOUT PROTOCOL (DAILY REPORT) ---
@@ -1046,12 +1066,46 @@ def _split_scout_sections(text: str) -> list[str]:
     return final
 
 
+def _send_telegram_section(section: str) -> None:
+    """Send a Telegram section safely so one failed message does not abort the report."""
+    try:
+        bot.send_message(CHAT_ID, section, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"[ERROR] [HEARTBEAT] Failed to send Telegram section: {e}")
+        print(f"[ERROR] [HEARTBEAT] Failed to send Telegram section: {e}", flush=True)
+
+
 def run_scout_protocol():
     try:
-        news_context    = get_us_news_context()
-        scout_tickers   = WATCHLIST[:6] if len(WATCHLIST) >= 6 else WATCHLIST
-        sec_context     = "\n\n".join([get_latest_sec_filing(t) for t in scout_tickers])
-        chinese_context = get_chinese_market_context()
+        news_context, news_ok = get_us_news_context()
+        report_tickers  = DAILY_REPORT_TICKERS[:MAX_DAILY_REPORT_SEC_TICKERS]
+        sec_results     = [get_latest_sec_filing(t) for t in report_tickers]
+        sec_context     = "\n\n".join(text for text, _ in sec_results)
+        sec_failed      = [t for t, (_, ok) in zip(report_tickers, sec_results) if not ok]
+        chinese_context, china_ok = get_chinese_market_context()
+
+        # Policy: never generate the daily audit from incomplete context — a
+        # confident-sounding report built on partial data is worse than no
+        # report, since there's no way for the reader to tell "nothing
+        # material happened" apart from "we couldn't reach a data source".
+        gaps = []
+        if not news_ok:
+            gaps.append("US news (america-data-engine unreachable)")
+        if sec_failed:
+            gaps.append(f"SEC filings unreachable for: {', '.join(sec_failed)}")
+        if not china_ok:
+            gaps.append("Chinese market intelligence (china-data-engine unreachable)")
+
+        if gaps:
+            gap_summary = "; ".join(gaps)
+            print(f"[WARN] [HEARTBEAT] Scout protocol SKIPPED — incomplete data: {gap_summary}", flush=True)
+            _send_telegram_section(
+                "*NOX DAILY AUDIT — SKIPPED*\n"
+                "────────────────────────\n"
+                "Refusing to generate today's audit from incomplete data.\n"
+                f"Missing: {gap_summary}"
+            )
+            return
 
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -1068,23 +1122,27 @@ def run_scout_protocol():
         et_tz = ZoneInfo('America/New_York')
         timestamp = datetime.now(et_tz).strftime('%Y-%m-%d %H:%M ET')
 
-        # Header sent as its own message so sections start clean
+        print(f"[INFO] [HEARTBEAT] Daily audit raw report length: {len(analysis_text or '')} chars", flush=True)
+
         header = (
             f"*NOX DAILY AUDIT*\n"
             f"────────────────────────\n"
             f"{timestamp}"
         )
-        bot.send_message(CHAT_ID, header, parse_mode='Markdown')
+        _send_telegram_section(header)
 
-        # Send each section as its own Telegram message — no mid-section breaks
-        for section in _split_scout_sections(analysis_text):
-            bot.send_message(CHAT_ID, section, parse_mode='Markdown')
+        sections = _split_scout_sections(analysis_text or "No report content was produced.")
+        if not sections:
+            sections = list(smart_split(analysis_text or "No report content was produced.", chars_per_string=3800))
+
+        for section in sections:
+            _send_telegram_section(section)
 
         with db_lock:
             with sqlite3.connect(DB_PATH) as conn:
                 c = conn.cursor()
                 c.execute("INSERT INTO daily_audits (tickers_scanned, claude_analysis) VALUES (?, ?)",
-                          ("NVDA, BABA", analysis_text))
+                          (", ".join(report_tickers), analysis_text))
                 conn.commit()
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] Scout protocol failed: {e}", flush=True)
@@ -1107,8 +1165,10 @@ def fetch_options_chain_iv(ticker: str) -> float | None:
     }
 
     try:
-        url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{ticker}"
-        resp = _http_session.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        # Alpaca options chains endpoint — served from the broker/account host,
+        # which differs paper vs live (unlike ALPACA_DATA_URL).
+        url = f"{ALPACA_BROKER_URL}/v1beta3/options/chains/{ticker}"
+        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
 
         if resp.status_code != 200:
             logger.warning(f"Alpaca options chain request failed for {ticker}: HTTP {resp.status_code}")
@@ -1189,13 +1249,15 @@ def fetch_iv_skew(ticker: str) -> dict:
         "APCA-API-KEY-ID": ALPACA_API,
         "APCA-API-SECRET-KEY": ALPACA_SEC,
     }
-    try:
-        url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{ticker}"
-        resp = _http_session.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            return {"ticker": ticker, "method": "error",
-                    "error": f"chain HTTP {resp.status_code}"}
+    url = f"{ALPACA_BROKER_URL}/v1beta3/options/chains/{ticker}"
+    resp = fetch_with_retry(url, source=f"IV skew chain:{ticker}", headers=headers, timeout=HTTP_TIMEOUT)
+    if resp is None:
+        return {"ticker": ticker, "method": "error", "error": "options chain unreachable after retries"}
+    if resp.status_code != 200:
+        return {"ticker": ticker, "method": "error",
+                "error": f"chain HTTP {resp.status_code}"}
 
+    try:
         data = resp.json() or {}
         chains = data.get("chains", [])
         if not chains:
@@ -1515,64 +1577,26 @@ def schedule_checker():
 
     _reschedule_iv_collection()
 
-    # --- Weekly Performance Report (last NYSE trading day at 16:00 ET) ---
-    # pandas_market_calendars determines whether today is the last trading day
-    # of the week (Friday, or Thursday on early-close/holiday weeks). The job
-    # is only registered on that day and cleared the following morning by
-    # _combined_reschedule, so it never fires on the wrong day.
+    # --- End-of-Day / End-of-Week reports (post-close) ---
+    # EOD 16:05 ET daily (weekends skipped inside run_eod_report); EOW 16:10 ET Friday.
+    # DST-aware like the scout: recomputed nightly at 00:01 UTC.
+    def _reschedule_eod_eow():
+        schedule.clear("eod_report")
+        schedule.clear("eow_report")
+        now_et = datetime.now(tz=ET)
 
-    def _reschedule_weekly_report():
-        """
-        Register run_weekly_performance_report at 16:00 ET only when today
-        is the last NYSE trading day of the current Mon–Fri week.
+        eod_et  = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
+        eod_utc = eod_et.astimezone(UTC).strftime("%H:%M")
+        schedule.every().day.at(eod_utc).do(run_eod_report).tag("eod_report")
 
-        Uses pandas_market_calendars (lazy import — loads once then cached)
-        so NYSE holidays automatically shift the report to Thursday with no
-        manual calendar maintenance required. Re-run nightly at 00:01 UTC.
-        """
-        schedule.clear("weekly_report")
-        try:
-            import pandas_market_calendars as mcal  # noqa: PLC0415
+        eow_et  = now_et.replace(hour=16, minute=10, second=0, microsecond=0)
+        eow_utc = eow_et.astimezone(UTC).strftime("%H:%M")
+        schedule.every().friday.at(eow_utc).do(run_eow_report).tag("eow_report")
 
-            nyse   = mcal.get_calendar("NYSE")
-            now_et = datetime.now(tz=ET)
-            today  = now_et.date()
-            monday = today - timedelta(days=today.weekday())
-            friday = monday + timedelta(days=4)
+        logger.info(f"EOD report scheduled 16:05 ET = {eod_utc} UTC (daily); "
+                    f"EOW report scheduled 16:10 ET = {eow_utc} UTC (Friday).")
 
-            sched_df = nyse.schedule(
-                start_date=monday.strftime("%Y-%m-%d"),
-                end_date=friday.strftime("%Y-%m-%d"),
-            )
-
-            if sched_df.empty:
-                logger.info("Weekly report: no NYSE trading days this week — skipping.")
-                return
-
-            last_trading_day = sched_df.index[-1].date()
-
-            if today != last_trading_day:
-                logger.info(
-                    f"Weekly report: today ({today}) is not the last trading day "
-                    f"this week ({last_trading_day}). Not scheduling."
-                )
-                return
-
-            # Today IS the last trading day — register a one-shot at 16:00 ET.
-            target_et  = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-            target_utc = target_et.astimezone(UTC)
-            utc_hhmm   = target_utc.strftime("%H:%M")
-
-            schedule.every().day.at(utc_hhmm).do(run_weekly_performance_report).tag("weekly_report")
-            print(
-                f"[INFO] [HEARTBEAT] Weekly report scheduled for today ({today}) "
-                f"at 16:00 ET = {utc_hhmm} UTC.",
-                flush=True,
-            )
-        except Exception as e:
-            logger.error(f"_reschedule_weekly_report failed: {e}")
-
-    _reschedule_weekly_report()
+    _reschedule_eod_eow()
 
     # --- Market Scanner (every 30 minutes, market hours only) ---
     # Runs independently of DST — the is_market_hours() check inside handles
@@ -1583,12 +1607,11 @@ def schedule_checker():
     # Fire once immediately at startup so first signals don't wait 30 minutes.
     threading.Thread(target=run_market_scanner, daemon=True).start()
 
-    # Reschedule all time-sensitive jobs each night so DST shifts and
-    # "is today the last trading day?" checks are re-evaluated daily.
+    # Reschedule IV collection each night along with the scout
     def _combined_reschedule():
         _reschedule_scout()
         _reschedule_iv_collection()
-        _reschedule_weekly_report()
+        _reschedule_eod_eow()
 
     schedule.clear("reschedule")
     schedule.every().day.at("00:01").do(_combined_reschedule).tag("reschedule")
@@ -1624,24 +1647,6 @@ def trigger_report(message):
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] /report command failed: {e}", flush=True)
         bot.reply_to(message, f"⚠️ Failed to trigger report: {str(e)}")
-
-@bot.message_handler(commands=['weekly_report'])
-def trigger_weekly_report(message):
-    """
-    /weekly_report — Manually triggers the weekly performance report on demand.
-    Runs in a background thread so the bot stays responsive during DB queries.
-    """
-    try:
-        bot.reply_to(
-            message,
-            "📊 *Generating weekly performance report...* Querying memory bank.",
-            parse_mode="Markdown",
-        )
-        threading.Thread(target=run_weekly_performance_report, daemon=True).start()
-    except Exception as e:
-        print(f"[ERROR] [HEARTBEAT] /weekly_report failed: {e}", flush=True)
-        bot.reply_to(message, f"⚠️ Failed to trigger weekly report: {str(e)}")
-
 
 @bot.message_handler(commands=['status'])
 def send_status(message):
@@ -1750,17 +1755,6 @@ def send_status(message):
             reserved = r'_*[]()~`>#+-=|{}.!'
             return re.sub(f'([{re.escape(reserved)}])', r'\\\1', str(text))
 
-        try:
-            _spy, _spy_sma, _vix = fetch_spy_regime()
-            if _vix > 25 or (_spy > 0 and _spy_sma > 0 and _spy < _spy_sma):
-                _regime_label = "RISK_OFF"
-            elif _vix > 20:
-                _regime_label = "TRANSITION"
-            else:
-                _regime_label = "RISK_ON"
-        except Exception:
-            _regime_label = "UNKNOWN"
-
         separator = "─" * 24
         status_msg = (
             f"🦅 *Nox System Health Status*\n"
@@ -1770,7 +1764,7 @@ def send_status(message):
             f"🇨🇳 *China Data Engine:* {esc(data_status)} \\(Cache updated: {esc(data_cache_age)}\\)\n"
             f"🇺🇸 *America Data Engine:* {esc(america_data_status)} \\(Cache updated: {esc(america_data_cache_age)}\\)\n"
             f"📚 *Memory Bank:* {esc(audit_count)} Audits \\| {esc(filing_count)} Processed Filings\n"
-            f"📊 *Current Market Regime:* `{_regime_label}` \\(VIX: {esc(round(_vix, 1))}\\)"
+            f"📊 *Current Market Regime:* `RISK_ON`"
         )
         print(f"[STATUS CMD] Assembled status message:\n{status_msg}", flush=True)
         bot.reply_to(message, status_msg, parse_mode='MarkdownV2')
@@ -1838,9 +1832,9 @@ def cmd_pulse(message):
     """
     /pulse — Fast intraday market pulse (VIX + headlines + gap analysis).
     Gathers current VIX, recent headlines, contradiction verdicts, and upcoming
-    earnings; sends to Claude for a 3-sentence market read + up to 3 gaps
-    the trader may not be thinking about given their current positions.
-    Response is fast (~10 seconds) because all data is cached.
+    earnings; sends to Claude for a short market read + up to 3 gaps the
+    trader may not be thinking about given their current positions.
+    Response is fast (~10 seconds) because all data is cached in the data engines.
     """
     try:
         bot.reply_to(message, "📡 *Market Pulse analyzing...* Gathering VIX, headlines, and position gaps.", parse_mode='Markdown')
@@ -1848,15 +1842,16 @@ def cmd_pulse(message):
         # 1. Fetch VIX
         vix = fetch_vix_level()
 
-        # 2. Fetch headlines from america-data-engine
-        news_data = query_data_engine("/news/us", "http://america-data-engine:8001")
-        headlines = [a.get("headline", "") for a in news_data.get("news", [])[:8]] if news_data else []
+        # 2. Fetch headlines from america-data-engine.
+        # query_data_engine() returns (payload, ok) — ok=False means the
+        # engine was unreachable, distinct from a legitimately empty cache.
+        news_data, news_ok = query_data_engine("/news/us", "http://america-data-engine:8001")
+        headlines = [a.get("headline", "") for a in news_data.get("news", [])[:8]] if news_ok else []
 
         # 3. Fetch contradiction verdicts
-        contradiction_data = query_data_engine("/contradiction/us", "http://america-data-engine:8001")
-        # Extract ticker verdicts from the results list
+        contradiction_data, contradiction_ok = query_data_engine("/contradiction/us", "http://america-data-engine:8001")
         contradictions = {}
-        if contradiction_data:
+        if contradiction_ok:
             for result in contradiction_data.get("results", []):
                 if isinstance(result, dict):
                     ticker = result.get("ticker")
@@ -1865,13 +1860,13 @@ def cmd_pulse(message):
                         contradictions[ticker] = verdict
 
         # 4. Fetch upcoming earnings (next 5 days)
-        earnings_data = query_data_engine("/earnings/calendar", "http://america-data-engine:8001")
+        earnings_data, earnings_ok = query_data_engine("/earnings/calendar", "http://america-data-engine:8001")
         upcoming_earnings_tickers = set()
-        if earnings_data:
+        if earnings_ok:
             earnings_cal = earnings_data.get("earnings_calendar", {})
             today = datetime.now()
             for ticker, events in earnings_cal.items():
-                for event in events:
+                for event in (events or []):
                     try:
                         event_date = datetime.strptime(event.get("date", ""), "%Y-%m-%d").date()
                         days_until = (event_date - today.date()).days
@@ -1884,7 +1879,7 @@ def cmd_pulse(message):
         positions_text = "No open positions"
         try:
             pos_resp = requests.get(
-                "https://paper-api.alpaca.markets/v2/positions",
+                f"{ALPACA_BROKER_URL}/v2/positions",
                 headers={
                     "APCA-API-KEY-ID": ALPACA_API,
                     "APCA-API-SECRET-KEY": ALPACA_SEC,
@@ -1985,9 +1980,10 @@ def send_signals(message):
             rsi    = s.get('rsi', 0)
             vix    = s.get('vix', 0)
             ts     = s.get('received_at', '?')[:19]
+            source = s.get('source', '') or 'webhook'
             lines.append(
                 f"• `{ts}` *{action}* {ticker} "
-                f"@ ${price:.2f} RSI={rsi:.1f} VIX={vix:.1f}"
+                f"@ ${price:.2f} RSI={rsi:.1f} VIX={vix:.1f} [{source}]"
             )
 
         bot.reply_to(
@@ -2001,70 +1997,162 @@ def send_signals(message):
         bot.reply_to(message, f"⚠️ Failed to fetch signals: {str(e)}")
 
 
-@bot.message_handler(commands=['lagstats'])
-def send_lag_stats(message):
+@bot.message_handler(commands=['cn_status'])
+def send_cn_status(message):
     """
-    /lagstats — WS7 meta-analysis report.
-    Shows grade distribution, mean lag, mean AR, and last 10 graded events
-    from the lag_windows SQLite table.
+    /cn_status — Single-command diagnostic for CN-RULE-001/002 (Chinese A-share
+    board-lot truncation + T+1 settlement gate). Answers "is CN protection
+    currently active, and what does it think it's tracking" without grepping
+    logs or reading code. Queries /cn-status on the execution engine.
     """
     try:
-        with db_lock:
-            with sqlite3.connect(DB_PATH) as conn:
-                rows = conn.execute(
-                    """SELECT ticker, lag_hours, abnormal_return, grade,
-                              grade_reasoning, closed_by_source, closed_at
-                       FROM lag_windows
-                       WHERE closed_at IS NOT NULL
-                       ORDER BY closed_at DESC
-                       LIMIT 50"""
-                ).fetchall()
-
-        if not rows:
-            bot.reply_to(message, "📭 No closed lag windows yet. Waiting for 6-K detections.")
+        resp = requests.get("http://execution-engine:8080/cn-status", timeout=HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            bot.reply_to(message, f"⚠️ Execution engine returned HTTP {resp.status_code}.")
             return
 
-        graded = [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows if r[3]]
-        grades = {"A": 0, "B": 0, "C": 0, "F": 0}
-        ar_by_grade = {"A": [], "B": [], "C": [], "F": []}
-        for _, lag_h, ar, grade, _, _ in graded:
-            g = grade.strip().upper() if grade else "?"
-            if g in grades:
-                grades[g] += 1
-                if ar is not None:
-                    ar_by_grade[g].append(ar)
+        data = resp.json()
+        lot_size    = data.get("board_lot_size", "?")
+        gate_active = data.get("gate_active", False)
+        today       = data.get("today", "?")
+        positions   = data.get("positions", [])
 
-        total_graded = sum(grades.values())
-        mean_lag = sum(r[1] for r in rows if r[1]) / max(len(rows), 1)
+        status_line = (
+            "🟢 *ACTIVE* — board-lot truncation and T+1 gate are enforced on every ticker"
+            if gate_active else
+            "⚪ *DORMANT* — board_lot_size=1, no CN-specific restriction applied to any ticker"
+        )
 
         lines = [
-            f"📊 *WS7 Lag Window — Meta Analysis*",
-            f"Total closed windows: {len(rows)} | Graded: {total_graded}",
-            f"Mean lag: *{mean_lag:.1f}h*",
-            "",
-            "*Grade Distribution:*",
+            f"🇨🇳 *CN-RULE-001/002 Status*",
+            f"────────────────────────",
+            f"• *Board Lot Size:* {lot_size}",
+            f"• *Gate:* {status_line}",
+            f"• *Today (ET):* {today}",
         ]
-        for g in ["A", "B", "C", "F"]:
-            count = grades[g]
-            ars = ar_by_grade[g]
-            mean_ar = f"{sum(ars)/len(ars)*100:+.2f}%" if ars else "N/A"
-            lines.append(f"  `{g}` ×{count}  mean AR={mean_ar}")
 
-        lines += ["", "*Last 10 Events:*"]
-        for row in rows[:10]:
-            ticker, lag_h, ar, grade, reasoning, source, closed_at = row
-            lag_str = f"{lag_h:.1f}h" if lag_h else "—"
-            ar_str  = f"{ar*100:+.2f}%" if ar is not None else "—"
-            g_str   = grade if grade else "?"
-            lines.append(
-                f"`{ticker}` {g_str} | lag={lag_str} | AR={ar_str} | via {source or '?'}"
-            )
-            if reasoning:
-                lines.append(f"  _{reasoning}_")
+        if positions:
+            lines.append(f"\n*T+1 Tracked Positions ({len(positions)}):*")
+            for p in positions:
+                cleared = "✅ cleared" if p.get("cleared") else "⏳ pending"
+                lines.append(f"• {p.get('ticker','?')} — entry {p.get('entry_date','?')} ({cleared})")
+        elif gate_active:
+            lines.append("\n_No positions currently tracked._")
 
         bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
     except Exception as e:
-        bot.reply_to(message, f"⚠️ /lagstats failed: {e}")
+        print(f"[ERROR] [HEARTBEAT] /cn_status command failed: {e}", flush=True)
+        bot.reply_to(message, f"⚠️ Failed to fetch CN status: {str(e)}")
+
+
+@bot.message_handler(commands=['trades'])
+def send_trades(message):
+    """
+    /trades [n] — Last N executed trades from the persistent trade ledger
+    (trade_history). Unlike /signals (in-memory, wiped on engine restart), this
+    reads the DB so filled entries/exits and realized P&L survive restarts.
+    Defaults to 15, capped at 50.
+    """
+    try:
+        parts = message.text.strip().split()
+        try:
+            requested = int(parts[1]) if len(parts) > 1 else 15
+            count = max(1, min(requested, 50))
+        except (ValueError, IndexError):
+            count = 15
+
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute(
+                    "SELECT timestamp, ticker, action, asset_class, quantity, price, pnl, detail "
+                    "FROM trade_history ORDER BY id DESC LIMIT ?",
+                    (count,),
+                )
+                rows = c.fetchall()
+
+        if not rows:
+            bot.reply_to(
+                message,
+                "📭 No trades recorded yet.\n\n"
+                "The engine records every equity/option entry and exit here once it "
+                "places or closes an order. If this stays empty during market hours, "
+                "check that signals are arriving (/signals) and orders aren't being "
+                "blocked by a gate.",
+            )
+            return
+
+        lines = []
+        for ts, ticker, action, asset_class, qty, price, pnl, detail in rows:
+            icon = "🟢" if action in ("BUY", "OPEN") else "🔴" if action in ("SELL", "CLOSE") else "⚪"
+            kind = "opt" if (asset_class or "") == "option" else "eq"
+            pnl_str = ""
+            if pnl is not None and action in ("SELL", "CLOSE"):
+                pnl_str = f" | P&L ${pnl:+.2f}"
+            qty_str = f"x{qty:g}" if qty else ""
+            lines.append(
+                f"{icon} `{str(ts)[:19]}` *{action}* {ticker} [{kind}] "
+                f"{qty_str} @ ${price:.2f}{pnl_str}"
+            )
+
+        bot.reply_to(
+            message,
+            f"📒 *Last {len(rows)} executed trade(s):*\n\n" + "\n".join(lines),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"[ERROR] [HEARTBEAT] /trades command failed: {e}", flush=True)
+        bot.reply_to(message, f"⚠️ Failed to fetch trades: {str(e)}")
+
+
+@bot.message_handler(commands=['details'])
+def send_details(message):
+    """
+    /details [n] — Full breakdown of the last N signals received by the execution engine.
+    Shows ticker, action, price, RSI, VIX, and timestamp. Defaults to 5, capped at 20.
+    """
+    try:
+        parts = message.text.strip().split()
+        try:
+            requested = int(parts[1]) if len(parts) > 1 else 5
+            count = max(1, min(requested, 20))
+        except (ValueError, IndexError):
+            count = 5
+
+        resp = requests.get("http://execution-engine:8080/recent-signals", timeout=HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            bot.reply_to(message, f"⚠️ Engine returned HTTP {resp.status_code}.")
+            return
+
+        signals = resp.json()
+        if not signals:
+            bot.reply_to(message, "📭 No signals on record yet.")
+            return
+
+        signals = signals[-count:]
+        lines = []
+        for s in reversed(signals):
+            ts     = s.get('received_at', '?')[:16].replace('T', ' ')
+            ticker = s.get('ticker', '?')
+            action = s.get('action', '?')
+            price  = s.get('price', 0.0)
+            rsi    = s.get('rsi', 0.0)
+            vix    = s.get('vix', 0.0)
+            source = s.get('source', '') or 'webhook'
+            icon   = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
+            lines.append(
+                f"{icon} *{ticker}* {action}  `{ts}`  [{source}]\n"
+                f"   Price ${price:.2f} · RSI {rsi:.1f} · VIX {vix:.1f}"
+            )
+
+        bot.reply_to(
+            message,
+            f"📋 *Last {len(signals)} signal(s):*\n\n" + "\n\n".join(lines),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"[ERROR] [HEARTBEAT] /details command failed: {e}", flush=True)
+        bot.reply_to(message, f"⚠️ Failed to fetch details: {str(e)}")
 
 
 @bot.message_handler(func=lambda message: True)
@@ -2113,12 +2201,13 @@ def mark_filing_processed(filing_id):
             c.execute("INSERT OR IGNORE INTO processed_filings (filing_id) VALUES (?)", (filing_id,))
             conn.commit()
 
-
-# --- WS7: Information Lag Window Tracker ---
-# Tracks the period between a material 6-K SEC filing and Chinese retail media
-# pickup (East Money hot board or Cailian Press). When the lag window closes,
-# we know Chinese retail has discovered the filing — the edge has been consumed.
-
+# ---------------------------------------------------------------------------
+# WS7 — Information Lag Window: tracks the period between a material 6-K SEC
+# filing and Chinese retail media pickup (china-data-engine /lag/check).
+# process_automated_filing() opens a window via _lag_open_window() when it
+# detects a heavyweight 6-K for a CN watchlist ticker; _lag_monitor_loop()
+# polls china-data-engine every 15 minutes and closes/grades windows.
+# ---------------------------------------------------------------------------
 _CN_DATA_ENGINE_URL = "http://china-data-engine:8000"
 _LAG_WINDOW_MAX_HOURS = 48  # auto-expire windows older than this
 
@@ -2364,6 +2453,72 @@ def _lag_monitor_loop():
             print(f"[ERROR] [HEARTBEAT] WS7 lag monitor loop error: {e}", flush=True)
 
 
+@bot.message_handler(commands=['lagstats'])
+def send_lag_stats(message):
+    """
+    /lagstats — WS7 meta-analysis report.
+    Shows grade distribution, mean lag, mean AR, and last 10 graded events
+    from the lag_windows SQLite table.
+    """
+    try:
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                rows = conn.execute(
+                    """SELECT ticker, lag_hours, abnormal_return, grade,
+                              grade_reasoning, closed_by_source, closed_at
+                       FROM lag_windows
+                       WHERE closed_at IS NOT NULL
+                       ORDER BY closed_at DESC
+                       LIMIT 50"""
+                ).fetchall()
+
+        if not rows:
+            bot.reply_to(message, "📭 No closed lag windows yet. Waiting for 6-K detections.")
+            return
+
+        graded = [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows if r[3]]
+        grades = {"A": 0, "B": 0, "C": 0, "F": 0}
+        ar_by_grade = {"A": [], "B": [], "C": [], "F": []}
+        for _, lag_h, ar, grade, _, _ in graded:
+            g = grade.strip().upper() if grade else "?"
+            if g in grades:
+                grades[g] += 1
+                if ar is not None:
+                    ar_by_grade[g].append(ar)
+
+        total_graded = sum(grades.values())
+        mean_lag = sum(r[1] for r in rows if r[1]) / max(len(rows), 1)
+
+        lines = [
+            f"📊 *WS7 Lag Window — Meta Analysis*",
+            f"Total closed windows: {len(rows)} | Graded: {total_graded}",
+            f"Mean lag: *{mean_lag:.1f}h*",
+            "",
+            "*Grade Distribution:*",
+        ]
+        for g in ["A", "B", "C", "F"]:
+            count = grades[g]
+            ars = ar_by_grade[g]
+            mean_ar = f"{sum(ars)/len(ars)*100:+.2f}%" if ars else "N/A"
+            lines.append(f"  `{g}` ×{count}  mean AR={mean_ar}")
+
+        lines += ["", "*Last 10 Events:*"]
+        for row in rows[:10]:
+            ticker, lag_h, ar, grade, reasoning, source, closed_at = row
+            lag_str = f"{lag_h:.1f}h" if lag_h else "—"
+            ar_str  = f"{ar*100:+.2f}%" if ar is not None else "—"
+            g_str   = grade if grade else "?"
+            lines.append(
+                f"`{ticker}` {g_str} | lag={lag_str} | AR={ar_str} | via {source or '?'}"
+            )
+            if reasoning:
+                lines.append(f"  _{reasoning}_")
+
+        bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ /lagstats failed: {e}")
+
+
 def poll_sec_edgar():
     print("[INFO] [HEARTBEAT] Nox Automated SEC Radar engaged...", flush=True)
     # Poll both the global 8-K feed (US domestic companies) and the global 6-K
@@ -2375,16 +2530,19 @@ def poll_sec_edgar():
         ("8-K", "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"),
         ("6-K", "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=6-K&output=atom"),
     ]
-    headers = {"User-Agent": "Nox/1.0 fairydestroyasaur856@gmail.com"}
+    headers = {"User-Agent": "Nox/1.0 openclaw@vanhellsing.tech"}
 
     while True:
         for feed_type, sec_url in SEC_FEEDS:
-            try:
-                response = _http_session.get(sec_url, headers=headers, timeout=HTTP_TIMEOUT)
-                if response.status_code != 200:
-                    print(f"[WARN] [HEARTBEAT] SEC {feed_type} feed returned {response.status_code}.", flush=True)
-                    continue
+            response = fetch_with_retry(sec_url, source=f"SEC radar:{feed_type}", headers=headers, timeout=HTTP_TIMEOUT)
+            if response is None:
+                print(f"[WARN] [HEARTBEAT] SEC {feed_type} feed unreachable after retries.", flush=True)
+                continue
+            if response.status_code != 200:
+                print(f"[WARN] [HEARTBEAT] SEC {feed_type} feed returned {response.status_code}.", flush=True)
+                continue
 
+            try:
                 root = ET.fromstring(response.content)
                 ns = {'atom': 'http://www.w3.org/2005/Atom'}
                 for entry in root.findall('atom:entry', ns):
@@ -2445,12 +2603,15 @@ def resolve_primary_document(index_url: str, headers: dict, filing_type: str = "
     We look for a row whose Type column is exactly '8-K' and return that
     document's href. Falls back to the first .htm file if no typed match.
     """
-    try:
-        idx_res = _http_session.get(index_url, headers=headers, timeout=HTTP_TIMEOUT)
-        if idx_res.status_code != 200:
-            print(f"[WARN] [HEARTBEAT] Index page returned {idx_res.status_code}: {index_url}", flush=True)
-            return None
+    idx_res = fetch_with_retry(index_url, source=f"SEC index page:{index_url}", headers=headers, timeout=HTTP_TIMEOUT)
+    if idx_res is None:
+        print(f"[WARN] [HEARTBEAT] Index page unreachable after retries: {index_url}", flush=True)
+        return None
+    if idx_res.status_code != 200:
+        print(f"[WARN] [HEARTBEAT] Index page returned {idx_res.status_code}: {index_url}", flush=True)
+        return None
 
+    try:
         soup = BeautifulSoup(idx_res.text, "html.parser")
         base_url = "https://www.sec.gov"
 
@@ -2515,7 +2676,6 @@ def analyze_and_alert(ticker: str, payload: str, filing_type: str, context: str 
             bot.send_message(CHAT_ID, chunk, parse_mode='Markdown')
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] Analysis/alerting failed for {ticker}: {e}", flush=True)
-        _log_parsing_failure(ticker, filing_type, str(e))
         bot.send_message(CHAT_ID, f"⚠️ Analysis failed for {ticker} filing.", parse_mode='Markdown')
 
 
@@ -2579,7 +2739,7 @@ def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8
     3.  Routes to Heavyweight Lane (background thread, chunked analysis) for
         larger documents to prevent blocking the main SEC polling loop.
     """
-    headers = {"User-Agent": "Nox/1.0 fairydestroyasaur856@gmail.com"}
+    headers = {"User-Agent": "Nox/1.0 openclaw@vanhellsing.tech"}
     try:
         primary_url = resolve_primary_document(filing_url, headers, filing_type)
         if not primary_url:
@@ -2587,7 +2747,10 @@ def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8
             return
 
         print(f"[INFO] [HEARTBEAT] Fetching primary {filing_type} doc for {ticker}: {primary_url}", flush=True)
-        doc_res = _http_session.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
+        doc_res = fetch_with_retry(primary_url, source=f"SEC {filing_type} doc:{ticker}", headers=headers, timeout=HTTP_TIMEOUT)
+        if doc_res is None:
+            print(f"[WARN] [HEARTBEAT] Primary doc unreachable for {ticker} after retries, skipping.", flush=True)
+            return
         if doc_res.status_code != 200:
             return
 
@@ -2635,208 +2798,8 @@ def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8
                 daemon=True
             ).start()
 
-        # --- WS7: Information Lag Window ---
-        # For Chinese ADR 6-K filings only: check whether Chinese retail media has
-        # already covered this ticker. If not, the lag window is open — we have an
-        # edge before Chinese retail discovers the disclosure.
-        if filing_type == "6-K" and ticker in CHINESE_ADRS:
-            # Quick lexicon materiality score from the dense payload text
-            _BULLISH_W = {"beat":1.0,"surge":1.0,"soar":1.0,"rally":0.9,"jump":0.8,
-                          "gain":0.6,"profit":0.5,"growth":0.5,"approval":0.7,"record":0.7}
-            _BEARISH_W = {"miss":-1.0,"plunge":-1.0,"crash":-1.0,"slump":-0.9,
-                          "drop":-0.7,"warn":-0.8,"loss":-0.6,"default":-0.9}
-            _NEG = {"not","no","without","fails","fail","denies","denied"}
-            _tok_re = re.compile(r"[a-z']+")
-            toks = _tok_re.findall(dense_payload[:4000].lower())
-            raw = 0.0
-            for _i, _t in enumerate(toks):
-                _w = _BULLISH_W.get(_t) or _BEARISH_W.get(_t)
-                if _w and _i > 0 and toks[_i - 1] in _NEG:
-                    _w = -_w
-                if _w:
-                    raw += _w
-            materiality = min(1.0, abs(raw) / 3.0)
-
-            presence = _check_lag_window_for_ticker(ticker)
-            if presence.get("lag_open", False) and materiality >= 0.25:
-                win_id = _lag_open_window(ticker, filing_url, materiality)
-                msg = (
-                    f"⏳ *[WS7] LAG WINDOW OPEN — {ticker}*\n"
-                    f"6-K filed — not yet trending on CN media\n"
-                    f"Materiality: *{materiality:.2f}*\n"
-                    f"[Filing Index]({filing_url})"
-                )
-                try:
-                    bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
-                    print(f"[INFO] [HEARTBEAT] WS7 lag window opened for {ticker} (id={win_id})", flush=True)
-                except Exception as _te:
-                    print(f"[WARN] [HEARTBEAT] WS7 Telegram send failed: {_te}", flush=True)
-            elif presence:
-                print(f"[INFO] [HEARTBEAT] WS7: {ticker} 6-K already in CN media, no lag window.", flush=True)
-
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] Failed to process automated filing for {ticker}: {e}", flush=True)
-
-# --- 5.7 WEEKLY PERFORMANCE REPORT ---
-# Scheduled to fire at 16:00 ET on the last NYSE trading day of each week
-# (Friday, or Thursday when Friday is a holiday — determined dynamically by
-# pandas_market_calendars so no manual calendar updates are ever needed).
-# The scheduler is re-evaluated at 00:01 UTC each night; the job is only
-# registered on the correct day, then cleared the following morning.
-#
-# Data sources: memory_bank.db tables trade_history, trade_predictions,
-# parsing_failures.  All queries wrapped in db_lock (RULE-016).
-
-def get_weekly_stats() -> dict:
-    """
-    Query memory_bank.db for the current calendar week's performance metrics.
-
-    Returns a dict with keys:
-        week_label, trade_count, total_pnl, wins, losses,
-        win_loss_ratio, mae, calibration_score, parsing_failure_count
-    On DB error returns {week_label, error}.
-    """
-    et      = ZoneInfo("America/New_York")
-    now_et  = datetime.now(et)
-    monday  = (now_et - timedelta(days=now_et.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    week_label    = monday.strftime("%b %d") + " – " + now_et.strftime("%b %d, %Y")
-    week_start_str = monday.strftime("%Y-%m-%d %H:%M:%S")
-
-    try:
-        with db_lock:
-            with sqlite3.connect(DB_PATH) as conn:
-                c = conn.cursor()
-
-                # ── Total P&L and Win/Loss breakdown ─────────────────────────
-                c.execute(
-                    "SELECT pnl FROM trade_history "
-                    "WHERE timestamp >= ? AND pnl IS NOT NULL",
-                    (week_start_str,),
-                )
-                pnl_rows    = [r[0] for r in c.fetchall()]
-                trade_count = len(pnl_rows)
-                total_pnl   = sum(pnl_rows)
-                wins        = sum(1 for p in pnl_rows if p > 0)
-                losses      = trade_count - wins
-                win_loss_ratio = wins / losses if losses > 0 else float(wins)
-
-                # ── MAE: predicted vs actual outcome ─────────────────────────
-                # Rows are written by workstreams that log forecasts; the table
-                # starts empty and MAE is reported as N/A until data accumulates.
-                c.execute(
-                    "SELECT predicted_outcome, actual_outcome "
-                    "FROM trade_predictions "
-                    "WHERE timestamp >= ? "
-                    "  AND predicted_outcome IS NOT NULL "
-                    "  AND actual_outcome    IS NOT NULL",
-                    (week_start_str,),
-                )
-                pred_rows = c.fetchall()
-                if pred_rows:
-                    mae = sum(abs(p - a) for p, a in pred_rows) / len(pred_rows)
-                    # Calibration: 1 = perfect (MAE=0), 0 = total miscalibration
-                    calibration_score = max(0.0, min(1.0, 1.0 - mae))
-                else:
-                    mae               = None
-                    calibration_score = None
-
-                # ── SEC parsing failures (all form types) ────────────────────
-                c.execute(
-                    "SELECT COUNT(*) FROM parsing_failures WHERE timestamp >= ?",
-                    (week_start_str,),
-                )
-                parsing_failure_count = c.fetchone()[0] or 0
-
-        return {
-            "week_label":            week_label,
-            "trade_count":           trade_count,
-            "total_pnl":             total_pnl,
-            "wins":                  wins,
-            "losses":                losses,
-            "win_loss_ratio":        win_loss_ratio,
-            "mae":                   mae,
-            "calibration_score":     calibration_score,
-            "parsing_failure_count": parsing_failure_count,
-        }
-    except Exception as e:
-        logger.error(f"get_weekly_stats failed: {e}")
-        return {"week_label": week_label, "error": str(e)}
-
-
-def format_weekly_report(stats: dict) -> str:
-    """
-    Render weekly performance stats as a Telegram-ready Markdown message.
-
-    Uses a monospace code block for the table — pipe-based Markdown tables
-    are not supported in Telegram's Markdown mode; a code block gives clean
-    fixed-width rendering without requiring MarkdownV2 escaping.
-    """
-    if "error" in stats:
-        return f"⚠️ *Weekly Report Error*\n`{stats['error']}`"
-
-    pnl_str = (
-        f"+${stats['total_pnl']:.2f}"
-        if stats["total_pnl"] >= 0
-        else f"-${abs(stats['total_pnl']):.2f}"
-    )
-    if stats["losses"] > 0:
-        wl_ratio_str = f"{stats['win_loss_ratio']:.2f}"
-    elif stats["wins"] > 0:
-        wl_ratio_str = "∞  (all wins)"
-    else:
-        wl_ratio_str = "N/A"
-
-    mae_str = f"{stats['mae']:.4f}" if stats["mae"] is not None else "N/A"
-    cal_str = (
-        f"{stats['calibration_score']:.1%}"
-        if stats["calibration_score"] is not None
-        else "N/A — no predictions logged"
-    )
-
-    W    = 22   # metric label column width
-    rows = [
-        ("Total P&L",            pnl_str),
-        ("Trades",               f"{stats['trade_count']}  "
-                                 f"({stats['wins']}W / {stats['losses']}L)"),
-        ("Win/Loss Ratio",       wl_ratio_str),
-        ("MAE (Pred vs Actual)", mae_str),
-        ("Calibration Score",    cal_str),
-        ("8-K Parse Failures",   str(stats["parsing_failure_count"])),
-    ]
-    header = f"{'Metric':<{W}}│ Value"
-    sep    = "─" * W + "┼" + "─" * 16
-    body   = "\n".join(f"{label:<{W}}│ {value}" for label, value in rows)
-    table  = f"```\n{header}\n{sep}\n{body}\n```"
-
-    return (
-        f"📊 *NOX WEEKLY PERFORMANCE REPORT*\n"
-        f"────────────────────────\n"
-        f"*Week:* {stats['week_label']}\n\n"
-        + table
-    )
-
-
-def run_weekly_performance_report() -> None:
-    """
-    Build and deliver the weekly performance report via Telegram.
-    smart_split ensures the message never exceeds Telegram's 4096-char cap.
-    """
-    try:
-        logger.info("Weekly performance report building...")
-        stats  = get_weekly_stats()
-        report = format_weekly_report(stats)
-        for chunk in smart_split(report, chars_per_string=4096):
-            bot.send_message(CHAT_ID, chunk, parse_mode="Markdown")
-        logger.info("Weekly performance report delivered.")
-    except Exception as e:
-        logger.error(f"run_weekly_performance_report failed: {e}")
-        try:
-            bot.send_message(CHAT_ID, f"⚠️ Weekly report failed: {e}")
-        except Exception:
-            pass
-
 
 # --- 5.5 MONTHLY TRADING JOURNAL ---
 # Generates a structured markdown report from the SQLite database and writes it
@@ -3055,6 +3018,190 @@ def run_monthly_journal():
         logger.error(f"Monthly journal failed: {e}")
 
 
+# ── End-of-Day / End-of-Week account summaries ───────────────────────────────
+# These read the canonical trade_history ledger (written by the execution engine)
+# plus a live Alpaca account snapshot, and are pushed to Telegram at the close.
+# Before this existed there was no EOD/EOW trade report at all — only a 9 AM news
+# briefing and a monthly journal.
+
+def _fetch_account_and_positions():
+    """Return (account_dict, positions_list) from Alpaca, or (None, None)."""
+    headers = {'APCA-API-KEY-ID': ALPACA_API, 'APCA-API-SECRET-KEY': ALPACA_SEC}
+    try:
+        acc = requests.get(f'{ALPACA_BROKER_URL}/v2/account',
+                           headers=headers, timeout=HTTP_TIMEOUT)
+        pos = requests.get(f'{ALPACA_BROKER_URL}/v2/positions',
+                           headers=headers, timeout=HTTP_TIMEOUT)
+        if acc.status_code != 200 or pos.status_code != 200:
+            return None, None
+        a, p = acc.json(), pos.json()
+        if not isinstance(a, dict) or not isinstance(p, list):
+            return None, None
+        return a, p
+    except Exception as e:
+        logger.warning(f"account snapshot fetch failed: {e}")
+        return None, None
+
+
+def _period_start_utc(scope: str) -> str:
+    """
+    UTC 'YYYY-MM-DD HH:MM:SS' string for the start of the reporting window.
+    'day'  → midnight ET today; 'week' → most recent Monday 00:00 ET.
+    trade_history.timestamp is stored in UTC, so we compare against a UTC bound.
+    """
+    et  = ZoneInfo("America/New_York")
+    utc = ZoneInfo("UTC")
+    now_et = datetime.now(et)
+    start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    if scope == "week":
+        start_et = start_et - timedelta(days=now_et.weekday())  # back to Monday
+    return start_et.astimezone(utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def generate_activity_report(scope: str) -> str:
+    """Build a full account-summary report ('day' or 'week') as a Markdown string."""
+    et = ZoneInfo("America/New_York")
+    now = datetime.now(et)
+    title = "End-of-Day" if scope == "day" else "End-of-Week"
+    period_desc = now.strftime("%A, %Y-%m-%d") if scope == "day" \
+        else f"week ending {now.strftime('%A, %Y-%m-%d')}"
+    start_utc = _period_start_utc(scope)
+
+    # ── Live account snapshot ──────────────────────────────────────────────
+    acc, positions = _fetch_account_and_positions()
+    if acc is not None:
+        equity     = float(acc.get('portfolio_value', 0) or 0)
+        last_equity = float(acc.get('last_equity', 0) or 0)
+        cash       = float(acc.get('cash', 0) or 0)
+        buying_pw  = float(acc.get('buying_power', 0) or 0)
+        day_change = equity - last_equity
+        day_pct    = (day_change / last_equity * 100) if last_equity else 0.0
+        acct_block = (
+            f"• *Equity:* ${equity:,.2f}\n"
+            f"• *Since prior close:* ${day_change:+,.2f} ({day_pct:+.2f}%)\n"
+            f"• *Cash:* ${cash:,.2f}  |  *Buying power:* ${buying_pw:,.2f}"
+        )
+        open_positions = positions or []
+    else:
+        acct_block = "_⚠️ Could not fetch live account snapshot from Alpaca._"
+        open_positions = []
+
+    # ── Open positions w/ unrealized P&L ───────────────────────────────────
+    if open_positions:
+        pos_lines = []
+        total_unreal = 0.0
+        for p in open_positions:
+            if not isinstance(p, dict):
+                continue
+            upl = float(p.get('unrealized_pl', 0) or 0)
+            total_unreal += upl
+            uplpc = float(p.get('unrealized_plpc', 0) or 0) * 100
+            pos_lines.append(
+                f"• {p.get('symbol','?')} x{p.get('qty','?')} @ "
+                f"${float(p.get('avg_entry_price',0) or 0):.2f} → "
+                f"${float(p.get('current_price',0) or 0):.2f}  "
+                f"(${upl:+,.2f} / {uplpc:+.1f}%)"
+            )
+        pos_block = "\n".join(pos_lines) + f"\n*Total unrealized:* ${total_unreal:+,.2f}"
+    else:
+        pos_block = "_No open positions._"
+
+    # ── Realized trades in the window (from the ledger) ────────────────────
+    with db_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT ticker, action, asset_class, quantity, price, pnl, detail, timestamp "
+                "FROM trade_history WHERE timestamp >= ? ORDER BY id ASC",
+                (start_utc,),
+            )
+            trades = c.fetchall()
+
+    entries = [t for t in trades if t[1] in ("BUY", "OPEN")]
+    exits   = [t for t in trades if t[1] in ("SELL", "CLOSE")]
+    realized = sum((t[5] or 0.0) for t in exits)
+    wins   = [t for t in exits if (t[5] or 0.0) > 0]
+    losses = [t for t in exits if (t[5] or 0.0) < 0]
+    win_rate = (len(wins) / len(exits) * 100) if exits else 0.0
+
+    def _class_pnl(cls):
+        return sum((t[5] or 0.0) for t in exits if (t[2] or "equity") == cls)
+    eq_pnl, opt_pnl = _class_pnl("equity"), _class_pnl("option")
+
+    def _fmt_trades(rows, n=8):
+        if not rows:
+            return "_None_"
+        out = []
+        for ticker, action, cls, qty, price, pnl, detail, ts in rows[:n]:
+            kind = "opt" if (cls or "") == "option" else "eq"
+            pnl_str = f" | ${pnl:+.2f}" if (action in ("SELL", "CLOSE") and pnl is not None) else ""
+            out.append(f"• `{str(ts)[11:16]}` {action} {ticker} [{kind}] "
+                       f"x{qty:g} @ ${price:.2f}{pnl_str}")
+        extra = f"\n_…and {len(rows) - n} more_" if len(rows) > n else ""
+        return "\n".join(out) + extra
+
+    best  = max(exits, key=lambda t: (t[5] or 0.0), default=None)
+    worst = min(exits, key=lambda t: (t[5] or 0.0), default=None)
+    def _one(t):
+        return f"{t[0]} {t[1]} ${t[5]:+.2f}" if t else "—"
+
+    report = (
+        f"📊 *{title} Report — {period_desc}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"*Account*\n{acct_block}\n\n"
+        f"*Trades this {'day' if scope == 'day' else 'week'}*\n"
+        f"• Entries: {len(entries)}  |  Exits: {len(exits)}\n"
+        f"• Realized P&L: ${realized:+,.2f}\n"
+        f"• Win rate: {win_rate:.0f}%  ({len(wins)}W / {len(losses)}L)\n"
+        f"• By class: equity ${eq_pnl:+,.2f}  |  options ${opt_pnl:+,.2f}\n"
+        f"• Best: {_one(best)}  |  Worst: {_one(worst)}\n\n"
+        f"*Open Positions*\n{pos_block}\n\n"
+        f"*Entries*\n{_fmt_trades(entries)}\n\n"
+        f"*Exits*\n{_fmt_trades(exits)}\n\n"
+        f"_Generated {now.strftime('%Y-%m-%d %H:%M ET')} from the trade ledger._"
+    )
+    return report
+
+
+def _send_report(scope: str):
+    """Generate and Telegram-push an EOD/EOW report, chunking to Telegram limits."""
+    try:
+        text = generate_activity_report(scope)
+        for chunk in smart_split(text, chars_per_string=4096):
+            bot.send_message(CHAT_ID, chunk, parse_mode="Markdown")
+        logger.info(f"{scope}-report sent.")
+    except Exception as e:
+        logger.error(f"{scope}-report failed: {e}")
+        try:
+            bot.send_message(CHAT_ID, f"⚠️ {scope.upper()} report failed to generate: {e}")
+        except Exception:
+            pass
+
+
+def run_eod_report():
+    """End-of-day summary. Scheduled ~16:05 ET on trading days."""
+    if datetime.now(ZoneInfo("America/New_York")).weekday() >= 5:
+        return  # skip weekends
+    _send_report("day")
+
+
+def run_eow_report():
+    """End-of-week summary. Scheduled ~16:10 ET Friday."""
+    _send_report("week")
+
+
+@bot.message_handler(commands=['eod'])
+def cmd_eod(message):
+    """/eod — on-demand end-of-day account summary."""
+    _send_report("day")
+
+
+@bot.message_handler(commands=['eow'])
+def cmd_eow(message):
+    """/eow — on-demand end-of-week account summary."""
+    _send_report("week")
+
+
 @bot.message_handler(commands=['monthly_report'])
 def cmd_monthly_report(message):
     """
@@ -3105,6 +3252,182 @@ def cmd_monthly_report(message):
         bot.reply_to(message, f"⚠️ Failed: {str(e)}")
 
 
+# --- 5.5 WEEKLY PERFORMANCE REPORT (win/loss, MAE, calibration, parsing failures) ---
+# Complementary to /eow (trade-ledger equity report): this one tracks the
+# trade_predictions (predicted vs actual outcome MAE/calibration) and
+# parsing_failures tables, which /eow does not surface.
+
+def get_weekly_stats() -> dict:
+    """
+    Query memory_bank.db for the current calendar week's performance metrics.
+
+    Returns a dict with keys:
+        week_label, trade_count, total_pnl, wins, losses,
+        win_loss_ratio, mae, calibration_score, parsing_failure_count
+    On DB error returns {week_label, error}.
+    """
+    et      = ZoneInfo("America/New_York")
+    now_et  = datetime.now(et)
+    monday  = (now_et - timedelta(days=now_et.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    week_label    = monday.strftime("%b %d") + " - " + now_et.strftime("%b %d, %Y")
+    week_start_str = monday.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+
+                # -- Total P&L and Win/Loss breakdown --
+                c.execute(
+                    "SELECT pnl FROM trade_history "
+                    "WHERE timestamp >= ? AND pnl IS NOT NULL",
+                    (week_start_str,),
+                )
+                pnl_rows    = [r[0] for r in c.fetchall()]
+                trade_count = len(pnl_rows)
+                total_pnl   = sum(pnl_rows)
+                wins        = sum(1 for p in pnl_rows if p > 0)
+                losses      = trade_count - wins
+                win_loss_ratio = wins / losses if losses > 0 else float(wins)
+
+                # -- MAE: predicted vs actual outcome --
+                # Rows are written by workstreams that log forecasts; the table
+                # starts empty and MAE is reported as N/A until data accumulates.
+                c.execute(
+                    "SELECT predicted_outcome, actual_outcome "
+                    "FROM trade_predictions "
+                    "WHERE timestamp >= ? "
+                    "  AND predicted_outcome IS NOT NULL "
+                    "  AND actual_outcome    IS NOT NULL",
+                    (week_start_str,),
+                )
+                pred_rows = c.fetchall()
+                if pred_rows:
+                    mae = sum(abs(p - a) for p, a in pred_rows) / len(pred_rows)
+                    # Calibration: 1 = perfect (MAE=0), 0 = total miscalibration
+                    calibration_score = max(0.0, min(1.0, 1.0 - mae))
+                else:
+                    mae               = None
+                    calibration_score = None
+
+                # -- SEC parsing failures (all form types) --
+                c.execute(
+                    "SELECT COUNT(*) FROM parsing_failures WHERE timestamp >= ?",
+                    (week_start_str,),
+                )
+                parsing_failure_count = c.fetchone()[0] or 0
+
+        return {
+            "week_label":            week_label,
+            "trade_count":           trade_count,
+            "total_pnl":             total_pnl,
+            "wins":                  wins,
+            "losses":                losses,
+            "win_loss_ratio":        win_loss_ratio,
+            "mae":                   mae,
+            "calibration_score":     calibration_score,
+            "parsing_failure_count": parsing_failure_count,
+        }
+    except Exception as e:
+        logger.error(f"get_weekly_stats failed: {e}")
+        return {"week_label": week_label, "error": str(e)}
+
+
+def format_weekly_report(stats: dict) -> str:
+    """
+    Render weekly performance stats as a Telegram-ready Markdown message.
+
+    Uses a monospace code block for the table — pipe-based Markdown tables
+    are not supported in Telegram's Markdown mode; a code block gives clean
+    fixed-width rendering without requiring MarkdownV2 escaping.
+    """
+    if "error" in stats:
+        return f"⚠️ *Weekly Report Error*\n`{stats['error']}`"
+
+    pnl_str = (
+        f"+${stats['total_pnl']:.2f}"
+        if stats["total_pnl"] >= 0
+        else f"-${abs(stats['total_pnl']):.2f}"
+    )
+    if stats["losses"] > 0:
+        wl_ratio_str = f"{stats['win_loss_ratio']:.2f}"
+    elif stats["wins"] > 0:
+        wl_ratio_str = "inf (all wins)"
+    else:
+        wl_ratio_str = "N/A"
+
+    mae_str = f"{stats['mae']:.4f}" if stats["mae"] is not None else "N/A"
+    cal_str = (
+        f"{stats['calibration_score']:.1%}"
+        if stats["calibration_score"] is not None
+        else "N/A — no predictions logged"
+    )
+
+    W    = 22   # metric label column width
+    rows = [
+        ("Total P&L",            pnl_str),
+        ("Trades",               f"{stats['trade_count']}  "
+                                 f"({stats['wins']}W / {stats['losses']}L)"),
+        ("Win/Loss Ratio",       wl_ratio_str),
+        ("MAE (Pred vs Actual)", mae_str),
+        ("Calibration Score",    cal_str),
+        ("8-K Parse Failures",   str(stats["parsing_failure_count"])),
+    ]
+    header = f"{'Metric':<{W}}| Value"
+    sep    = "-" * W + "+" + "-" * 16
+    body   = "\n".join(f"{label:<{W}}| {value}" for label, value in rows)
+    table  = f"```\n{header}\n{sep}\n{body}\n```"
+
+    return (
+        f"📊 *NOX WEEKLY PERFORMANCE REPORT*\n"
+        f"------------------------\n"
+        f"*Week:* {stats['week_label']}\n\n"
+        + table
+    )
+
+
+def run_weekly_performance_report() -> None:
+    """
+    Build and deliver the weekly performance report via Telegram.
+    smart_split ensures the message never exceeds Telegram's 4096-char cap.
+    """
+    try:
+        logger.info("Weekly performance report building...")
+        stats  = get_weekly_stats()
+        report = format_weekly_report(stats)
+        for chunk in smart_split(report, chars_per_string=4096):
+            bot.send_message(CHAT_ID, chunk, parse_mode="Markdown")
+        logger.info("Weekly performance report delivered.")
+    except Exception as e:
+        logger.error(f"run_weekly_performance_report failed: {e}")
+        try:
+            bot.send_message(CHAT_ID, f"⚠️ Weekly report failed: {e}")
+        except Exception:
+            pass
+
+
+@bot.message_handler(commands=['weekly_report'])
+def trigger_weekly_report(message):
+    """
+    /weekly_report — Manually triggers the win/loss + MAE/calibration weekly
+    performance report on demand (distinct from /eow, which reports the
+    trade-ledger equity summary). Runs in a background thread so the bot
+    stays responsive during DB queries.
+    """
+    try:
+        bot.reply_to(
+            message,
+            "⚙️ *Building weekly performance report...*",
+            parse_mode='Markdown',
+        )
+        threading.Thread(target=run_weekly_performance_report, daemon=True).start()
+    except Exception as e:
+        print(f"[ERROR] [HEARTBEAT] /weekly_report command failed: {e}", flush=True)
+        bot.reply_to(message, f"⚠️ Failed to trigger weekly report: {str(e)}")
+
+
 # --- 5.5 INTERNAL IV ENDPOINT (WS1 Contradiction Vector data source) ---
 # The heartbeat already holds the Alpaca options-chain plumbing, so it is the
 # natural place to expose live IV skew. A tiny stdlib HTTP server (no Flask/
@@ -3152,29 +3475,6 @@ def _start_iv_http_server():
                 self._send(200, fetch_iv_skew(ticker))
                 return
 
-            if parsed.path == "/iv/rank":
-                qs = parse_qs(parsed.query)
-                ticker = (qs.get("ticker", [""])[0] or "").upper().strip()
-                if not ticker:
-                    self._send(400, {"error": "missing ?ticker="})
-                    return
-                result = calculate_iv_rank(ticker)
-                # Normalise keys for C++ consumer: return iv_rank as 0–100 percentile,
-                # iv_level and iv_min/max as raw decimals (same unit as HRV-30).
-                payload = {
-                    "ticker":      ticker,
-                    "iv_rank":     round((result.get("iv_rank") or 0.0) * 100.0, 1),
-                    "iv_level":    round(result.get("current_iv") or 0.0, 4),
-                    "iv_min_52w":  round(result.get("iv_min") or 0.0, 4),
-                    "iv_max_52w":  round(result.get("iv_max") or 0.0, 4),
-                    "data_points": result.get("data_points", 0),
-                    "days_available": result.get("days_available", 0),
-                    "method":      result.get("method", "error"),
-                    "error":       result.get("error"),
-                }
-                self._send(200, payload)
-                return
-
             self._send(404, {"error": "not found"})
 
         def log_message(self, *args):  # silence default stderr access logging
@@ -3196,9 +3496,4 @@ if __name__ == "__main__":
     threading.Thread(target=_start_iv_http_server, daemon=True).start()
     threading.Thread(target=_lag_monitor_loop, daemon=True).start()  # WS7
 
-    while True:
-        try:
-            bot.infinity_polling(none_stop=True, timeout=30, long_polling_timeout=20)
-        except Exception as e:
-            print(f"[CRITICAL] [HEARTBEAT] Telegram polling crashed: {e}. Restarting in 10s…", flush=True)
-            time.sleep(10)
+    bot.infinity_polling()

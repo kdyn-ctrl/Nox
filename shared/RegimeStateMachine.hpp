@@ -3,7 +3,6 @@
 #include <iostream>
 #include <string>
 #include <cmath>
-#include <cstdlib>
 #include <map>
 
 // 1. Strictly define the possible market states
@@ -36,11 +35,11 @@ enum class SignalCategory {
 class HalfLifeDecay {
 public:
     HalfLifeDecay() {
-        // Half-lives (hours) loaded from env at startup → lambda = ln2 / H.
-        set_half_life_hours(SignalCategory::GEOPOLITICAL,   env_hours("DECAY_GEO",      6.0));
-        set_half_life_hours(SignalCategory::MACRO_ECONOMIC, env_hours("DECAY_MACRO",    48.0));
-        set_half_life_hours(SignalCategory::EARNINGS,       env_hours("DECAY_EARNINGS", 72.0));
-        set_half_life_hours(SignalCategory::TECHNICAL,      env_hours("DECAY_TECHNICAL",12.0));
+        // Default half-lives (hours) → lambda = ln2 / H.
+        set_half_life_hours(SignalCategory::GEOPOLITICAL,   6.0);
+        set_half_life_hours(SignalCategory::MACRO_ECONOMIC, 48.0);
+        set_half_life_hours(SignalCategory::EARNINGS,       72.0);
+        set_half_life_hours(SignalCategory::TECHNICAL,      12.0);
         set_half_life_hours(SignalCategory::GENERIC,        24.0);
     }
 
@@ -73,12 +72,6 @@ private:
     static constexpr double ln2_ = 0.6931471805599453;
     std::map<SignalCategory, double> lambda_;
     bool bypass_ = false;
-
-    static double env_hours(const char* var, double fallback) {
-        const char* s = std::getenv(var);
-        if (!s || *s == '\0') return fallback;
-        try { return std::stod(s); } catch (...) { return fallback; }
-    }
 };
 
 // 2. Define what the Risk Agent receives based on the state

@@ -93,10 +93,18 @@ def detect_insider_clusters(watchlist: List[str]) -> Dict[str, Any]:
     """
     Top-level entry point. Scans the watchlist for insider buy clusters and
     returns the signal JSON written to the shared data bus.
+
+    `data_gaps` lists tickers whose SEC Form 4 feed could not be fetched
+    after retries — these are excluded from the scan, so their absence from
+    `signals` must NOT be read as "no insider activity".
     """
     signals = []
+    data_gaps = []
     for ticker in watchlist:
         filings = fetch_form4_filings(ticker)
+        if filings is None:
+            data_gaps.append(ticker)
+            continue
         if not filings:
             continue
         cluster = _find_cluster(_collect_buys(filings))
@@ -115,10 +123,18 @@ def detect_insider_clusters(watchlist: List[str]) -> Dict[str, Any]:
         "bypass": BYPASS,
         "signal_count": len(signals),
         "signals": signals,
+        "data_gaps": data_gaps,
+        "complete": not data_gaps,
     }
     print(
         f"[INFO] [INSIDER-CLUSTER] Scanned {len(watchlist)} ticker(s); "
         f"{len(signals)} cluster signal(s).",
         flush=True,
     )
+    if data_gaps:
+        print(
+            f"[WARN] [INSIDER-CLUSTER] SEC Form 4 fetch failed for: {', '.join(data_gaps)} "
+            f"— results are INCOMPLETE for these tickers.",
+            flush=True,
+        )
     return payload

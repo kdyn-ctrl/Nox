@@ -19,10 +19,10 @@ source WS4's decay hook was built for.
 import os
 import statistics
 import math
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple
 
-import requests
+from retry_utils import fetch_with_retry
 
 HTTP_TIMEOUT = (5, 10)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET_TOKEN", "")
@@ -78,7 +78,7 @@ def _is_anchor_event(headline: str, summary: str = "") -> bool:
     return any(kw in text for kw in _ANCHOR_KEYWORDS)
 
 
-def _detect_manipulation_theme(headline: str, summary: str = "") -> tuple[bool, str]:
+def _detect_manipulation_theme(headline: str, summary: str = "") -> Tuple[bool, str]:
     """
     Flags articles describing artificial/coordinated moves (short squeezes, buybacks, etc.)
     Returns (is_manipulated, theme_tag).
@@ -126,18 +126,18 @@ def _compute_decay_weight(category: str, timestamp: Any) -> float:
 
 def fetch_iv_skew(ticker: str) -> Dict[str, Any]:
     """Query the heartbeat's internal IV skew endpoint for one ticker."""
-    try:
-        resp = requests.get(
-            f"{HEARTBEAT_BASE}/iv/skew",
-            params={"ticker": ticker},
-            headers={"X-Nox-Token": WEBHOOK_SECRET},
-            timeout=HTTP_TIMEOUT,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-        return {"ticker": ticker, "method": "error", "error": f"HTTP {resp.status_code}"}
-    except requests.RequestException as e:
-        return {"ticker": ticker, "method": "error", "error": str(e)}
+    resp = fetch_with_retry(
+        f"{HEARTBEAT_BASE}/iv/skew",
+        source=f"IV skew:{ticker}",
+        params={"ticker": ticker},
+        headers={"X-Nox-Token": WEBHOOK_SECRET},
+        timeout=HTTP_TIMEOUT,
+    )
+    if resp is None:
+        return {"ticker": ticker, "method": "error", "error": "heartbeat unreachable after retries"}
+    if resp.status_code == 200:
+        return resp.json()
+    return {"ticker": ticker, "method": "error", "error": f"HTTP {resp.status_code}"}
 
 
 def aggregate_sentiment(news: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -146,13 +146,16 @@ def aggregate_sentiment(news: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
     bucket keyed by MARKET_PROXY built from every scored headline.
 
     Applies:
-    - Decay weighting (recent articles weighted higher)
+    - Decay weighting (recent articles weighted higher, per-category half-life)
     - Per-source sentiment breakdown (see source disagreement)
     - Anchor event detection (major structural news)
     - Manipulation theme flagging (reduce weight on artificial moves)
 
-    Returns {ticker: {"score", "magnitude", "category", "count", "latest_ts", "sources": {...},
-                      "anchor_event": bool, "manipulation_flag": str|null}}.
+    Returns {ticker: {"score", "magnitude", "category", "count", "latest_ts",
+                      "sources": {...}, "anchor_event": bool,
+                      "manipulation_theme": str|None}}
+    plus a special "_anchor_events" key (List[str] of anchor headlines) that
+    is NOT a per-ticker bucket — callers must pop/skip it before iterating.
     score is decay + magnitude + anchor-adjusted weighted mean.
     """
     buckets: Dict[str, Dict[str, Any]] = {}
@@ -161,7 +164,6 @@ def aggregate_sentiment(news: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
     market_category_votes: Dict[str, int] = {}
     market_latest_ts = None
     anchor_events: List[str] = []  # store headlines of anchor events
-    manipulation_flags: Dict[str, str] = {}  # ticker -> manipulation theme
 
     def _add(key: str, sent: Dict[str, Any], ts: Any, source: str, is_anchor: bool, manip_theme: str):
         b = buckets.setdefault(key, {
@@ -173,7 +175,7 @@ def aggregate_sentiment(news: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
 
         # Penalize manipulated signals: reduce weight if artificial
         manip_penalty = 0.5 if manip_theme else 1.0
-        w = max(sent.get("magnitude", 0.0), 1e-3) * decay * manip_penalty
+        w = max(sent.get("magnitude", 0.0), 1e-3) * decay * manip_penalty  # floor so zero-mag still counts
 
         b["_score_w"] += sent.get("score", 0.0) * w
         b["_w"] += w
@@ -187,9 +189,7 @@ def aggregate_sentiment(news: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
             b["manip_theme"] = manip_theme
 
         # Track per-source sentiment for this ticker
-        src = b["sources"].setdefault(source, {
-            "_score_w": 0.0, "_w": 0.0, "count": 0,
-        })
+        src = b["sources"].setdefault(source, {"_score_w": 0.0, "_w": 0.0, "count": 0})
         src["_score_w"] += sent.get("score", 0.0) * w
         src["_w"] += w
         src["count"] += 1
@@ -205,10 +205,8 @@ def aggregate_sentiment(news: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
         headline = item.get("headline", "")
         summary = item.get("summary", "")
 
-        # Check for anchor events and manipulation themes
         is_anchor = _is_anchor_event(headline, summary)
         is_manip, manip_theme = _detect_manipulation_theme(headline, summary)
-
         if is_anchor:
             anchor_events.append(headline)
 
@@ -218,11 +216,8 @@ def aggregate_sentiment(news: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
         market_category_votes[cat] = market_category_votes.get(cat, 0) + 1
         if ts and (market_latest_ts is None or str(ts) > str(market_latest_ts)):
             market_latest_ts = ts
-
         for sym in (item.get("symbols") or []):
             _add(sym.upper(), sent, ts, source, is_anchor, manip_theme)
-            if is_manip and sym.upper() not in manipulation_flags:
-                manipulation_flags[sym.upper()] = manip_theme
 
     # Finalise per-ticker weighted means and per-source breakdown.
     out: Dict[str, Dict[str, Any]] = {}
@@ -230,14 +225,10 @@ def aggregate_sentiment(news: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
         score = b["_score_w"] / b["_w"] if b["_w"] > 0 else 0.0
         dominant = max(b["category_votes"], key=b["category_votes"].get)
 
-        # Compute per-source sentiment
         sources_out = {}
         for src_name, src_data in b["sources"].items():
             src_score = src_data["_score_w"] / src_data["_w"] if src_data["_w"] > 0 else 0.0
-            sources_out[src_name] = {
-                "score": round(src_score, 4),
-                "count": src_data["count"],
-            }
+            sources_out[src_name] = {"score": round(src_score, 4), "count": src_data["count"]}
 
         out[key] = {
             "score": round(score, 4),
@@ -266,7 +257,8 @@ def aggregate_sentiment(news: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
             "manipulation_theme": None,
         })
 
-    # Store anchor events globally for report
+    # Stored separately (not a per-ticker bucket) — run_contradiction_check
+    # pops this before iterating tickers.
     out["_anchor_events"] = anchor_events
     return out
 
@@ -353,11 +345,15 @@ def run_contradiction_check(news: List[Dict[str, Any]]) -> Dict[str, Any]:
     Produces the JSON written to the shared data bus.
     """
     sentiment = aggregate_sentiment(news)
+    # "_anchor_events" is a List[str] side-channel, not a per-ticker bucket —
+    # pop it before iterating tickers.
+    anchor_events = sentiment.pop("_anchor_events", [])
     results = [evaluate_ticker(t, s) for t, s in sentiment.items()]
     # Surface contradictions first for quick human/LLM scanning.
     results.sort(key=lambda r: 0 if r.get("verdict", "").startswith("CONTRADICT") else 1)
 
     contradictions = [r for r in results if r.get("verdict", "").startswith("CONTRADICT")]
+    data_gaps = [r["ticker"] for r in results if r.get("verdict") == "NO_DATA"]
     payload = {
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
         "bypass": BYPASS,
@@ -368,10 +364,19 @@ def run_contradiction_check(news: List[Dict[str, Any]]) -> Dict[str, Any]:
         "results": results,
         # WS4 feed: aged-decay input for the analyst.
         "sentiment_scores": to_sentiment_scores(results),
+        "anchor_events": anchor_events,
+        "data_gaps": data_gaps,
+        "complete": not data_gaps,
     }
     print(
         f"[INFO] [CONTRADICTION-VECTOR] Evaluated {len(results)} ticker(s); "
         f"{len(contradictions)} contradiction(s) flagged.",
         flush=True,
     )
+    if data_gaps:
+        print(
+            f"[WARN] [CONTRADICTION-VECTOR] IV skew unavailable for: {', '.join(data_gaps)} "
+            f"— verdicts for these tickers are NO_DATA, not a real signal.",
+            flush=True,
+        )
     return payload

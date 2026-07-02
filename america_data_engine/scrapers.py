@@ -7,12 +7,14 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 
+from retry_utils import fetch_with_retry
+
 # RULE-008: All HTTP calls use a (connect_timeout, read_timeout) tuple.
 HTTP_TIMEOUT = (5, 10)
 
 # SEC EDGAR requires a descriptive User-Agent or it returns 403. Match the
 # convention already used by the heartbeat's EDGAR scraper.
-SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "Nox/1.0 fairydestroyasaur856@gmail.com")
+SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "Nox/1.0 openclaw@vanhellsing.tech")
 
 # ---------------------------------------------------------------------------
 # WS1 — Headline sentiment scoring (Contradiction Vector input).
@@ -189,9 +191,13 @@ except EnvironmentError as e:
     sys.exit(1)
 
 
-def fetch_alpaca_news() -> List[Dict[str, Any]]:
+def fetch_alpaca_news() -> Optional[List[Dict[str, Any]]]:
     """
     Fetches the latest financial news from Alpaca's API.
+
+    Returns None if the fetch failed after retries (distinct from a
+    successful fetch that legitimately found zero articles, which returns
+    []) so callers can tell "Alpaca is down" apart from "a quiet news day".
     """
     url = "https://data.alpaca.markets/v1beta1/news"
     headers = {
@@ -202,8 +208,10 @@ def fetch_alpaca_news() -> List[Dict[str, Any]]:
         "limit": 10,
         "sort": "desc",
     }
+    response = fetch_with_retry(url, source="Alpaca news", headers=headers, params=params, timeout=HTTP_TIMEOUT)
+    if response is None:
+        return None
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
         response.raise_for_status()
         news_data = response.json().get("news", [])
 
@@ -228,38 +236,42 @@ def fetch_alpaca_news() -> List[Dict[str, Any]]:
         return result
     except requests.RequestException as e:
         print(f"[ERROR] [SCRAPER] Alpaca news fetch failed: {e}", flush=True)
-        return []
+        return None
 
 
-def fetch_newsapi_news() -> List[Dict[str, Any]]:
+def fetch_newsapi_news() -> Optional[List[Dict[str, Any]]]:
     """
-    Fetches news from NewsAPI (free tier: 100 req/day, includes global + tech + finance).
-    Filters for market-relevant keywords to avoid pure noise.
-    Backup source if Alpaca fails.
+    Fetches news from NewsAPI (free tier: 100 req/day, includes global + tech +
+    finance). Filters for market-relevant keywords to avoid pure noise.
+    Backup source used by fetch_news_with_fallback() when Alpaca fails.
+
+    Returns [] if the key is unset (source not configured — not a failure) or
+    a legitimate empty result set. Returns None if the HTTP call itself failed
+    after retries.
     """
     api_key = os.getenv("NEWSAPI_KEY")
     if not api_key:
         return []
 
+    url = "https://newsapi.org/v2/everything"
+    # Market-relevant keywords: earnings, inflation, Fed, tech, energy, geopolitics
+    q = "(earnings OR inflation OR \"federal reserve\" OR fed OR nvda OR tsla OR aapl OR msft OR tech OR tariff OR sanctions OR oil OR energy) AND (market OR stock OR trading OR business)"
+    params = {
+        "q": q,
+        "sortBy": "publishedAt",
+        "language": "en",
+        "pageSize": 20,
+        "apiKey": api_key,
+    }
+    response = fetch_with_retry(url, source="NewsAPI news", params=params, timeout=HTTP_TIMEOUT)
+    if response is None:
+        return None
     try:
-        url = "https://newsapi.org/v2/everything"
-        # Market-relevant keywords: earnings, inflation, Fed, tech, energy, geopolitics
-        q = "(earnings OR inflation OR \"federal reserve\" OR fed OR nvda OR tsla OR aapl OR msft OR tech OR tariff OR sanctions OR oil OR energy) AND (market OR stock OR trading OR business)"
-        params = {
-            "q": q,
-            "sortBy": "publishedAt",
-            "language": "en",
-            "pageSize": 20,
-            "apiKey": api_key,
-        }
-
-        response = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
         response.raise_for_status()
         articles = response.json().get("articles", [])
 
         result = []
         for article in articles:
-            # Extract tickers from headline/description using regex
             headline = article.get("title", "")
             description = article.get("description", "")
             symbols = list(set(_TICKER_RE.findall(headline) + _TICKER_RE.findall(description)))
@@ -278,35 +290,37 @@ def fetch_newsapi_news() -> List[Dict[str, Any]]:
         return result
     except requests.RequestException as e:
         print(f"[WARN] [SCRAPER] NewsAPI backup fetch failed: {e}", flush=True)
-        return []
+        return None
 
 
-def fetch_polygon_news() -> List[Dict[str, Any]]:
+def fetch_polygon_news() -> Optional[List[Dict[str, Any]]]:
     """
-    Fetches news from Polygon.io free tier.
-    Includes market, tech, and general news with high relevance to trading.
-    Second backup source.
+    Fetches news from Polygon.io free tier. Second backup source used by
+    fetch_news_with_fallback() when both Alpaca and NewsAPI fail.
+
+    Returns [] if the key is unset or a legitimate empty result set. Returns
+    None if the HTTP call itself failed after retries.
     """
     api_key = os.getenv("POLYGON_API_KEY")
     if not api_key:
         return []
 
+    url = "https://api.polygon.io/v2/reference/news"
+    params = {
+        "limit": 20,
+        "sort": "-published_utc",
+        "apiKey": api_key,
+    }
+    response = fetch_with_retry(url, source="Polygon news", params=params, timeout=HTTP_TIMEOUT)
+    if response is None:
+        return None
     try:
-        url = "https://api.polygon.io/v2/reference/news"
-        params = {
-            "limit": 20,
-            "sort": "-published_utc",
-            "apiKey": api_key,
-        }
-
-        response = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
         response.raise_for_status()
         results = response.json().get("results", [])
 
         result = []
         for article in results:
             symbols = article.get("tickers", [])
-
             result.append({
                 "source": "Polygon.io",
                 "headline": article.get("title", ""),
@@ -321,35 +335,41 @@ def fetch_polygon_news() -> List[Dict[str, Any]]:
         return result
     except requests.RequestException as e:
         print(f"[WARN] [SCRAPER] Polygon backup fetch failed: {e}", flush=True)
-        return []
+        return None
 
 
-def fetch_rss_news() -> List[Dict[str, Any]]:
+# Free RSS feeds require no API key — last-resort fallback when Alpaca,
+# NewsAPI, and Polygon have all failed or returned nothing.
+_RSS_FEEDS = [
+    ("Reuters Markets", "https://www.reutersagency.com/feed/?taxonomy=best-topics&post_type=best-news&storyline=market_news"),
+    ("Reuters Business", "https://feeds.reuters.com/reuters/businessNews"),
+    ("Reuters Tech", "https://feeds.reuters.com/reuters/technologyNews"),
+    ("CNBC Top News", "https://feeds.cnbc.com/id/100003114/device/rss/rss.html"),
+    ("DW Business", "https://www.dw.com/en/business/s-9097"),
+]
+
+
+def fetch_rss_news() -> Optional[List[Dict[str, Any]]]:
     """
-    Fetches news from free RSS feeds (Reuters, CNBC, DW News).
-    Provides geopolitical + earnings + market news without API key requirements.
-    Last-resort fallback source.
+    Fetches news from free RSS feeds (Reuters, CNBC, DW News). Provides
+    geopolitical + earnings + market news without an API key. Last-resort
+    fallback source in fetch_news_with_fallback().
+
+    Returns [] if every feed came back empty; returns None only if every
+    single feed request failed outright (all sources down).
     """
-    try:
-        import xml.etree.ElementTree as ET
-    except ImportError:
-        return []
+    result: List[Dict[str, Any]] = []
+    any_success = False
 
-    feeds = [
-        ("Reuters Markets", "https://www.reutersagency.com/feed/?taxonomy=best-topics&post_type=best-news&storyline=market_news"),
-        ("Reuters Business", "https://feeds.reuters.com/reuters/businessNews"),
-        ("Reuters Tech", "https://feeds.reuters.com/reuters/technologyNews"),
-        ("CNBC Top News", "https://feeds.cnbc.com/id/100003114/device/rss/rss.html"),
-        ("DW Business", "https://www.dw.com/en/business/s-9097"),
-    ]
-
-    result = []
-
-    for feed_name, feed_url in feeds:
+    for feed_name, feed_url in _RSS_FEEDS:
+        response = fetch_with_retry(feed_url, source=f"RSS:{feed_name}", timeout=(5, 8))
+        if response is None:
+            print(f"[WARN] [SCRAPER] RSS feed '{feed_name}' failed after retries.", flush=True)
+            continue
         try:
-            response = requests.get(feed_url, timeout=(5, 8))
             response.raise_for_status()
             root = ET.fromstring(response.content)
+            any_success = True
 
             # RSS 2.0 standard: items are under /rss/channel/item
             for item in root.findall(".//item")[:5]:  # limit to 5 per feed
@@ -357,8 +377,6 @@ def fetch_rss_news() -> List[Dict[str, Any]]:
                 desc = item.findtext("description", "")
                 pub_date = item.findtext("pubDate")
                 link = item.findtext("link")
-
-                # Extract tickers from title
                 symbols = _TICKER_RE.findall(title)
 
                 result.append({
@@ -369,9 +387,12 @@ def fetch_rss_news() -> List[Dict[str, Any]]:
                     "timestamp": pub_date,
                     "symbols": list(set(symbols)),
                 })
-        except Exception as e:
-            print(f"[WARN] [SCRAPER] RSS feed '{feed_name}' failed: {e}", flush=True)
+        except (requests.RequestException, ET.ParseError) as e:
+            print(f"[WARN] [SCRAPER] RSS feed '{feed_name}' failed to parse: {e}", flush=True)
             continue
+
+    if not any_success:
+        return None
 
     score_news_batch(result)
     if result:
@@ -393,8 +414,6 @@ def deduplicate_news(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         headline = (item.get("headline") or "").lower().strip()
         if not headline:
             continue
-
-        # Hash the headline to detect exact/near-duplicates
         h = hashlib.md5(headline.encode()).hexdigest()
         if h not in seen:
             seen.add(h)
@@ -403,46 +422,58 @@ def deduplicate_news(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return deduped
 
 
-def fetch_news_with_fallback() -> List[Dict[str, Any]]:
+def fetch_news_with_fallback() -> Optional[List[Dict[str, Any]]]:
     """
     Orchestrates multi-source news fetching with fallback logic.
-    Tries sources in order: Alpaca (primary) → NewsAPI → Polygon → RSS (last resort).
-    Deduplicates, filters by topic, and scores all results uniformly.
+    Tries sources in order: Alpaca (primary) -> NewsAPI -> Polygon -> RSS
+    (last resort). Deduplicates, filters by topic, and scores all results
+    uniformly.
 
-    Returns: list of news items with sentiment scores, or empty list if all sources fail.
+    Returns None only if ALL sources failed outright (network/API failures
+    across the board) — distinct from a successful run that legitimately
+    found zero qualifying articles, which returns []. Callers should treat
+    None as a data gap the same way they treat fetch_alpaca_news() == None.
     """
-    all_news = []
+    all_news: List[Dict[str, Any]] = []
+    any_source_reachable = False
 
-    # Primary source
     news = fetch_alpaca_news()
+    if news is not None:
+        any_source_reachable = True
     if news:
         all_news.extend(news)
         print(f"[INFO] [SCRAPER] Primary (Alpaca) succeeded: {len(news)} items", flush=True)
     else:
-        print(f"[WARN] [SCRAPER] Primary (Alpaca) failed, trying backups...", flush=True)
+        print("[WARN] [SCRAPER] Primary (Alpaca) failed or empty, trying backups...", flush=True)
 
-        # Secondary sources
-        news = fetch_newsapi_news()
-        if news:
-            all_news.extend(news)
-            print(f"[INFO] [SCRAPER] Secondary (NewsAPI) succeeded: {len(news)} items", flush=True)
+        newsapi_items = fetch_newsapi_news()
+        if newsapi_items is not None:
+            any_source_reachable = True
+        if newsapi_items:
+            all_news.extend(newsapi_items)
+            print(f"[INFO] [SCRAPER] Secondary (NewsAPI) succeeded: {len(newsapi_items)} items", flush=True)
 
-        news = fetch_polygon_news()
-        if news:
-            all_news.extend(news)
-            print(f"[INFO] [SCRAPER] Secondary (Polygon) succeeded: {len(news)} items", flush=True)
+        polygon_items = fetch_polygon_news()
+        if polygon_items is not None:
+            any_source_reachable = True
+        if polygon_items:
+            all_news.extend(polygon_items)
+            print(f"[INFO] [SCRAPER] Secondary (Polygon) succeeded: {len(polygon_items)} items", flush=True)
 
-        # Last resort
         if not all_news:
-            news = fetch_rss_news()
-            if news:
-                all_news.extend(news)
-                print(f"[INFO] [SCRAPER] Fallback (RSS) succeeded: {len(news)} items", flush=True)
+            rss_items = fetch_rss_news()
+            if rss_items is not None:
+                any_source_reachable = True
+            if rss_items:
+                all_news.extend(rss_items)
+                print(f"[INFO] [SCRAPER] Fallback (RSS) succeeded: {len(rss_items)} items", flush=True)
 
-    # Deduplicate across all sources
+    if not any_source_reachable:
+        print("[ERROR] [SCRAPER] All news sources failed outright — treating as data gap.", flush=True)
+        return None
+
     deduped = deduplicate_news(all_news)
 
-    # Filter by topic (exclude low-signal content)
     filtered = [
         item for item in deduped
         if should_include_article(item.get("headline", ""), item.get("summary", ""))
@@ -451,15 +482,11 @@ def fetch_news_with_fallback() -> List[Dict[str, Any]]:
         excluded = len(deduped) - len(filtered)
         print(f"[INFO] [SCRAPER] Topic filter excluded {excluded} article(s).", flush=True)
 
-    if filtered:
-        print(f"[INFO] [SCRAPER] After dedup + filter: {len(filtered)} unique articles", flush=True)
-        return filtered
-    else:
-        print(f"[ERROR] [SCRAPER] All news sources failed — returning empty batch", flush=True)
-        return []
+    print(f"[INFO] [SCRAPER] After dedup + filter: {len(filtered)} unique articles", flush=True)
+    return filtered
 
 
-def fetch_earnings_calendar(tickers: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+def fetch_earnings_calendar(tickers: List[str]) -> Dict[str, Optional[List[Dict[str, Any]]]]:
     """
     Queries Alpaca's corporate actions endpoint for scheduled earnings announcements.
     Returns a dict mapping each ticker to a list of earnings dates within the next 30 days.
@@ -469,6 +496,8 @@ def fetch_earnings_calendar(tickers: List[str]) -> Dict[str, List[Dict[str, Any]
         "TSLA": [{"date": "2026-07-20"}, ...],
         ...
     }
+    A ticker maps to None (not []) if its fetch failed after retries, so a
+    real "no earnings scheduled" is never confused with "the API call failed".
 
     RULE-008: Enforces (5, 10) timeout tuple on all HTTP calls.
     """
@@ -478,7 +507,7 @@ def fetch_earnings_calendar(tickers: List[str]) -> Dict[str, List[Dict[str, Any]
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
     }
 
-    result: Dict[str, List[Dict[str, Any]]] = {}
+    result: Dict[str, Optional[List[Dict[str, Any]]]] = {}
 
     # Compute the 30-day forward window from today (UTC)
     now_utc = datetime.now(tz=timezone.utc)
@@ -486,17 +515,20 @@ def fetch_earnings_calendar(tickers: List[str]) -> Dict[str, List[Dict[str, Any]
     end_date = (now_utc + timedelta(days=30)).date().isoformat()
 
     for ticker in tickers:
+        params = {
+            "symbols": ticker,
+            "types": "earnings",
+            "start": start_date,
+            "end": end_date,
+        }
+        response = fetch_with_retry(
+            url, source=f"Alpaca earnings:{ticker}", headers=headers, params=params, timeout=HTTP_TIMEOUT
+        )
+        if response is None:
+            result[ticker] = None
+            continue
         try:
-            params = {
-                "symbols": ticker,
-                "types": "earnings",
-                "start": start_date,
-                "end": end_date,
-            }
-
-            response = requests.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
             response.raise_for_status()
-
             data = response.json()
             events = data.get("corporate_actions", [])
 
@@ -516,7 +548,7 @@ def fetch_earnings_calendar(tickers: List[str]) -> Dict[str, List[Dict[str, Any]
 
         except requests.RequestException as e:
             print(f"[WARN] [SCRAPER] Could not fetch earnings for {ticker}: {e}", flush=True)
-            result[ticker] = []
+            result[ticker] = None
 
     return result
 
@@ -543,26 +575,23 @@ def _resolve_form4_xml_url(index_url: str) -> Optional[str]:
     From a Form 4 filing index page, find the primary ownership XML document.
     Skips the XSL-rendered viewer links; returns the raw .xml href, or None.
     """
-    try:
-        resp = requests.get(index_url, headers=_SEC_HEADERS, timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            return None
-        # Index pages list document hrefs; the ownership doc ends in .xml and is
-        # NOT under the /xslF345X0?/ rendering path.
-        hrefs = re.findall(r'href="([^"]+\.xml)"', resp.text, flags=re.IGNORECASE)
-        for href in hrefs:
-            if "xsl" in href.lower():
-                continue
-            if href.startswith("/"):
-                return f"https://www.sec.gov{href}"
-            if href.startswith("http"):
-                return href
-            # Relative to the index page directory
-            base = index_url.rsplit("/", 1)[0]
-            return f"{base}/{href}"
+    resp = fetch_with_retry(index_url, source=f"SEC Form4 index:{index_url}", headers=_SEC_HEADERS, timeout=HTTP_TIMEOUT)
+    if resp is None or resp.status_code != 200:
         return None
-    except requests.RequestException:
-        return None
+    # Index pages list document hrefs; the ownership doc ends in .xml and is
+    # NOT under the /xslF345X0?/ rendering path.
+    hrefs = re.findall(r'href="([^"]+\.xml)"', resp.text, flags=re.IGNORECASE)
+    for href in hrefs:
+        if "xsl" in href.lower():
+            continue
+        if href.startswith("/"):
+            return f"https://www.sec.gov{href}"
+        if href.startswith("http"):
+            return href
+        # Relative to the index page directory
+        base = index_url.rsplit("/", 1)[0]
+        return f"{base}/{href}"
+    return None
 
 
 def _txn_is_10b5_1(txn: ET.Element, footnotes: Dict[str, str]) -> bool:
@@ -638,22 +667,27 @@ def _parse_form4_xml(xml_bytes: bytes) -> Optional[Dict[str, Any]]:
     return info
 
 
-def fetch_form4_filings(ticker: str, max_filings: int = 15) -> List[Dict[str, Any]]:
+def fetch_form4_filings(ticker: str, max_filings: int = 15) -> Optional[List[Dict[str, Any]]]:
     """
     Fetch and parse recent Form 4 filings for a ticker from SEC EDGAR.
-    Returns a list of parsed filing dicts (see _parse_form4_xml). Empty on failure.
+    Returns a list of parsed filing dicts (see _parse_form4_xml), or None if
+    the feed itself could not be fetched/parsed after retries — distinct from
+    a successful fetch that legitimately found no qualifying filings ([]),
+    so callers can flag the ticker as a data gap rather than "no signal".
     """
     feed_url = (
         "https://www.sec.gov/cgi-bin/browse-edgar"
         f"?action=getcompany&CIK={ticker}&type=4&dateb=&owner=include"
         f"&count={max_filings}&output=atom"
     )
-    try:
-        resp = requests.get(feed_url, headers=_SEC_HEADERS, timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            print(f"[WARN] [SCRAPER] Form 4 feed HTTP {resp.status_code} for {ticker}.", flush=True)
-            return []
+    resp = fetch_with_retry(feed_url, source=f"SEC Form4 feed:{ticker}", headers=_SEC_HEADERS, timeout=HTTP_TIMEOUT)
+    if resp is None:
+        return None
+    if resp.status_code != 200:
+        print(f"[WARN] [SCRAPER] Form 4 feed HTTP {resp.status_code} for {ticker}.", flush=True)
+        return None
 
+    try:
         root = ET.fromstring(resp.content)
         ns = {"atom": "http://www.w3.org/2005/Atom"}
         filings: List[Dict[str, Any]] = []
@@ -668,8 +702,9 @@ def fetch_form4_filings(ticker: str, max_filings: int = 15) -> List[Dict[str, An
             xml_url = _resolve_form4_xml_url(index_url)
             if not xml_url:
                 continue
-            doc = requests.get(xml_url, headers=_SEC_HEADERS, timeout=HTTP_TIMEOUT)
-            if doc.status_code != 200:
+            doc = fetch_with_retry(xml_url, source=f"SEC Form4 doc:{ticker}", headers=_SEC_HEADERS, timeout=HTTP_TIMEOUT)
+            if doc is None or doc.status_code != 200:
+                print(f"[WARN] [SCRAPER] Could not fetch one Form 4 document for {ticker}; skipping that entry.", flush=True)
                 continue
             parsed = _parse_form4_xml(doc.content)
             if parsed and parsed["purchases"]:
@@ -680,9 +715,9 @@ def fetch_form4_filings(ticker: str, max_filings: int = 15) -> List[Dict[str, An
 
         print(f"[INFO] [SCRAPER] Form 4 for {ticker}: {len(filings)} filing(s) with open-market buys.", flush=True)
         return filings
-    except (requests.RequestException, ET.ParseError) as e:
-        print(f"[WARN] [SCRAPER] Form 4 fetch failed for {ticker}: {e}", flush=True)
-        return []
+    except ET.ParseError as e:
+        print(f"[WARN] [SCRAPER] Form 4 feed for {ticker} failed to parse: {e}", flush=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -702,8 +737,10 @@ def _load_alt_source(url_env: str, json_env: str, label: str) -> Optional[Any]:
     """Resolve an alt-data source from a provider URL or an inline JSON env var."""
     url = os.getenv(url_env)
     if url:
+        resp = fetch_with_retry(url, source=f"alt-macro:{label}", timeout=HTTP_TIMEOUT)
+        if resp is None:
+            return None
         try:
-            resp = requests.get(url, timeout=HTTP_TIMEOUT)
             resp.raise_for_status()
             return resp.json()
         except (requests.RequestException, ValueError) as e:
@@ -779,20 +816,24 @@ _OFAC_TIGHTEN = ["sanction", "designat", "block", "freeze", "embargo", "restrict
 _OFAC_EASE = ["license", "authoriz", "delist", "remov", "waiver", "ease", "lift", "general license"]
 
 
-def fetch_ofac_actions(max_items: int = 25) -> List[Dict[str, Any]]:
+def fetch_ofac_actions(max_items: int = 25) -> Optional[List[Dict[str, Any]]]:
     """
     Fetch recent OFAC actions (sanctions designations, licenses, delistings) and
     classify each as supply-TIGHTENING (+1) or supply-EASING (-1) by keyword.
 
-    Returns a list of {date, title, url, direction, keywords}. Empty on failure.
+    Returns a list of {date, title, url, direction, keywords}, or None if the
+    feed could not be fetched/parsed after retries — distinct from a
+    successful fetch that legitimately found zero recent actions.
     A 'tightening' action constrains physical supply (bullish oil); an 'easing'
     action (e.g. a general license) releases supply (bearish oil).
     """
+    resp = fetch_with_retry(OFAC_ACTIONS_URL, source="OFAC actions", headers={"User-Agent": SEC_USER_AGENT}, timeout=HTTP_TIMEOUT)
+    if resp is None:
+        return None
+    if resp.status_code != 200:
+        print(f"[WARN] [SCRAPER] OFAC feed HTTP {resp.status_code}.", flush=True)
+        return None
     try:
-        resp = requests.get(OFAC_ACTIONS_URL, headers={"User-Agent": SEC_USER_AGENT}, timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            print(f"[WARN] [SCRAPER] OFAC feed HTTP {resp.status_code}.", flush=True)
-            return []
         root = ET.fromstring(resp.content)
         actions: List[Dict[str, Any]] = []
         # Tolerate both RSS (<item>) and Atom (<entry>) feeds.
@@ -820,6 +861,6 @@ def fetch_ofac_actions(max_items: int = 25) -> List[Dict[str, Any]]:
                 break
         print(f"[INFO] [SCRAPER] OFAC actions fetched: {len(actions)}.", flush=True)
         return actions
-    except (requests.RequestException, ET.ParseError) as e:
-        print(f"[WARN] [SCRAPER] OFAC actions fetch failed: {e}", flush=True)
-        return []
+    except ET.ParseError as e:
+        print(f"[WARN] [SCRAPER] OFAC actions feed failed to parse: {e}", flush=True)
+        return None

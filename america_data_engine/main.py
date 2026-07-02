@@ -9,10 +9,6 @@ from fastapi import FastAPI, HTTPException, Security, status
 from fastapi.security import APIKeyHeader
 
 from scrapers import (
-    fetch_alpaca_news,
-    fetch_newsapi_news,
-    fetch_polygon_news,
-    fetch_rss_news,
     fetch_news_with_fallback,
     fetch_earnings_calendar,
 )
@@ -77,10 +73,10 @@ _CACHE: Dict[str, Any] = {
 }
 
 
-def _detect_volume_spike(current_count: int, window_size: int = 4) -> tuple[bool, float, float]:
+def _detect_volume_spike(current_count: int, window_size: int = 4) -> "tuple[bool, float, float]":
     """
     Detects if current article count is anomalously high.
-    Returns (is_spike, mean, stddev) where is_spike=True if current > mean + 2σ.
+    Returns (is_spike, mean, stddev) where is_spike=True if current > mean + 2sigma.
     Maintains a rolling window of recent counts.
     """
     history = _CACHE["news_volume_history"]
@@ -105,22 +101,30 @@ def _detect_volume_spike(current_count: int, window_size: int = 4) -> tuple[bool
 def _refresh_cache() -> None:
     """
     Background worker — runs on startup and then every 15 minutes via APScheduler.
-    Refreshes news with fallback logic (Alpaca → NewsAPI → Polygon → RSS).
-    Applies topic filtering and detects volume spikes.
-    Earnings are refreshed separately every 24h.
+    Refreshes news via the multi-source fallback chain (Alpaca -> NewsAPI ->
+    Polygon -> RSS), applies volume-spike detection, and runs the Contradiction
+    Vector. Earnings are refreshed separately every 24h.
+
+    fetch_news_with_fallback() returns None only if every source failed
+    outright (data gap — keep the previous cache, do not overwrite with
+    nothing) and [] if sources succeeded but legitimately found no articles
+    (a quiet news day — still a valid, if empty, refresh).
     """
     print("[INFO] [AMERICA-DATA-ENGINE] Starting scheduled news scrape with fallback logic...", flush=True)
 
     news_us = fetch_news_with_fallback()
-    if news_us:
+    if news_us is None:
+        print("[WARN] [AMERICA-DATA-ENGINE] All news sources failed after retries; keeping previous cache.", flush=True)
+        _CACHE["volume_spike_detected"] = False
+    elif news_us:
         _CACHE["news_us"] = news_us
 
-        # Detect volume spikes (potential noise)
+        # Detect volume spikes (potential noise / breaking-event flood).
         is_spike, mean, stddev = _detect_volume_spike(len(news_us))
         _CACHE["volume_spike_detected"] = is_spike
         if is_spike:
             print(f"[WARN] [AMERICA-DATA-ENGINE] Volume spike detected: {len(news_us)} articles "
-                  f"(mean: {mean:.1f}, σ: {stddev:.1f})", flush=True)
+                  f"(mean: {mean:.1f}, sigma: {stddev:.1f})", flush=True)
 
         # WS1 — cross-check headline sentiment against live IV skew. Wrapped so a
         # heartbeat outage never blocks the (more critical) news cache refresh.
@@ -129,7 +133,9 @@ def _refresh_cache() -> None:
         except Exception as e:
             print(f"[WARN] [AMERICA-DATA-ENGINE] Contradiction check failed: {e}", flush=True)
     else:
-        print("[WARN] [AMERICA-DATA-ENGINE] All news sources failed — contradiction cache not updated.", flush=True)
+        # Legitimate empty result — all reachable sources agreed there's
+        # nothing new. Still record it as "up to date", just with zero items.
+        _CACHE["news_us"] = news_us
         _CACHE["volume_spike_detected"] = False
 
     _CACHE["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
@@ -148,9 +154,16 @@ def _refresh_earnings_cache() -> None:
     earnings = fetch_earnings_calendar(WATCHLIST)
     if earnings:
         _CACHE["earnings_calendar"] = earnings
-        total_events = sum(len(events) for events in earnings.values())
+        failed_tickers = [t for t, events in earnings.items() if events is None]
+        total_events = sum(len(events) for events in earnings.values() if events)
         print(f"[INFO] [AMERICA-DATA-ENGINE] Earnings calendar updated: {total_events} event(s) found.",
               flush=True)
+        if failed_tickers:
+            print(
+                f"[WARN] [AMERICA-DATA-ENGINE] Earnings fetch failed for: {', '.join(failed_tickers)} "
+                f"— their earnings data is stale/missing this cycle.",
+                flush=True,
+            )
 
     _CACHE["last_earnings_update"] = datetime.now(tz=timezone.utc).isoformat()
     print(f"[INFO] [AMERICA-DATA-ENGINE] Earnings refresh complete at {_CACHE['last_earnings_update']}.",
@@ -259,7 +272,7 @@ def health_check() -> Dict[str, Any]:
 
 @app.get(
     "/news/us",
-    summary="Latest multi-source news headlines with sentiment scores",
+    summary="Latest Alpaca news headlines",
     tags=["news"],
     dependencies=[Security(verify_token)],
 )
@@ -267,7 +280,6 @@ def get_us_headlines() -> Dict[str, Any]:
     return {
         "last_updated": _CACHE["last_updated"],
         "count":        len(_CACHE["news_us"]),
-        "volume_spike_detected": _CACHE.get("volume_spike_detected", False),
         "news":         _CACHE["news_us"],
     }
 

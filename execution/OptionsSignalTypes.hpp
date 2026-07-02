@@ -52,6 +52,7 @@ struct RiskProfile {
     double delta_long         = 0.45; // target Δ for directional longs (calls/puts)
     double delta_income       = 0.25; // target Δ for income/short legs (CSP, CC)
     double delta_spread_wing  = 0.15; // target Δ for the short wing of spreads
+
     double delta_leap         = 0.70; // target Δ for LEAP contracts (ITM for intrinsic value)
 
     int    dte_long           = 45;   // DTE for directional longs

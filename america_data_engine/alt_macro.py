@@ -181,10 +181,25 @@ def run_alt_macro_check() -> Dict[str, Any]:
     """
     Top-level entry point invoked by the data-engine scheduler. Produces the
     JSON written to the shared data bus / signal pipeline.
+
+    `data_gaps` names any source that IS configured (a provider URL/manual
+    JSON is set, or OFAC is simply expected to always be reachable) but
+    failed to fetch after retries — as opposed to a source that is simply
+    unconfigured ("source": "none"), which is not a gap.
     """
     insurance = fetch_marine_insurance_premiums()
     traffic = fetch_tanker_traffic()
     ofac = fetch_ofac_actions()
+
+    data_gaps = []
+    if insurance.get("source") in ("provider", "manual") and not insurance.get("available"):
+        data_gaps.append("marine_insurance")
+    if traffic.get("source") in ("provider", "manual") and not traffic.get("available"):
+        data_gaps.append("tanker_traffic")
+    ofac_failed = ofac is None
+    if ofac_failed:
+        data_gaps.append("ofac_actions")
+    ofac = ofac or []
 
     regions = [_evaluate_region(k, cfg, insurance, traffic, ofac)
                for k, cfg in CHOKEPOINTS.items()]
@@ -204,10 +219,14 @@ def run_alt_macro_check() -> Dict[str, Any]:
         "political_min": POLITICAL_MIN,
         "contradiction_count": len(contradictions),
         "regions": regions,
+        "data_gaps": data_gaps,
+        "complete": not data_gaps,
     }
     print(
         f"[INFO] [ALT-MACRO] Evaluated {len(regions)} chokepoint(s); "
         f"{len(contradictions)} text-vs-physical contradiction(s).",
         flush=True,
     )
+    if data_gaps:
+        print(f"[WARN] [ALT-MACRO] Incomplete data — missing: {', '.join(data_gaps)}.", flush=True)
     return payload

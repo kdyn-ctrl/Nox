@@ -222,6 +222,16 @@ void PositionManager::monitor_positions() {
                            << "• *Quantity:* " << pos.quantity;
                     TelegramNotifier::sendMessage(tg_msg.str());
                     
+                    // Realized P&L on the option (100 shares per contract).
+                    // Long profits when price rises; short premium profits when it falls.
+                    double pnl = (pos.profile_type == "short_premium")
+                        ? (pos.entry_price - current_price) * pos.quantity * 100.0
+                        : (current_price - pos.entry_price) * pos.quantity * 100.0;
+                    record_trade(pos.ticker, "CLOSE", "option",
+                                 static_cast<double>(pos.quantity), current_price,
+                                 0.0, 0.0, pnl,
+                                 pos.option_type + " " + std::to_string(pos.strike) + " | " + exit_reason);
+
                     // Remove from database
                     remove_position(pos.id);
                 } else {

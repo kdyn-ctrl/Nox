@@ -282,19 +282,4 @@ Monthly spot-checks keep guides fresh. If a guide example doesn't work, update i
 
 ---
 
-### 5. Paper Trading & Live Migration Guide
-**File**: [PAPER_TRADING_READINESS.md](PAPER_TRADING_READINESS.md)
-
-- Honest assessment of what's operational vs what needs fixing before live capital
-- Identifies the 3 critical pre-live gaps (PositionManager wiring, restart sync, earnings filter)
-- Step-by-step live migration sequence (IBKR activation or Alpaca flip)
-- 60-day paper trading checklist with clear go/no-go criteria
-- Realistic expected-edge section covering variance risk premium, directional bias, and WS1–WS3 lift
-
-**Who should read this**: Anyone deciding whether to deploy real capital
-
-**When to update**: After 60-day paper trading cycle; update Section 2 with realized stats
-
----
-
-**Last Updated: 2026-06-29**
+**Last Updated: 2026-06-22**
