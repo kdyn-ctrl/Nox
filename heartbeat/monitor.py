@@ -163,6 +163,21 @@ def init_db():
                         source TEXT DEFAULT 'market_scanner'
                     )
                 ''')
+
+                # Additive migration: the execution engine now writes trade_history
+                # (the canonical trade ledger) with these extra columns. Older DBs
+                # created the table without them, so add any that are missing. Must
+                # stay in sync with execution/PositionManager.hpp::initialize_database.
+                c.execute("PRAGMA table_info(trade_history)")
+                existing_cols = {row[1] for row in c.fetchall()}
+                for col, decl in (
+                    ("asset_class", "TEXT DEFAULT 'equity'"),
+                    ("quantity",    "REAL DEFAULT 0"),
+                    ("detail",      "TEXT DEFAULT ''"),
+                ):
+                    if col not in existing_cols:
+                        c.execute(f"ALTER TABLE trade_history ADD COLUMN {col} {decl}")
+
                 conn.commit()
     except Exception as e:
         print(f"Database initialization error: {e}")
@@ -176,9 +191,9 @@ HTTP_TIMEOUT = (5, 10)  # (connect seconds, read seconds)
 def get_alpaca_portfolio():
     headers = {'APCA-API-KEY-ID': ALPACA_API, 'APCA-API-SECRET-KEY': ALPACA_SEC}
     try:
-        acc_resp = requests.get('https://paper-api.alpaca.markets/v2/account',
+        acc_resp = requests.get(f'{ALPACA_BROKER_URL}/v2/account',
                                 headers=headers, timeout=HTTP_TIMEOUT)
-        pos_resp = requests.get('https://paper-api.alpaca.markets/v2/positions',
+        pos_resp = requests.get(f'{ALPACA_BROKER_URL}/v2/positions',
                                 headers=headers, timeout=HTTP_TIMEOUT)
         
         if acc_resp.status_code != 200 or pos_resp.status_code != 200:
@@ -421,7 +436,10 @@ def get_us_news_context() -> str:
 # No Traefik, no public internet, no TradingView subscription needed.
 
 ALPACA_DATA_URL  = "https://data.alpaca.markets"
-ALPACA_BROKER_URL = "https://paper-api.alpaca.markets"
+# Broker/account host differs paper vs live — must track execution-engine's
+# ALPACA_BASE_URL (same env var name) so reports never silently show the wrong
+# account. Falls back to paper for local runs where the var isn't set.
+ALPACA_BROKER_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 # Minimum liquidity thresholds for the whole-market scanner.
 # Keeps the candidate pool to liquid, optionable names.
@@ -1028,8 +1046,9 @@ def fetch_options_chain_iv(ticker: str) -> float | None:
     }
 
     try:
-        # Alpaca options chains endpoint — paper trading API
-        url = f"https://paper-api.alpaca.markets/v1beta3/options/chains/{ticker}"
+        # Alpaca options chains endpoint — served from the broker/account host,
+        # which differs paper vs live (unlike ALPACA_DATA_URL).
+        url = f"{ALPACA_BROKER_URL}/v1beta3/options/chains/{ticker}"
         resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
 
         if resp.status_code != 200:
@@ -1112,7 +1131,7 @@ def fetch_iv_skew(ticker: str) -> dict:
         "APCA-API-SECRET-KEY": ALPACA_SEC,
     }
     try:
-        url = f"https://paper-api.alpaca.markets/v1beta3/options/chains/{ticker}"
+        url = f"{ALPACA_BROKER_URL}/v1beta3/options/chains/{ticker}"
         resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
         if resp.status_code != 200:
             return {"ticker": ticker, "method": "error",
@@ -1437,6 +1456,27 @@ def schedule_checker():
 
     _reschedule_iv_collection()
 
+    # --- End-of-Day / End-of-Week reports (post-close) ---
+    # EOD 16:05 ET daily (weekends skipped inside run_eod_report); EOW 16:10 ET Friday.
+    # DST-aware like the scout: recomputed nightly at 00:01 UTC.
+    def _reschedule_eod_eow():
+        schedule.clear("eod_report")
+        schedule.clear("eow_report")
+        now_et = datetime.now(tz=ET)
+
+        eod_et  = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
+        eod_utc = eod_et.astimezone(UTC).strftime("%H:%M")
+        schedule.every().day.at(eod_utc).do(run_eod_report).tag("eod_report")
+
+        eow_et  = now_et.replace(hour=16, minute=10, second=0, microsecond=0)
+        eow_utc = eow_et.astimezone(UTC).strftime("%H:%M")
+        schedule.every().friday.at(eow_utc).do(run_eow_report).tag("eow_report")
+
+        logger.info(f"EOD report scheduled 16:05 ET = {eod_utc} UTC (daily); "
+                    f"EOW report scheduled 16:10 ET = {eow_utc} UTC (Friday).")
+
+    _reschedule_eod_eow()
+
     # --- Market Scanner (every 30 minutes, market hours only) ---
     # Runs independently of DST — the is_market_hours() check inside handles
     # the ET window, so we schedule on a fixed wall-clock interval, not a time.
@@ -1450,6 +1490,7 @@ def schedule_checker():
     def _combined_reschedule():
         _reschedule_scout()
         _reschedule_iv_collection()
+        _reschedule_eod_eow()
 
     schedule.clear("reschedule")
     schedule.every().day.at("00:01").do(_combined_reschedule).tag("reschedule")
@@ -1703,9 +1744,10 @@ def send_signals(message):
             rsi    = s.get('rsi', 0)
             vix    = s.get('vix', 0)
             ts     = s.get('received_at', '?')[:19]
+            source = s.get('source', '') or 'webhook'
             lines.append(
                 f"• `{ts}` *{action}* {ticker} "
-                f"@ ${price:.2f} RSI={rsi:.1f} VIX={vix:.1f}"
+                f"@ ${price:.2f} RSI={rsi:.1f} VIX={vix:.1f} [{source}]"
             )
 
         bot.reply_to(
@@ -1717,6 +1759,114 @@ def send_signals(message):
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] /signals command failed: {e}", flush=True)
         bot.reply_to(message, f"⚠️ Failed to fetch signals: {str(e)}")
+
+
+@bot.message_handler(commands=['cn_status'])
+def send_cn_status(message):
+    """
+    /cn_status — Single-command diagnostic for CN-RULE-001/002 (Chinese A-share
+    board-lot truncation + T+1 settlement gate). Answers "is CN protection
+    currently active, and what does it think it's tracking" without grepping
+    logs or reading code. Queries /cn-status on the execution engine.
+    """
+    try:
+        resp = requests.get("http://execution-engine:8080/cn-status", timeout=HTTP_TIMEOUT)
+        if resp.status_code != 200:
+            bot.reply_to(message, f"⚠️ Execution engine returned HTTP {resp.status_code}.")
+            return
+
+        data = resp.json()
+        lot_size    = data.get("board_lot_size", "?")
+        gate_active = data.get("gate_active", False)
+        today       = data.get("today", "?")
+        positions   = data.get("positions", [])
+
+        status_line = (
+            "🟢 *ACTIVE* — board-lot truncation and T+1 gate are enforced on every ticker"
+            if gate_active else
+            "⚪ *DORMANT* — board_lot_size=1, no CN-specific restriction applied to any ticker"
+        )
+
+        lines = [
+            f"🇨🇳 *CN-RULE-001/002 Status*",
+            f"────────────────────────",
+            f"• *Board Lot Size:* {lot_size}",
+            f"• *Gate:* {status_line}",
+            f"• *Today (ET):* {today}",
+        ]
+
+        if positions:
+            lines.append(f"\n*T+1 Tracked Positions ({len(positions)}):*")
+            for p in positions:
+                cleared = "✅ cleared" if p.get("cleared") else "⏳ pending"
+                lines.append(f"• {p.get('ticker','?')} — entry {p.get('entry_date','?')} ({cleared})")
+        elif gate_active:
+            lines.append("\n_No positions currently tracked._")
+
+        bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        print(f"[ERROR] [HEARTBEAT] /cn_status command failed: {e}", flush=True)
+        bot.reply_to(message, f"⚠️ Failed to fetch CN status: {str(e)}")
+
+
+@bot.message_handler(commands=['trades'])
+def send_trades(message):
+    """
+    /trades [n] — Last N executed trades from the persistent trade ledger
+    (trade_history). Unlike /signals (in-memory, wiped on engine restart), this
+    reads the DB so filled entries/exits and realized P&L survive restarts.
+    Defaults to 15, capped at 50.
+    """
+    try:
+        parts = message.text.strip().split()
+        try:
+            requested = int(parts[1]) if len(parts) > 1 else 15
+            count = max(1, min(requested, 50))
+        except (ValueError, IndexError):
+            count = 15
+
+        with db_lock:
+            with sqlite3.connect(DB_PATH) as conn:
+                c = conn.cursor()
+                c.execute(
+                    "SELECT timestamp, ticker, action, asset_class, quantity, price, pnl, detail "
+                    "FROM trade_history ORDER BY id DESC LIMIT ?",
+                    (count,),
+                )
+                rows = c.fetchall()
+
+        if not rows:
+            bot.reply_to(
+                message,
+                "📭 No trades recorded yet.\n\n"
+                "The engine records every equity/option entry and exit here once it "
+                "places or closes an order. If this stays empty during market hours, "
+                "check that signals are arriving (/signals) and orders aren't being "
+                "blocked by a gate.",
+            )
+            return
+
+        lines = []
+        for ts, ticker, action, asset_class, qty, price, pnl, detail in rows:
+            icon = "🟢" if action in ("BUY", "OPEN") else "🔴" if action in ("SELL", "CLOSE") else "⚪"
+            kind = "opt" if (asset_class or "") == "option" else "eq"
+            pnl_str = ""
+            if pnl is not None and action in ("SELL", "CLOSE"):
+                pnl_str = f" | P&L ${pnl:+.2f}"
+            qty_str = f"x{qty:g}" if qty else ""
+            lines.append(
+                f"{icon} `{str(ts)[:19]}` *{action}* {ticker} [{kind}] "
+                f"{qty_str} @ ${price:.2f}{pnl_str}"
+            )
+
+        bot.reply_to(
+            message,
+            f"📒 *Last {len(rows)} executed trade(s):*\n\n" + "\n".join(lines),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        print(f"[ERROR] [HEARTBEAT] /trades command failed: {e}", flush=True)
+        bot.reply_to(message, f"⚠️ Failed to fetch trades: {str(e)}")
 
 
 @bot.message_handler(commands=['details'])
@@ -1752,9 +1902,10 @@ def send_details(message):
             price  = s.get('price', 0.0)
             rsi    = s.get('rsi', 0.0)
             vix    = s.get('vix', 0.0)
+            source = s.get('source', '') or 'webhook'
             icon   = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
             lines.append(
-                f"{icon} *{ticker}* {action}  `{ts}`\n"
+                f"{icon} *{ticker}* {action}  `{ts}`  [{source}]\n"
                 f"   Price ${price:.2f} · RSI {rsi:.1f} · VIX {vix:.1f}"
             )
 
@@ -2302,6 +2453,190 @@ def run_monthly_journal():
         )
     except Exception as e:
         logger.error(f"Monthly journal failed: {e}")
+
+
+# ── End-of-Day / End-of-Week account summaries ───────────────────────────────
+# These read the canonical trade_history ledger (written by the execution engine)
+# plus a live Alpaca account snapshot, and are pushed to Telegram at the close.
+# Before this existed there was no EOD/EOW trade report at all — only a 9 AM news
+# briefing and a monthly journal.
+
+def _fetch_account_and_positions():
+    """Return (account_dict, positions_list) from Alpaca, or (None, None)."""
+    headers = {'APCA-API-KEY-ID': ALPACA_API, 'APCA-API-SECRET-KEY': ALPACA_SEC}
+    try:
+        acc = requests.get(f'{ALPACA_BROKER_URL}/v2/account',
+                           headers=headers, timeout=HTTP_TIMEOUT)
+        pos = requests.get(f'{ALPACA_BROKER_URL}/v2/positions',
+                           headers=headers, timeout=HTTP_TIMEOUT)
+        if acc.status_code != 200 or pos.status_code != 200:
+            return None, None
+        a, p = acc.json(), pos.json()
+        if not isinstance(a, dict) or not isinstance(p, list):
+            return None, None
+        return a, p
+    except Exception as e:
+        logger.warning(f"account snapshot fetch failed: {e}")
+        return None, None
+
+
+def _period_start_utc(scope: str) -> str:
+    """
+    UTC 'YYYY-MM-DD HH:MM:SS' string for the start of the reporting window.
+    'day'  → midnight ET today; 'week' → most recent Monday 00:00 ET.
+    trade_history.timestamp is stored in UTC, so we compare against a UTC bound.
+    """
+    et  = ZoneInfo("America/New_York")
+    utc = ZoneInfo("UTC")
+    now_et = datetime.now(et)
+    start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    if scope == "week":
+        start_et = start_et - timedelta(days=now_et.weekday())  # back to Monday
+    return start_et.astimezone(utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def generate_activity_report(scope: str) -> str:
+    """Build a full account-summary report ('day' or 'week') as a Markdown string."""
+    et = ZoneInfo("America/New_York")
+    now = datetime.now(et)
+    title = "End-of-Day" if scope == "day" else "End-of-Week"
+    period_desc = now.strftime("%A, %Y-%m-%d") if scope == "day" \
+        else f"week ending {now.strftime('%A, %Y-%m-%d')}"
+    start_utc = _period_start_utc(scope)
+
+    # ── Live account snapshot ──────────────────────────────────────────────
+    acc, positions = _fetch_account_and_positions()
+    if acc is not None:
+        equity     = float(acc.get('portfolio_value', 0) or 0)
+        last_equity = float(acc.get('last_equity', 0) or 0)
+        cash       = float(acc.get('cash', 0) or 0)
+        buying_pw  = float(acc.get('buying_power', 0) or 0)
+        day_change = equity - last_equity
+        day_pct    = (day_change / last_equity * 100) if last_equity else 0.0
+        acct_block = (
+            f"• *Equity:* ${equity:,.2f}\n"
+            f"• *Since prior close:* ${day_change:+,.2f} ({day_pct:+.2f}%)\n"
+            f"• *Cash:* ${cash:,.2f}  |  *Buying power:* ${buying_pw:,.2f}"
+        )
+        open_positions = positions or []
+    else:
+        acct_block = "_⚠️ Could not fetch live account snapshot from Alpaca._"
+        open_positions = []
+
+    # ── Open positions w/ unrealized P&L ───────────────────────────────────
+    if open_positions:
+        pos_lines = []
+        total_unreal = 0.0
+        for p in open_positions:
+            if not isinstance(p, dict):
+                continue
+            upl = float(p.get('unrealized_pl', 0) or 0)
+            total_unreal += upl
+            uplpc = float(p.get('unrealized_plpc', 0) or 0) * 100
+            pos_lines.append(
+                f"• {p.get('symbol','?')} x{p.get('qty','?')} @ "
+                f"${float(p.get('avg_entry_price',0) or 0):.2f} → "
+                f"${float(p.get('current_price',0) or 0):.2f}  "
+                f"(${upl:+,.2f} / {uplpc:+.1f}%)"
+            )
+        pos_block = "\n".join(pos_lines) + f"\n*Total unrealized:* ${total_unreal:+,.2f}"
+    else:
+        pos_block = "_No open positions._"
+
+    # ── Realized trades in the window (from the ledger) ────────────────────
+    with db_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT ticker, action, asset_class, quantity, price, pnl, detail, timestamp "
+                "FROM trade_history WHERE timestamp >= ? ORDER BY id ASC",
+                (start_utc,),
+            )
+            trades = c.fetchall()
+
+    entries = [t for t in trades if t[1] in ("BUY", "OPEN")]
+    exits   = [t for t in trades if t[1] in ("SELL", "CLOSE")]
+    realized = sum((t[5] or 0.0) for t in exits)
+    wins   = [t for t in exits if (t[5] or 0.0) > 0]
+    losses = [t for t in exits if (t[5] or 0.0) < 0]
+    win_rate = (len(wins) / len(exits) * 100) if exits else 0.0
+
+    def _class_pnl(cls):
+        return sum((t[5] or 0.0) for t in exits if (t[2] or "equity") == cls)
+    eq_pnl, opt_pnl = _class_pnl("equity"), _class_pnl("option")
+
+    def _fmt_trades(rows, n=8):
+        if not rows:
+            return "_None_"
+        out = []
+        for ticker, action, cls, qty, price, pnl, detail, ts in rows[:n]:
+            kind = "opt" if (cls or "") == "option" else "eq"
+            pnl_str = f" | ${pnl:+.2f}" if (action in ("SELL", "CLOSE") and pnl is not None) else ""
+            out.append(f"• `{str(ts)[11:16]}` {action} {ticker} [{kind}] "
+                       f"x{qty:g} @ ${price:.2f}{pnl_str}")
+        extra = f"\n_…and {len(rows) - n} more_" if len(rows) > n else ""
+        return "\n".join(out) + extra
+
+    best  = max(exits, key=lambda t: (t[5] or 0.0), default=None)
+    worst = min(exits, key=lambda t: (t[5] or 0.0), default=None)
+    def _one(t):
+        return f"{t[0]} {t[1]} ${t[5]:+.2f}" if t else "—"
+
+    report = (
+        f"📊 *{title} Report — {period_desc}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"*Account*\n{acct_block}\n\n"
+        f"*Trades this {'day' if scope == 'day' else 'week'}*\n"
+        f"• Entries: {len(entries)}  |  Exits: {len(exits)}\n"
+        f"• Realized P&L: ${realized:+,.2f}\n"
+        f"• Win rate: {win_rate:.0f}%  ({len(wins)}W / {len(losses)}L)\n"
+        f"• By class: equity ${eq_pnl:+,.2f}  |  options ${opt_pnl:+,.2f}\n"
+        f"• Best: {_one(best)}  |  Worst: {_one(worst)}\n\n"
+        f"*Open Positions*\n{pos_block}\n\n"
+        f"*Entries*\n{_fmt_trades(entries)}\n\n"
+        f"*Exits*\n{_fmt_trades(exits)}\n\n"
+        f"_Generated {now.strftime('%Y-%m-%d %H:%M ET')} from the trade ledger._"
+    )
+    return report
+
+
+def _send_report(scope: str):
+    """Generate and Telegram-push an EOD/EOW report, chunking to Telegram limits."""
+    try:
+        text = generate_activity_report(scope)
+        for chunk in smart_split(text, chars_per_string=4096):
+            bot.send_message(CHAT_ID, chunk, parse_mode="Markdown")
+        logger.info(f"{scope}-report sent.")
+    except Exception as e:
+        logger.error(f"{scope}-report failed: {e}")
+        try:
+            bot.send_message(CHAT_ID, f"⚠️ {scope.upper()} report failed to generate: {e}")
+        except Exception:
+            pass
+
+
+def run_eod_report():
+    """End-of-day summary. Scheduled ~16:05 ET on trading days."""
+    if datetime.now(ZoneInfo("America/New_York")).weekday() >= 5:
+        return  # skip weekends
+    _send_report("day")
+
+
+def run_eow_report():
+    """End-of-week summary. Scheduled ~16:10 ET Friday."""
+    _send_report("week")
+
+
+@bot.message_handler(commands=['eod'])
+def cmd_eod(message):
+    """/eod — on-demand end-of-day account summary."""
+    _send_report("day")
+
+
+@bot.message_handler(commands=['eow'])
+def cmd_eow(message):
+    """/eow — on-demand end-of-week account summary."""
+    _send_report("week")
 
 
 @bot.message_handler(commands=['monthly_report'])

@@ -189,6 +189,7 @@ private:
         return {};
     }
 
+public:
     struct BarData {
         double price = 0.0;
         double sma20 = 0.0;
@@ -199,7 +200,9 @@ private:
     };
 
     // Identical RSI/ATR/SMA calculation to OptionsSignalGenerator for consistency.
-    BarData fetchBars(const std::string& symbol) const {
+    // Public + static so the execution engine's rule-based exit monitor evaluates
+    // exits using the exact same indicators that produced the entry.
+    static BarData fetchBars(const std::string& symbol) {
         try {
             httplib::Client cli("https://query1.finance.yahoo.com");
             cli.set_connection_timeout(std::chrono::seconds(8));
@@ -270,6 +273,7 @@ private:
         return {};
     }
 
+private:
     // ── Signal qualification ──────────────────────────────────────────────────
     //
     // BUY criteria (all must pass):

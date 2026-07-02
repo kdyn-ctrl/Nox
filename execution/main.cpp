@@ -56,6 +56,11 @@ struct TradeSignal {
     // CN-RULE-001: Trade date used for T+1 enforcement.
     // Backtester feeds this field; live execution defaults to today's system date.
     std::string trade_date = "";
+    // Human-readable origin of an internally-generated SELL (e.g. "rule:Take-profit
+    // (+15.2%)", "trailing_stop_close"). Empty means an externally-supplied webhook
+    // signal. Surfaced in the close reason, the T+1-block Telegram message, and
+    // /recent-signals so an operator can distinguish sources at a glance.
+    std::string source = "";
 };
 
 // Tracks the purchase date of an open A-share position.
@@ -152,6 +157,7 @@ private:
     double      kellyFraction;
     int         cnBoardLotSize;   // CN-RULE-001: configurable via CN_BOARD_LOT_SIZE (default 1)
     std::string cnPositionsPath;  // path for T+1 persistence file
+    std::string equityPositionsPath_; // path for equity trailing-stop tracking persistence
     RegimeStateMachine regimeMachine;
     std::string last_analyst_report_time;
 
@@ -171,6 +177,19 @@ private:
     int    equityMaxSignals_          = 2;
     bool   equityScanEnabled_         = true;
     bool   equityBypassHours_         = false;
+
+    // ── Rule-based equity exit config ─────────────────────────────────────────
+    // Evaluated by the trailing-stop monitor thread on each 5-min cycle for every
+    // open equity position. These are the strategy-consistent inverse of the entry
+    // rules (trend-following momentum): take profit, hard-stop backup, RSI
+    // exhaustion, and trend break below SMA20. Each rule is individually
+    // configurable; set a threshold to 0 (or the toggle to false) to disable it.
+    bool   equityRuleExitsEnabled_  = true;
+    double equityExitTakeProfitPct_ = 0.15; // +15% unrealized → take profit
+    double equityExitStopLossPct_   = 0.10; // -10% unrealized → hard-stop backup
+    double equityExitRsiCeiling_    = 78.0; // RSI ≥ ceiling → momentum exhausted
+    bool   equityExitSmaBreak_      = true; // close < SMA20 → uptrend broken
+    int    equityExitMaxHoldDays_   = 0;    // 0 = disabled
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
     // SIGTERM sets running_ = false and calls shutdown(), which stops the HTTP
@@ -203,6 +222,7 @@ private:
         double price = 0.0;
         double rsi   = 0.0;
         double vix   = 0.0;
+        std::string source; // origin tag for internally-generated SELLs; empty = webhook
     };
     std::deque<SignalLogEntry> signal_log_;
     std::mutex                 signal_log_mutex_;
@@ -215,7 +235,7 @@ private:
         std::ostringstream ts;
         ts << std::put_time(::gmtime_r(&time_t, &tm_buf), "%Y-%m-%dT%H:%M:%SZ");
         std::lock_guard<std::mutex> lock(signal_log_mutex_);
-        signal_log_.push_back({ts.str(), s.ticker, s.action, s.price, s.rsi, s.vix});
+        signal_log_.push_back({ts.str(), s.ticker, s.action, s.price, s.rsi, s.vix, s.source});
         if (signal_log_.size() > SIGNAL_LOG_MAX)
             signal_log_.pop_front();
     }
@@ -246,18 +266,45 @@ private:
         int quantity;
         double entry_price;
         std::chrono::system_clock::time_point entry_time;
+        // Last values seen from Alpaca while the position was still open. When the
+        // position later disappears (trailing stop hit), last_pnl is the best
+        // available estimate of realized P&L for the trade ledger.
+        double last_price = 0.0;
+        double last_pnl   = 0.0;
     };
 
     std::map<std::string, OpenEquityPosition> equity_positions_;
     std::mutex equity_positions_mutex_;
 
-    // Returns today's date as "YYYY-MM-DD" in the local system timezone.
+    // Returns today's date as "YYYY-MM-DD" anchored to US Eastern (the market this
+    // engine actually trades on via Alpaca) — NOT the container's local timezone.
+    // Two bugs this fixes:
+    //   1. std::localtime() returns a pointer into a single process-wide static
+    //      buffer — not thread-safe. This is called from both the webhook handler
+    //      thread and the monitor thread; a race could corrupt the date the
+    //      CN-RULE-002 T+1 gate compares against. gmtime_r (used here, and already
+    //      used elsewhere in this file, e.g. record_signal()) is reentrant.
+    //   2. The execution-engine container sets no TZ (defaults to UTC on Ubuntu),
+    //      unlike analyst-brain which explicitly sets TZ=America/New_York. UTC's
+    //      calendar date flips 4-5 hours before US Eastern's does, so a SELL
+    //      arriving in the US evening could compute "tomorrow" in UTC while it's
+    //      still "today" by US trading-day convention — letting a same-day
+    //      round-trip silently slip past the T+1 gate. Anchoring to ET (via the
+    //      same approximate DST offset already used by is_us_market_hours() and
+    //      EquitySignalGenerator::isMarketHours()) fixes this for the market this
+    //      engine actually trades on today. A real Beijing-time A-share venue
+    //      would need a per-venue offset — out of scope until that venue exists.
     static std::string get_today_date_string() {
         auto now    = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
-        std::tm* tm_ptr = std::localtime(&time_t);
+        std::tm utc{};
+        gmtime_r(&time_t, &utc);
+        int offset_h = (utc.tm_mon >= 3 && utc.tm_mon <= 9) ? 4 : 5; // EDT vs EST
+        std::time_t et_time = time_t - offset_h * 3600;
+        std::tm et{};
+        gmtime_r(&et_time, &et);
         std::ostringstream oss;
-        oss << std::put_time(tm_ptr, "%Y-%m-%d");
+        oss << std::put_time(&et, "%Y-%m-%d");
         return oss.str();
     }
 
@@ -315,9 +362,100 @@ private:
         }
     }
 
-    // Fetch all open positions from Alpaca
-    std::vector<std::string> fetch_open_positions() {
-        std::vector<std::string> tickers;
+    // Writes equity_positions_ to disk as JSON. Caller must hold equity_positions_mutex_.
+    // Persisting this map lets the trailing-stop monitor survive restarts instead of
+    // forgetting every open position (which orphaned trailing-stop fills before).
+    void persist_equity_positions_locked() {
+        try {
+            json j = json::object();
+            for (const auto& kv : equity_positions_) {
+                j[kv.first] = {
+                    {"quantity",    kv.second.quantity},
+                    {"entry_price", kv.second.entry_price}
+                };
+            }
+            std::ofstream f(equityPositionsPath_, std::ios::trunc);
+            if (f.is_open()) f << j.dump(2);
+        } catch (const std::exception& e) {
+            Logger::log("WARN", "[TRAILING_STOP_MONITOR] Failed to persist equity positions: " +
+                        std::string(e.what()));
+        }
+    }
+
+    // Loads equity_positions_ from disk, then RECONCILES against Alpaca so the map
+    // always reflects broker reality after a restart:
+    //   • Alpaca position not in the map  → adopt it (recover entry from disk if known,
+    //     else use Alpaca's average entry price) so its trailing stop is monitored.
+    //   • Map entry no longer open at Alpaca → drop it (already closed while we were down).
+    void load_and_reconcile_equity_positions() {
+        std::map<std::string, OpenEquityPosition> from_disk;
+        std::ifstream f(equityPositionsPath_);
+        if (f.is_open()) {
+            try {
+                json j = json::parse(f);
+                for (auto it = j.begin(); it != j.end(); ++it) {
+                    OpenEquityPosition p;
+                    p.ticker      = it.key();
+                    p.quantity    = it.value().value("quantity", 0);
+                    p.entry_price = it.value().value("entry_price", 0.0);
+                    p.entry_time  = std::chrono::system_clock::now();
+                    from_disk[it.key()] = p;
+                }
+            } catch (const std::exception& e) {
+                Logger::log("WARN", "[TRAILING_STOP_MONITOR] Could not parse equity positions file: " +
+                            std::string(e.what()));
+            }
+        }
+
+        bool fetch_ok = false;
+        auto live = fetch_open_positions_map(fetch_ok);
+        std::lock_guard<std::mutex> lock(equity_positions_mutex_);
+        if (!fetch_ok) {
+            // Alpaca unreachable at startup — keep whatever we loaded from disk rather
+            // than wiping tracking. The monitor will reconcile naturally once online.
+            equity_positions_ = from_disk;
+            Logger::log("WARN", "[TRAILING_STOP_MONITOR] Alpaca unreachable at startup — "
+                        "using " + std::to_string(from_disk.size()) +
+                        " position(s) from disk pending live reconcile.");
+            return;
+        }
+        equity_positions_.clear();
+        int adopted = 0;
+        for (const auto& kv : live) {
+            const std::string& ticker = kv.first;
+            OpenEquityPosition p;
+            p.ticker     = ticker;
+            p.quantity   = static_cast<int>(kv.second.qty);
+            auto d = from_disk.find(ticker);
+            p.entry_price = (d != from_disk.end() && d->second.entry_price > 0.0)
+                                ? d->second.entry_price
+                                : kv.second.avg_entry;
+            p.entry_time  = std::chrono::system_clock::now();
+            p.last_price  = kv.second.current_price;
+            p.last_pnl    = kv.second.unrealized_pl;
+            equity_positions_[ticker] = p;
+            adopted++;
+        }
+        persist_equity_positions_locked();
+        Logger::log("INFO", "[TRAILING_STOP_MONITOR] Reconciled equity positions with Alpaca — " +
+                    std::to_string(adopted) + " open position(s) now tracked.");
+    }
+
+    // A live Alpaca position snapshot used for reconciliation and P&L tracking.
+    struct AlpacaPositionSnapshot {
+        double qty           = 0.0;
+        double avg_entry     = 0.0;
+        double current_price = 0.0;
+        double unrealized_pl = 0.0;
+    };
+
+    // Fetch all open positions from Alpaca, keyed by symbol. Sets ok=false on any
+    // fetch/parse failure so callers can distinguish "no open positions" (ok=true,
+    // empty) from "couldn't reach Alpaca" (ok=false) — critical so a transient
+    // outage is never misread as every position having closed.
+    std::map<std::string, AlpacaPositionSnapshot> fetch_open_positions_map(bool& ok) {
+        std::map<std::string, AlpacaPositionSnapshot> out;
+        ok = false;
         try {
             httplib::Client alpaca_cli(alpacaBaseUrl);
             alpaca_cli.set_connection_timeout(std::chrono::seconds(5));
@@ -332,26 +470,130 @@ private:
             if (!res || res->status != 200) {
                 Logger::log("WARN", "[TRAILING_STOP_MONITOR] Failed to fetch positions (HTTP " +
                             std::to_string(res ? res->status : 0) + ")");
-                return tickers;
+                return out;
             }
 
             json positions = json::parse(res->body);
             if (positions.is_array()) {
                 for (const auto& pos : positions) {
                     std::string ticker = pos.value("symbol", "");
-                    if (!ticker.empty()) {
-                        tickers.push_back(ticker);
-                    }
+                    if (ticker.empty()) continue;
+                    AlpacaPositionSnapshot s;
+                    // Alpaca returns these numeric fields as JSON strings.
+                    try { s.qty           = std::stod(pos.value("qty", "0")); }           catch (...) {}
+                    try { s.avg_entry     = std::stod(pos.value("avg_entry_price", "0")); } catch (...) {}
+                    try { s.current_price = std::stod(pos.value("current_price", "0")); }  catch (...) {}
+                    try { s.unrealized_pl = std::stod(pos.value("unrealized_pl", "0")); }  catch (...) {}
+                    out[ticker] = s;
                 }
             }
+            ok = true; // reached Alpaca and parsed the array (possibly empty)
         } catch (const std::exception& e) {
             Logger::log("WARN", "[TRAILING_STOP_MONITOR] Exception fetching positions: " +
                         std::string(e.what()));
         }
-        return tickers;
+        return out;
     }
 
     // Monitor equity positions and detect trailing stop executions
+    // Approximate US market-hours check (Mon–Fri 09:30–16:00 ET, DST-approx).
+    // Used to gate rule-based liquidations so we never fire a market order after
+    // hours (where it would reject or fill at a bad open).
+    static bool is_us_market_hours() {
+        auto now = std::chrono::system_clock::now();
+        auto tt  = std::chrono::system_clock::to_time_t(now);
+        std::tm utc{};
+        gmtime_r(&tt, &utc);
+        if (utc.tm_wday == 0 || utc.tm_wday == 6) return false;
+        int offset_h = (utc.tm_mon >= 3 && utc.tm_mon <= 9) ? 4 : 5; // EDT vs EST
+        int et_mins  = ((utc.tm_hour - offset_h + 24) % 24) * 60 + utc.tm_min;
+        return et_mins >= 9 * 60 + 30 && et_mins < 16 * 60;
+    }
+
+    // Rule-based equity exit evaluation. For each open tracked position, apply the
+    // configured exit rules and liquidate the first one that fires. Price rules
+    // (take-profit / stop-loss / time) are checked first with no network cost;
+    // indicator rules (RSI exhaustion, SMA20 trend break) fetch the same bars the
+    // entry used and are only consulted if no price rule triggered.
+    void evaluate_equity_exit_rules(const std::map<std::string, AlpacaPositionSnapshot>& current) {
+        if (!equityRuleExitsEnabled_) return;
+        if (!equityBypassHours_ && !is_us_market_hours()) return; // don't liquidate after hours
+
+        struct Candidate {
+            std::string ticker;
+            double entry;
+            double price;
+            std::chrono::system_clock::time_point entry_time;
+        };
+        std::vector<Candidate> cands;
+        {
+            std::lock_guard<std::mutex> lock(equity_positions_mutex_);
+            for (const auto& kv : equity_positions_) {
+                auto it = current.find(kv.first);
+                if (it == current.end()) continue; // not currently open at Alpaca
+                cands.push_back({kv.first, kv.second.entry_price,
+                                 it->second.current_price, kv.second.entry_time});
+            }
+        }
+
+        auto pct = [](double v) {
+            std::ostringstream o; o << std::showpos << std::fixed << std::setprecision(1) << v * 100.0 << "%";
+            return o.str();
+        };
+
+        for (const auto& c : cands) {
+            if (!running_.load()) break;
+            std::string reason;
+            double ret = (c.entry > 0.0 && c.price > 0.0) ? (c.price - c.entry) / c.entry : 0.0;
+
+            if (equityExitTakeProfitPct_ > 0.0 && ret >= equityExitTakeProfitPct_) {
+                reason = "Take-profit (" + pct(ret) + ")";
+            } else if (equityExitStopLossPct_ > 0.0 && ret <= -equityExitStopLossPct_) {
+                reason = "Stop-loss (" + pct(ret) + ")";
+            } else if (equityExitMaxHoldDays_ > 0) {
+                long held_days = std::chrono::duration_cast<std::chrono::hours>(
+                    std::chrono::system_clock::now() - c.entry_time).count() / 24;
+                if (held_days >= equityExitMaxHoldDays_)
+                    reason = "Time stop (" + std::to_string(held_days) + "d held)";
+            }
+
+            double exit_rsi = 50.0;
+            if (reason.empty() && (equityExitRsiCeiling_ > 0.0 || equityExitSmaBreak_)) {
+                auto d = nox::equity_signal::EquitySignalGenerator::fetchBars(c.ticker);
+                if (d.valid) {
+                    exit_rsi = d.rsi14;
+                    std::ostringstream r;
+                    if (equityExitRsiCeiling_ > 0.0 && d.rsi14 >= equityExitRsiCeiling_) {
+                        r << std::fixed << std::setprecision(1) << d.rsi14;
+                        reason = "RSI exhaustion (" + r.str() + " ≥ " +
+                                 std::to_string(static_cast<int>(equityExitRsiCeiling_)) + ")";
+                    } else if (equityExitSmaBreak_ && d.price < d.sma20) {
+                        reason = "Trend break (close below SMA20)";
+                    }
+                }
+                // Gentle pacing for the Yahoo bar endpoint across multiple positions.
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            }
+
+            if (!reason.empty()) {
+                Logger::log("INFO", "[EQUITY_EXIT] " + c.ticker + " → " + reason + " — liquidating.");
+                // Route through the same pipeline a webhook SELL takes (record_signal +
+                // process()) instead of closing directly: this gets the CN-RULE-002 T+1
+                // gate applied to rule-triggered exits (previously bypassed — a real
+                // correctness gap, not just an observability one) and makes the exit
+                // visible in /signals and /details via the tagged `source`.
+                TradeSignal sell_sig;
+                sell_sig.ticker = c.ticker;
+                sell_sig.action = "SELL";
+                sell_sig.price  = c.price;
+                sell_sig.rsi    = exit_rsi;
+                sell_sig.source = "rule:" + reason;
+                record_signal(sell_sig);
+                process(sell_sig);
+            }
+        }
+    }
+
     void monitor_trailing_stops() {
         Logger::log("INFO", "[TRAILING_STOP_MONITOR] Thread started. Checking for trailing stop fills every 5 minutes.");
 
@@ -368,57 +610,95 @@ private:
             if (!running_.load()) break;
 
             try {
-                std::vector<std::string> current_positions = fetch_open_positions();
-                std::set<std::string> current_tickers(current_positions.begin(), current_positions.end());
-
-                // Check which positions we were tracking have closed
-                std::vector<std::string> closed_tickers;
-                {
-                    std::lock_guard<std::mutex> lock(equity_positions_mutex_);
-                    for (const auto& kv : equity_positions_) {
-                        if (current_tickers.find(kv.first) == current_tickers.end()) {
-                            // Position was tracked but is no longer open — it was closed (likely by trailing stop)
-                            closed_tickers.push_back(kv.first);
-                        }
-                    }
+                bool fetch_ok = false;
+                auto current = fetch_open_positions_map(fetch_ok);
+                if (!fetch_ok) {
+                    // Couldn't reach Alpaca — do NOT treat tracked positions as closed,
+                    // or we'd record phantom exits. Skip this cycle and retry later.
+                    Logger::log("WARN", "[TRAILING_STOP_MONITOR] Position fetch failed — "
+                                "skipping close-detection this cycle.");
+                    continue;
                 }
 
-                // For each closed position, record a synthetic SELL signal
-                for (const auto& ticker : closed_tickers) {
+                // Snapshot the closed tickers (tracked, but no longer open at Alpaca)
+                // and refresh last-seen P&L for those still open — all under one lock
+                // so a concurrent BUY/SELL can't race the detect-then-erase window.
+                struct ClosedInfo { int quantity; double last_price; double last_pnl; };
+                std::map<std::string, ClosedInfo> closed;
+                {
+                    std::lock_guard<std::mutex> lock(equity_positions_mutex_);
+                    for (auto& kv : equity_positions_) {
+                        auto it = current.find(kv.first);
+                        if (it == current.end()) {
+                            // Tracked but no longer open — closed (likely trailing stop).
+                            closed[kv.first] = ClosedInfo{
+                                kv.second.quantity, kv.second.last_price, kv.second.last_pnl};
+                        } else {
+                            // Still open — refresh last-seen values for future P&L estimate.
+                            kv.second.last_price = it->second.current_price;
+                            kv.second.last_pnl   = it->second.unrealized_pl;
+                        }
+                    }
+                    // Erase closed entries now, while we still hold the lock.
+                    for (const auto& kv : closed) equity_positions_.erase(kv.first);
+                    if (!closed.empty()) persist_equity_positions_locked();
+                }
+
+                // For each closed position, record the exit to the ledger + notify.
+                for (const auto& kv : closed) {
+                    const std::string& ticker = kv.first;
+                    const ClosedInfo&  info   = kv.second;
                     Logger::log("INFO", "[TRAILING_STOP_MONITOR] Position " + ticker +
                                 " detected as closed — likely hit trailing stop.");
 
                     TradeSignal sell_signal;
                     sell_signal.ticker = ticker;
                     sell_signal.action = "SELL";
-                    sell_signal.price = 0.0;  // Price unavailable without additional API call
-                    sell_signal.rsi = 50.0;
-                    sell_signal.vol = 0;
-                    sell_signal.atr = 0.0;
-
-                    // Record this synthetic SELL signal
+                    sell_signal.price  = info.last_price;
+                    sell_signal.rsi    = 50.0;
+                    sell_signal.vol    = 0;
+                    sell_signal.atr    = 0.0;
+                    sell_signal.source = "trailing_stop_close";
                     record_signal(sell_signal);
 
-                    // Log it for visibility
+                    // Ledger: record the exit with the last-seen unrealized P&L as the
+                    // best available realized figure (the position is already gone).
+                    if (positionManager_) {
+                        positionManager_->record_trade(
+                            ticker, "SELL", "equity",
+                            static_cast<double>(info.quantity), info.last_price,
+                            50.0, 0.0, info.last_pnl, "trailing_stop_close");
+                    }
+
+                    // CN-RULE-002: a trailing-stop close also lifts the T+1 record.
+                    {
+                        std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                        if (china_positions_.erase(ticker) > 0)
+                            persist_china_positions_locked();
+                    }
+
+                    std::ostringstream pnl_ss;
+                    pnl_ss << std::showpos << std::fixed << std::setprecision(2) << info.last_pnl;
                     TelegramNotifier::sendMessage(
                         "🔴 *TRAILING STOP DETECTED*\n"
                         "────────────────────────\n"
                         "• *Ticker:* " + ticker + "\n"
+                        "• *Est. P&L:* $" + pnl_ss.str() + "\n"
                         "• *Trigger:* Position closed (likely trailing stop hit)\n"
-                        "✅ SELL signal recorded automatically"
+                        "✅ Exit recorded to trade ledger"
                     );
-
-                    // Remove from tracking
-                    {
-                        std::lock_guard<std::mutex> lock(equity_positions_mutex_);
-                        equity_positions_.erase(ticker);
-                    }
                 }
+                std::vector<std::string> closed_tickers;
+                for (const auto& kv : closed) closed_tickers.push_back(kv.first);
 
                 if (!closed_tickers.empty()) {
                     Logger::log("INFO", "[TRAILING_STOP_MONITOR] Detected " +
                                 std::to_string(closed_tickers.size()) + " closed position(s).");
                 }
+
+                // Rule-based exits: liquidate any still-open position that trips a
+                // take-profit / stop-loss / RSI-exhaustion / trend-break / time rule.
+                evaluate_equity_exit_rules(current);
 
             } catch (const std::exception& e) {
                 Logger::log("WARN", "[TRAILING_STOP_MONITOR] Exception during monitoring: " +
@@ -508,6 +788,127 @@ private:
         }
     }
 
+    // Closes an open equity position at Alpaca: cancels resting orders (including
+    // the trailing stop), liquidates, records the exit to the trade ledger with the
+    // supplied reason, notifies, and clears local tracking (T+1 + equity maps).
+    // Shared by webhook SELL signals and the rule-based exit monitor so both close
+    // through one tested path. `reason` is surfaced in the ledger and Telegram.
+    void close_equity_position_alpaca(const std::string& ticker,
+                                      const std::string& reason,
+                                      double rsi) {
+        try {
+            httplib::Client alpaca_cli(alpacaBaseUrl);
+            // RULE-008: Strict timeout handling
+            alpaca_cli.set_connection_timeout(std::chrono::seconds(5));
+            alpaca_cli.set_read_timeout(std::chrono::seconds(10));
+
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID",     apiKey},
+                {"APCA-API-SECRET-KEY", apiSec}
+            };
+
+            // --- 0. Snapshot the position first so we can record realized P&L ---
+            // Alpaca's liquidate response doesn't include realized P&L, so read the
+            // open position's unrealized_pl (which becomes realized on close) and qty.
+            double closed_qty = 0.0, realized_pnl = 0.0, exit_price = 0.0;
+            {
+                auto snap = alpaca_cli.Get(("/v2/positions/" + ticker).c_str(), headers);
+                if (snap && snap->status == 200) {
+                    try {
+                        json p = json::parse(snap->body);
+                        closed_qty   = std::stod(p.value("qty", "0"));
+                        realized_pnl = std::stod(p.value("unrealized_pl", "0"));
+                        exit_price   = std::stod(p.value("current_price", "0"));
+                    } catch (...) { /* best-effort */ }
+                }
+            }
+
+            // --- 1. Cancel all open orders for the symbol to avoid interference ---
+            std::string cancel_path = "/v2/orders?symbol=" + ticker;
+            std::cout << "[EXECUTION] Canceling any existing orders for " << ticker << " before closing position..." << std::endl;
+            auto cancel_res = alpaca_cli.Delete(cancel_path.c_str(), headers);
+            if (cancel_res && (cancel_res->status == 200 || cancel_res->status == 207)) {
+                std::cout << "[EXECUTION] Existing orders for " << ticker << " canceled (or none existed)." << std::endl;
+            } else {
+                std::string cancel_status = cancel_res ? std::to_string(cancel_res->status) : "TIMEOUT";
+                std::cerr << "⚠️ [EXECUTION] Could not verify order cancellation for " << ticker
+                          << ". Status: " << cancel_status << ". Proceeding to close position." << std::endl;
+            }
+
+            // --- 2. Liquidate the entire position ---
+            std::string path = "/v2/positions/" + ticker;
+            std::cout << "[EXECUTION] Sending liquidate position request to Alpaca for " << ticker
+                      << " (reason: " << reason << ")..." << std::endl;
+            auto res = alpaca_cli.Delete(path.c_str(), headers);
+
+            if (res && res->status == 200) {
+                json response_data = json::parse(res->body);
+                std::cout << " [POSITION CLOSED] Alpaca response: " << response_data.dump(2) << std::endl;
+                // Ledger: record the equity exit with best-effort realized P&L.
+                if (positionManager_) {
+                    positionManager_->record_trade(
+                        ticker, "SELL", "equity",
+                        closed_qty, exit_price, rsi, 0.0, realized_pnl,
+                        reason + " order_id=" + response_data.value("id", "N/A"));
+                }
+                std::ostringstream pnl_ss;
+                pnl_ss << std::showpos << std::fixed << std::setprecision(2) << realized_pnl;
+                TelegramNotifier::sendMessage(
+                    "⚪ *POSITION CLOSED*\n"
+                    "────────────────────────\n"
+                    "• *Ticker:* " + ticker + "\n"
+                    "• *Reason:* " + reason + "\n"
+                    "• *Est. P&L:* $" + pnl_ss.str() + "\n"
+                    "• *Alpaca Order ID:* `" + response_data.value("id", "N/A") + "`"
+                );
+                // CN-RULE-002: Position is closed — remove from T+1 tracking map.
+                {
+                    std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                    china_positions_.erase(ticker);
+                    persist_china_positions_locked();
+                }
+                // Also remove from equity position tracking (trailing stop monitor)
+                {
+                    std::lock_guard<std::mutex> lock(equity_positions_mutex_);
+                    equity_positions_.erase(ticker);
+                    persist_equity_positions_locked();
+                }
+            } else {
+                std::string status_code = res ? std::to_string(res->status) : "TIMEOUT";
+                std::string details     = res ? res->body : "No response received.";
+
+                // A 404 here means we didn't have a position to close, which isn't a critical failure.
+                if (res && res->status == 404) {
+                    std::cerr << "ℹ️ [CLOSE IGNORED] No open position for " << ticker
+                              << " to close. Details: " << details << std::endl;
+                    // Position already gone — clear stale tracking so we don't retry it.
+                    {
+                        std::lock_guard<std::mutex> lock(equity_positions_mutex_);
+                        if (equity_positions_.erase(ticker) > 0) persist_equity_positions_locked();
+                    }
+                    TelegramNotifier::sendMessage(
+                        "ℹ️ *CLOSE IGNORED*\n"
+                        "────────────────────────\n"
+                        "• *Ticker:* " + ticker + "\n"
+                        "• *Details:* No open position found."
+                    );
+                } else {
+                    std::cerr << "⚠️ [CLOSE REJECTED] Failed to close " << ticker
+                              << ". Status: " << status_code << ", Details: " << details << std::endl;
+                    TelegramNotifier::sendMessage(
+                        "🚨 *CLOSE REJECTED*\n"
+                        "────────────────────────\n"
+                        "• *Ticker:* " + ticker + "\n"
+                        "• *Status Code:* " + status_code + "\n"
+                        "• *Details:* `" + details + "`"
+                    );
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "💥 Runtime Exception closing position for " << ticker << ": " << e.what() << std::endl;
+        }
+    }
+
     void process(TradeSignal sig) {
         // Skip processing if the action is HOLD or a REPORT audit payload
         if (sig.action == "HOLD" || sig.action == "REPORT") {
@@ -517,6 +918,11 @@ private:
 
         // --- SELL ROUTING: Close open position (enhanced) ---
         if (sig.action == "SELL") {
+            // Origin tag for this sell — empty (webhook) falls back to the historic
+            // wording; internally-generated sells (rule-based exits, trailing-stop
+            // closes) carry a human-readable reason via sig.source.
+            std::string sell_reason = sig.source.empty() ? "Webhook SELL Signal" : sig.source;
+
             // CN-RULE-002: T+1 Settlement Gate — only applies to Chinese A-shares.
             // US equities (cnBoardLotSize == 1) are exempt; only enforce when
             // routing to a Chinese exchange (cnBoardLotSize == 100).
@@ -532,11 +938,13 @@ private:
                             "[CN-RULE-002] T+1 gate blocked SELL for " + sig.ticker +
                             " — entry_date=" + it->second.entry_date +
                             " equals sell_date=" + effective_sell_date +
-                            ". Same-day round-trips are prohibited on Chinese A-shares.");
+                            ". Same-day round-trips are prohibited on Chinese A-shares. "
+                            "Trigger: " + sell_reason);
                         TelegramNotifier::sendMessage(
                             "🚫 *CN T+1 GATE BLOCKED*\n"
                             "────────────────────────\n"
                             "• *Ticker:* " + sig.ticker + "\n"
+                            "• *Trigger:* " + sell_reason + "\n"
                             "• *Entry Date:* " + it->second.entry_date + "\n"
                             "• *Sell Date:* " + effective_sell_date + "\n"
                             "⛔ Same-day sell prohibited (T+1 rule). Signal discarded."
@@ -591,86 +999,7 @@ private:
                 return;
             }
 #endif
-            try {
-                httplib::Client alpaca_cli(alpacaBaseUrl);
-                // RULE-008: Strict timeout handling
-                alpaca_cli.set_connection_timeout(std::chrono::seconds(5));
-                alpaca_cli.set_read_timeout(std::chrono::seconds(10));
-
-                httplib::Headers headers = {
-                    {"APCA-API-KEY-ID",     apiKey},
-                    {"APCA-API-SECRET-KEY", apiSec}
-                };
-
-                // --- 1. Cancel all open orders for the symbol to avoid interference ---
-                std::string cancel_path = "/v2/orders?symbol=" + sig.ticker;
-                std::cout << "[EXECUTION] Canceling any existing orders for " << sig.ticker << " before closing position..." << std::endl;
-                auto cancel_res = alpaca_cli.Delete(cancel_path.c_str(), headers);
-                if (cancel_res && (cancel_res->status == 200 || cancel_res->status == 207)) {
-                    // 207 Multi-Status can be returned. We consider it a success and proceed.
-                    std::cout << "[EXECUTION] Existing orders for " << sig.ticker << " canceled (or none existed)." << std::endl;
-                } else {
-                    // We log a warning but proceed anyway, as closing the position is the primary goal.
-                    std::string cancel_status = cancel_res ? std::to_string(cancel_res->status) : "TIMEOUT";
-                    std::cerr << "⚠️ [EXECUTION] Could not verify order cancellation for " << sig.ticker
-                              << ". Status: " << cancel_status << ". Proceeding to close position." << std::endl;
-                }
-
-                // --- 2. Liquidate the entire position ---
-                std::string path = "/v2/positions/" + sig.ticker;
-                std::cout << "[EXECUTION] Sending liquidate position request to Alpaca for " << sig.ticker << "..." << std::endl;
-                auto res = alpaca_cli.Delete(path.c_str(), headers);
-
-                if (res && res->status == 200) {
-                    json response_data = json::parse(res->body);
-                    std::cout << " [POSITION CLOSED] Alpaca response: " << response_data.dump(2) << std::endl;
-                    TelegramNotifier::sendMessage(
-                        "⚪ *POSITION CLOSED*\n"
-                        "────────────────────────\n"
-                        "• *Ticker:* " + sig.ticker + "\n"
-                        "• *Trigger:* Webhook SELL Signal\n"
-                        "• *Alpaca Order ID:* `" + response_data.value("id", "N/A") + "`"
-                    );
-                    // CN-RULE-002: Position is closed — remove from T+1 tracking map.
-                    {
-                        std::lock_guard<std::mutex> lock(china_positions_mutex_);
-                        china_positions_.erase(sig.ticker);
-                        persist_china_positions_locked();
-                    }
-                    // Also remove from equity position tracking (trailing stop monitor)
-                    {
-                        std::lock_guard<std::mutex> lock(equity_positions_mutex_);
-                        equity_positions_.erase(sig.ticker);
-                    }
-                } else {
-                    std::string status_code = res ? std::to_string(res->status) : "TIMEOUT";
-                    std::string details     = res ? res->body : "No response received.";
-                    
-                    // A 404 here means we didn't have a position to close, which isn't a critical failure.
-                    if (res && res->status == 404) {
-                         std::cerr << "ℹ️ [CLOSE IGNORED] No open position for " << sig.ticker
-                                  << " to close. Details: " << details << std::endl;
-                         TelegramNotifier::sendMessage(
-                                "ℹ️ *CLOSE IGNORED*\n"
-                                "────────────────────────\n"
-                                "• *Ticker:* " + sig.ticker + "\n"
-                                "• *Details:* No open position found."
-                            );
-                    } else {
-                        std::cerr << "⚠️ [CLOSE REJECTED] Failed to close " << sig.ticker
-                                  << ". Status: " << status_code << ", Details: " << details << std::endl;
-                        TelegramNotifier::sendMessage(
-                            "🚨 *CLOSE REJECTED*\n"
-                            "────────────────────────\n"
-                            "• *Ticker:* " + sig.ticker + "\n"
-                            "• *Status Code:* " + status_code + "\n"
-                            "• *Details:* `" + details + "`"
-                        );
-                    }
-                }
-            } catch (const std::exception& e) {
-                std::cerr << "💥 Runtime Exception closing position for " << sig.ticker << ": " << e.what() << std::endl;
-            }
+            close_equity_position_alpaca(sig.ticker, sell_reason, sig.rsi);
             return;
         }
 
@@ -858,7 +1187,11 @@ private:
                 );
 
                 // Record T+1 entry date for CN-RULE-002 enforcement.
-                {
+                // Only for Chinese A-shares (cnBoardLotSize > 1); US equities are exempt.
+                // (Matches the guard on the Alpaca BUY path below — this branch was
+                // previously unconditional, an asymmetry that would spuriously start a
+                // T+1 clock on every US-equity IBKR buy.)
+                if (cnBoardLotSize > 1) {
                     std::string entry_date = sig.trade_date.empty()
                         ? get_today_date_string() : sig.trade_date;
                     std::lock_guard<std::mutex> lock(china_positions_mutex_);
@@ -896,6 +1229,15 @@ private:
                     std::string order_id = response_data.value("id", "UNKNOWN");
                     std::cout << " [BUY ORDER EXECUTED] Alpaca Order ID: " << order_id << std::endl;
 
+                    // Ledger: record the equity entry (single source of truth for reports).
+                    if (positionManager_) {
+                        double kelly_ratio = (live_equity > 0.0) ? (notional_value / live_equity) : 0.0;
+                        positionManager_->record_trade(
+                            sig.ticker, "BUY", "equity",
+                            static_cast<double>(qty), sig.price, sig.rsi,
+                            kelly_ratio, 0.0, "order_id=" + order_id);
+                    }
+
                     // CN-RULE-002: Record entry date for T+1 enforcement.
                     // Only for Chinese A-shares (cnBoardLotSize > 1); US equities are exempt.
                     if (cnBoardLotSize > 1) {
@@ -903,6 +1245,14 @@ private:
                             ? get_today_date_string()
                             : sig.trade_date;
                         std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                        // Intentionally overwrites any existing entry with the newest
+                        // entry_date. Repeat-buying a ticker resets the T+1 clock for
+                        // the whole position — this looks wrong at a glance (lot-level
+                        // tracking would let already-settled shares sell), but this
+                        // system only ever fully liquidates a position (no partial sell
+                        // exists anywhere), so blocking the entire position until the
+                        // *most recent* buy clears T+1 is the only correct behavior
+                        // without real per-lot dates. Do not "fix" this into a min().
                         china_positions_[sig.ticker] = ChinaPositionRecord{entry_date};
                         persist_china_positions_locked();
                         Logger::log("INFO",
@@ -957,6 +1307,7 @@ private:
                             sig.price,
                             std::chrono::system_clock::now()
                         };
+                        persist_equity_positions_locked();
                     }
                     Logger::log("INFO", "[TRAILING_STOP_MONITOR] Tracking position: " +
                                 sig.ticker + " x" + std::to_string(qty));
@@ -1082,6 +1433,16 @@ public:
         Logger::log("INFO", "[CN-RULE-002] T+1 positions persistence path: " + cnPositionsPath);
         load_china_positions();
 
+        // Equity trailing-stop tracking persistence (survives restarts + reconciles
+        // against Alpaca so no open position is ever orphaned by a restart).
+        const char* eq_path_env = std::getenv("EQUITY_POSITIONS_PATH");
+        equityPositionsPath_ = (eq_path_env && std::string(eq_path_env) != "")
+            ? std::string(eq_path_env)
+            : "/app/data/equity_positions.json";
+        Logger::log("INFO", "[TRAILING_STOP_MONITOR] Equity positions persistence path: " +
+                    equityPositionsPath_);
+        load_and_reconcile_equity_positions();
+
         // ── Options signal generator profiles (all env vars optional) ──────────
         {
             // Helper: parse a comma-separated watchlist string into a vector
@@ -1157,6 +1518,32 @@ public:
             equityScanIntervalMinutes_ = envInt("EQUITY_SCAN_INTERVAL_MINUTES", 30);
             equityMaxSignals_          = envInt("EQUITY_SCAN_MAX_SIGNALS", 2);
             equityBypassHours_         = envBool("EQUITY_SCAN_BYPASS_HOURS");
+
+            // Rule-based equity exits (defaults on; per-rule tunable via .env).
+            {
+                const char* re = std::getenv("EQUITY_RULE_EXITS_ENABLED");
+                if (re && std::string(re) != "") {
+                    std::string sv(re);
+                    std::transform(sv.begin(), sv.end(), sv.begin(),
+                        [](unsigned char c){ return std::tolower(c); });
+                    equityRuleExitsEnabled_ = (sv == "true" || sv == "1" || sv == "yes");
+                }
+            }
+            equityExitTakeProfitPct_ = envDbl("EQUITY_EXIT_TAKE_PROFIT_PCT", 0.15);
+            equityExitStopLossPct_   = envDbl("EQUITY_EXIT_STOP_LOSS_PCT",   0.10);
+            equityExitRsiCeiling_    = envDbl("EQUITY_EXIT_RSI_CEILING",     78.0);
+            equityExitSmaBreak_      = [](){ const char* v = std::getenv("EQUITY_EXIT_SMA_BREAK");
+                                            return !v || std::string(v) == "" ||
+                                                   std::string(v) == "true" || std::string(v) == "1"; }();
+            equityExitMaxHoldDays_   = envInt("EQUITY_EXIT_MAX_HOLD_DAYS", 0);
+
+            Logger::log("INFO", std::string("[EQUITY_EXIT] Rule-based exits ") +
+                (equityRuleExitsEnabled_ ? "ENABLED" : "DISABLED") +
+                " | TP=" + std::to_string(equityExitTakeProfitPct_ * 100.0) + "%" +
+                " | SL=" + std::to_string(equityExitStopLossPct_ * 100.0) + "%" +
+                " | RSI≥" + std::to_string(equityExitRsiCeiling_) +
+                " | SMA20-break=" + (equityExitSmaBreak_ ? "on" : "off") +
+                " | MaxHold=" + std::to_string(equityExitMaxHoldDays_) + "d");
 
             Logger::log("INFO", "[EQUITY_SCAN] " +
                 std::string(equityScanEnabled_ ? "ENABLED" : "DISABLED") +
@@ -1279,10 +1666,37 @@ public:
                     {"action",      e.action},
                     {"price",       e.price},
                     {"rsi",         e.rsi},
-                    {"vix",         e.vix}
+                    {"vix",         e.vix},
+                    {"source",      e.source}
                 });
             }
             res.set_content(arr.dump(), "application/json");
+        });
+
+        // Simple diagnostic surface for CN-RULE-001/002: one command answers "is
+        // CN A-share protection currently active, and what does it think it's
+        // tracking" without grepping logs. gate_active mirrors the exact condition
+        // used by both the board-lot truncation and the T+1 gate (cnBoardLotSize > 1).
+        svr.Get("/cn-status", [this](const httplib::Request&, httplib::Response& res) {
+            std::string today = get_today_date_string();
+            json positions = json::array();
+            {
+                std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                for (const auto& kv : china_positions_) {
+                    positions.push_back({
+                        {"ticker",     kv.first},
+                        {"entry_date", kv.second.entry_date},
+                        {"cleared",    kv.second.entry_date < today}
+                    });
+                }
+            }
+            json response = {
+                {"board_lot_size", cnBoardLotSize},
+                {"gate_active",    cnBoardLotSize > 1},
+                {"today",          today},
+                {"positions",      positions}
+            };
+            res.set_content(response.dump(), "application/json");
         });
 
         svr.Post("/options/price", [](const httplib::Request& req, httplib::Response& res) {
@@ -1481,6 +1895,31 @@ public:
 
                 nox::options_signal::OptionsSignalGenerator generator(
                     alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat, profile);
+
+                // Persist every auto-executed option so the exit monitor can manage
+                // it (50%/stop/21-DTE) and it lands in the trade ledger for reports.
+                generator.set_execution_recorder(
+                    [this](const nox::options_signal::OptionsSignal& s, int qty) {
+                        if (!positionManager_) return;
+                        const bool is_short   = (s.strategy == "CSP" || s.strategy == "CC");
+                        const bool single_leg = (s.strategy == "LONG_CALL" || s.strategy == "LONG_PUT" ||
+                                                 s.strategy == "CSP"       || s.strategy == "CC");
+                        std::string profile_type = is_short ? "short_premium" : "long";
+                        std::string opt_type = (s.option_type == nox::options::OptionType::Call)
+                                                   ? "call" : "put";
+                        std::string entry_date = get_today_date_string();
+                        // Only single-leg strategies map to the monitor's exit rules.
+                        // Multi-leg (spreads/straddles) are logged but not auto-exited.
+                        if (single_leg) {
+                            positionManager_->add_position(
+                                s.underlying, opt_type, s.strike, qty, s.entry_price,
+                                entry_date, profile_type, s.expiry_date);
+                        }
+                        positionManager_->record_trade(
+                            s.underlying, "OPEN", "option",
+                            static_cast<double>(qty), s.entry_price, s.rsi, 0.0, 0.0,
+                            s.strategy + (single_leg ? "" : " (multi-leg: exit not auto-managed)"));
+                    });
 
                 while (running_.load()) {
                     try {

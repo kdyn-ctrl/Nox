@@ -22,6 +22,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <functional>
 #include <thread>
 #include <vector>
 
@@ -213,6 +214,13 @@ public:
         , profile_(std::move(profile))
     {}
 
+    // Optional hook invoked after an option order is successfully placed.
+    // The engine wires this to PositionManager so the fill is persisted to
+    // open_positions (for exit monitoring) and to the trade_history ledger.
+    // Kept as a callback so this header stays decoupled from PositionManager.
+    using ExecutionRecorder = std::function<void(const OptionsSignal& sig, int qty_contracts)>;
+    void set_execution_recorder(ExecutionRecorder cb) { execution_recorder_ = std::move(cb); }
+
     // Entry point — called once per scan cycle from the engine's background thread.
     void run_scan(double live_equity) {
         // ── Market hours gate ─────────────────────────────────────────────────
@@ -328,6 +336,7 @@ private:
     std::string tgToken_;
     std::string tgChatId_;
     RiskProfile profile_;
+    ExecutionRecorder execution_recorder_;         // optional fill-persistence hook
     RegimeStateMachine regimeMachine_;
     nox::liquidity::LiquidityGate liquidity_gate_; // WS5 microstructure gate
 
@@ -1341,6 +1350,15 @@ private:
 
         if (result.success) {
             log("INFO", "[OPTIONS_EXEC] Order placed — " + result.message);
+            // Persist the fill so it's tracked for exits and shows up in reports.
+            // Without this the position lives only at the broker and is never sold.
+            if (execution_recorder_) {
+                try {
+                    execution_recorder_(sig, profile_.qty_contracts);
+                } catch (const std::exception& e) {
+                    log("WARN", std::string("[OPTIONS_EXEC] execution_recorder failed: ") + e.what());
+                }
+            }
             sendTelegram(
                 "✅ *OPTIONS ORDER PLACED*\n"
                 "────────────────────────\n"
