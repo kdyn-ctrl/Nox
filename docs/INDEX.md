@@ -13,13 +13,13 @@
 ## 🚀 Core Services
 
 ### `/execution` — Execution Engine (C++)
-Webhook-enabled order execution, risk management, and options signal generation
-- Listens on **port 8080** (exposed to host)
-- Receives JSON webhooks from TradingView for equity trades
+Order execution, risk management, and options signal generation
+- Listens on **port 8080** for trade signals (webhook endpoint)
+- Rule-based equity trading with dynamic exits (take-profit, stop-loss, RSI exhaustion, trend-break)
 - Implements Kelly sizing and trailing stops
 - Communicates with Alpaca broker API
 - **`OptionEngine.hpp`** — Black-Scholes pricing + Greeks (`/options/price` endpoint)
-- **`OptionsSignalGenerator.hpp`** — Self-generating options advisory signals via Telegram (no TradingView needed)
+- **`OptionsSignalGenerator.hpp`** — Self-generating options advisory signals via Telegram
 
 ### `/analyst` — Analyst Brain (C++)
 Market analysis and regime classification
@@ -111,9 +111,9 @@ Location: **`/docs/`**
 | [DOCUMENTATION_SUMMARY.txt](docs/DOCUMENTATION_SUMMARY.txt) | Quick reference |
 
 **Key sections in NOX_USER_GUIDE.md:**
-- [Why Am I Not Getting Trade Signals?](#why-am-i-not-getting-trade-signals) — 6-step diagnosis + course of action
+- [Troubleshooting Trade Signals](#troubleshooting-trade-signals) — Diagnosis and resolution
 - [Options Signal Generator](#options-signal-generator) — How to use, tiers, IV rank, strategy glossary
-- [Developing Your Own Signals](#developing-your-own-signals) — TradingView webhook format, paper trading
+- [Rule-Based Equity Trading](#rule-based-equity-trading) — How exit rules work, custom signal format
 
 ---
 
@@ -182,18 +182,19 @@ make
 ## 🌐 Network Topology
 
 ```
-TradingView Webhooks
+Analyst Brain (signals via webhook)
         ↓
-Execution Engine (localhost:8080) ← Direct IP: <YOUR_VPS_IP>:80
+Execution Engine (localhost:8080)
         ↓
-Analyst Brain ← Data Engines (Internal Network)
+Alpaca API ← Position Manager ← Options Signal Generator
         ↓
-Alpaca API + Telegram Notifications
+Telegram Notifications (all alerts)
 ```
 
 **Key Points:**
-- Execution engine exposed directly (no Traefik proxy)
-- Data engines on internal `nox_net` network
+- Analyst brain fires signals via `/webhook` endpoint
+- Rule-based exits (no external strategy dependency)
+- Data engines on internal `nox_net` network (no external exposure)
 - All services in Docker via `docker-compose.yml`
 
 ---

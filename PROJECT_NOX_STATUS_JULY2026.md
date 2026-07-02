@@ -53,7 +53,6 @@
 **Exit Rules (All Unified)**
 | Exit Type | Trigger | Status | Ledger | Telegram |
 |-----------|---------|--------|--------|----------|
-| Webhook | TradingView / manual | ✅ Logged | ✅ Yes | ✅ Yes |
 | Take-profit % | +15% to +30% (ticker-dependent) | ✅ Logged | ✅ Yes | ✅ Yes |
 | Stop-loss % | -8% to -12% (ticker-dependent) | ✅ Logged | ✅ Yes | ✅ Yes |
 | RSI exhaustion | RSI > 78 (overbought) + 20-SMA break | ✅ Logged | ✅ Yes | ✅ Yes |
@@ -360,7 +359,7 @@ GET  /health                 → Service health check
 
 ### Execution Engine Internal HTTP
 ```
-POST /webhook               → TradingView / external webhook entry
+POST /webhook               → External signal entry (analyst, custom signals)
 GET  /status                → Engine state (running, positions, regime)
 GET  /cn_status             → CN settlement gate state
 ```

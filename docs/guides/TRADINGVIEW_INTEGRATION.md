@@ -1,4 +1,10 @@
-# TradingView ↔ Nox Integration Guide
+# TradingView ↔ Nox Integration Guide (DEPRECATED)
+
+**⚠️ NOTICE:** This guide is deprecated as of July 2, 2026. Nox no longer uses TradingView. The system now uses rule-based automatic position management instead. Please refer to [NOX_COMPLETE_GUIDE.md](../NOX_COMPLETE_GUIDE.md) for current documentation.
+
+This document is retained for historical reference only.
+
+---
 
 > How to use TradingView alongside Nox — either fully independently, or wired
 > into Nox's execution engine so TradingView alerts inject live trade signals.
