@@ -18,8 +18,9 @@ source WS4's decay hook was built for.
 
 import os
 import statistics
+import math
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from retry_utils import fetch_with_retry
 
@@ -35,6 +36,92 @@ BYPASS = os.getenv("CONTRADICTION_BYPASS", "false").lower() in ("true", "1", "ye
 
 # Index proxy used for the market-wide check when sentiment isn't ticker-specific.
 MARKET_PROXY = os.getenv("CONTRADICTION_MARKET_PROXY", "SPY")
+
+# Half-life decay constants (hours) — sourced from DECAY_* in .env.
+HALFLIFE_GEOPOLITICAL_HOURS = float(os.getenv("DECAY_GEO",      "24"))
+HALFLIFE_MACRO_HOURS        = float(os.getenv("DECAY_MACRO",    "24"))
+HALFLIFE_EARNINGS_HOURS     = float(os.getenv("DECAY_EARNINGS", "24"))
+HALFLIFE_TECHNICAL_HOURS    = float(os.getenv("DECAY_TECHNICAL","24"))
+
+# Anchor events — major structural news that act as reference points.
+_ANCHOR_KEYWORDS = [
+    "sanction", "tariff", "war", "recession",
+
+
+]
+
+# Manipulation theme keywords — flag coordinated/artificial moves (use cautiously).
+_MANIPULATION_THEMES = [
+    "short squeeze", "pump and dump", "manipulation",
+
+]
+
+
+def _get_halflife_hours(category: str) -> float:
+    """Map signal category to decay half-life in hours."""
+    mapping = {
+        "GEOPOLITICAL": HALFLIFE_GEOPOLITICAL_HOURS,
+        "MACRO_ECONOMIC": HALFLIFE_MACRO_HOURS,
+        "EARNINGS": HALFLIFE_EARNINGS_HOURS,
+        "TECHNICAL": HALFLIFE_TECHNICAL_HOURS,
+    }
+    return mapping.get(category, HALFLIFE_TECHNICAL_HOURS)
+
+
+def _is_anchor_event(headline: str, summary: str = "") -> bool:
+    """
+    Detects major structural news (Iran sanctions, Fed decisions, wars, etc.)
+    that serve as reference points for sentiment evaluation.
+    Anchor events should not be treated as noise even if unexpected.
+    """
+    text = f"{headline} {summary}".lower()
+    return any(kw in text for kw in _ANCHOR_KEYWORDS)
+
+
+def _detect_manipulation_theme(headline: str, summary: str = "") -> Tuple[bool, str]:
+    """
+    Flags articles describing artificial/coordinated moves (short squeezes, buybacks, etc.)
+    Returns (is_manipulated, theme_tag).
+    Manipulated signals should be weighted lower — real conviction comes from structural factors.
+    """
+    text = f"{headline} {summary}".lower()
+    for theme in _MANIPULATION_THEMES:
+        if theme in text:
+            return True, theme
+    return False, ""
+
+
+def _compute_decay_weight(category: str, timestamp: Any) -> float:
+    """
+    Exponential decay: weight(t) = 2^(-t / halflife).
+    Recent articles → weight ≈ 1.0. Old articles → weight → 0.
+    If timestamp is missing, assume current time (full weight).
+    """
+    if not timestamp:
+        return 1.0
+    try:
+        if isinstance(timestamp, str):
+            # Try ISO format first, then fallback parsing
+            if "T" in timestamp:
+                article_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            else:
+                article_time = datetime.fromisoformat(timestamp)
+        else:
+            article_time = timestamp
+
+        # Ensure both are aware datetimes
+        if article_time.tzinfo is None:
+            article_time = article_time.replace(tzinfo=timezone.utc)
+        now = datetime.now(tz=timezone.utc)
+
+        age_hours = (now - article_time).total_seconds() / 3600.0
+        if age_hours < 0:
+            age_hours = 0  # future timestamp, treat as now
+        halflife = _get_halflife_hours(category)
+        weight = math.pow(2.0, -age_hours / halflife)
+        return max(0.0, min(1.0, weight))  # clamp to [0, 1]
+    except (ValueError, AttributeError, TypeError):
+        return 1.0  # default to full weight on parse error
 
 
 def fetch_iv_skew(ticker: str) -> Dict[str, Any]:
@@ -58,54 +145,100 @@ def aggregate_sentiment(news: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
     Aggregate per-headline sentiment into per-ticker buckets, plus a market-wide
     bucket keyed by MARKET_PROXY built from every scored headline.
 
-    Returns {ticker: {"score", "magnitude", "category", "count", "latest_ts"}}.
-    score is the magnitude-weighted mean sentiment for that ticker.
+    Applies:
+    - Decay weighting (recent articles weighted higher, per-category half-life)
+    - Per-source sentiment breakdown (see source disagreement)
+    - Anchor event detection (major structural news)
+    - Manipulation theme flagging (reduce weight on artificial moves)
+
+    Returns {ticker: {"score", "magnitude", "category", "count", "latest_ts",
+                      "sources": {...}, "anchor_event": bool,
+                      "manipulation_theme": str|None}}
+    plus a special "_anchor_events" key (List[str] of anchor headlines) that
+    is NOT a per-ticker bucket — callers must pop/skip it before iterating.
+    score is decay + magnitude + anchor-adjusted weighted mean.
     """
     buckets: Dict[str, Dict[str, Any]] = {}
     all_scores: List[float] = []
     all_weights: List[float] = []
     market_category_votes: Dict[str, int] = {}
     market_latest_ts = None
+    anchor_events: List[str] = []  # store headlines of anchor events
 
-    def _add(key: str, sent: Dict[str, Any], ts: Any):
+    def _add(key: str, sent: Dict[str, Any], ts: Any, source: str, is_anchor: bool, manip_theme: str):
         b = buckets.setdefault(key, {
             "_score_w": 0.0, "_w": 0.0, "category_votes": {},
-            "count": 0, "latest_ts": None,
+            "count": 0, "latest_ts": None, "sources": {}, "anchor_event": False, "manip_theme": None,
         })
-        w = max(sent.get("magnitude", 0.0), 1e-3)  # floor so zero-mag still counts
+        cat = sent.get("category", "GENERIC")
+        decay = _compute_decay_weight(cat, ts)
+
+        # Penalize manipulated signals: reduce weight if artificial
+        manip_penalty = 0.5 if manip_theme else 1.0
+        w = max(sent.get("magnitude", 0.0), 1e-3) * decay * manip_penalty  # floor so zero-mag still counts
+
         b["_score_w"] += sent.get("score", 0.0) * w
         b["_w"] += w
         b["count"] += 1
-        cat = sent.get("category", "GENERIC")
         b["category_votes"][cat] = b["category_votes"].get(cat, 0) + 1
         if ts and (b["latest_ts"] is None or str(ts) > str(b["latest_ts"])):
             b["latest_ts"] = ts
+        if is_anchor:
+            b["anchor_event"] = True
+        if manip_theme:
+            b["manip_theme"] = manip_theme
+
+        # Track per-source sentiment for this ticker
+        src = b["sources"].setdefault(source, {"_score_w": 0.0, "_w": 0.0, "count": 0})
+        src["_score_w"] += sent.get("score", 0.0) * w
+        src["_w"] += w
+        src["count"] += 1
 
     for item in news:
         sent = item.get("sentiment")
         if not sent:
             continue
         ts = item.get("timestamp")
-        all_scores.append(sent.get("score", 0.0))
-        all_weights.append(max(sent.get("magnitude", 0.0), 1e-3))
         cat = sent.get("category", "GENERIC")
+        decay = _compute_decay_weight(cat, ts)
+        source = item.get("source", "unknown")
+        headline = item.get("headline", "")
+        summary = item.get("summary", "")
+
+        is_anchor = _is_anchor_event(headline, summary)
+        is_manip, manip_theme = _detect_manipulation_theme(headline, summary)
+        if is_anchor:
+            anchor_events.append(headline)
+
+        manip_penalty = 0.5 if is_manip else 1.0
+        all_scores.append(sent.get("score", 0.0))
+        all_weights.append(max(sent.get("magnitude", 0.0), 1e-3) * decay * manip_penalty)
         market_category_votes[cat] = market_category_votes.get(cat, 0) + 1
         if ts and (market_latest_ts is None or str(ts) > str(market_latest_ts)):
             market_latest_ts = ts
         for sym in (item.get("symbols") or []):
-            _add(sym.upper(), sent, ts)
+            _add(sym.upper(), sent, ts, source, is_anchor, manip_theme)
 
-    # Finalise per-ticker weighted means.
+    # Finalise per-ticker weighted means and per-source breakdown.
     out: Dict[str, Dict[str, Any]] = {}
     for key, b in buckets.items():
         score = b["_score_w"] / b["_w"] if b["_w"] > 0 else 0.0
         dominant = max(b["category_votes"], key=b["category_votes"].get)
+
+        sources_out = {}
+        for src_name, src_data in b["sources"].items():
+            src_score = src_data["_score_w"] / src_data["_w"] if src_data["_w"] > 0 else 0.0
+            sources_out[src_name] = {"score": round(src_score, 4), "count": src_data["count"]}
+
         out[key] = {
             "score": round(score, 4),
             "magnitude": round(min(1.0, b["_w"] / 3.0), 4),
             "category": dominant,
             "count": b["count"],
             "latest_ts": b["latest_ts"],
+            "sources": sources_out,
+            "anchor_event": b["anchor_event"],
+            "manipulation_theme": b.get("manip_theme"),
         }
 
     # Market-wide bucket (used when no ticker-specific sentiment is available).
@@ -119,7 +252,14 @@ def aggregate_sentiment(news: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]
             "category": dominant,
             "count": len(all_scores),
             "latest_ts": market_latest_ts,
+            "sources": {},
+            "anchor_event": bool(anchor_events),
+            "manipulation_theme": None,
         })
+
+    # Stored separately (not a per-ticker bucket) — run_contradiction_check
+    # pops this before iterating tickers.
+    out["_anchor_events"] = anchor_events
     return out
 
 
@@ -205,6 +345,9 @@ def run_contradiction_check(news: List[Dict[str, Any]]) -> Dict[str, Any]:
     Produces the JSON written to the shared data bus.
     """
     sentiment = aggregate_sentiment(news)
+    # "_anchor_events" is a List[str] side-channel, not a per-ticker bucket —
+    # pop it before iterating tickers.
+    anchor_events = sentiment.pop("_anchor_events", [])
     results = [evaluate_ticker(t, s) for t, s in sentiment.items()]
     # Surface contradictions first for quick human/LLM scanning.
     results.sort(key=lambda r: 0 if r.get("verdict", "").startswith("CONTRADICT") else 1)
@@ -221,6 +364,7 @@ def run_contradiction_check(news: List[Dict[str, Any]]) -> Dict[str, Any]:
         "results": results,
         # WS4 feed: aged-decay input for the analyst.
         "sentiment_scores": to_sentiment_scores(results),
+        "anchor_events": anchor_events,
         "data_gaps": data_gaps,
         "complete": not data_gaps,
     }

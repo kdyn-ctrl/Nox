@@ -11,6 +11,7 @@ than a generic "something went wrong".
 """
 
 import random
+import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -74,6 +75,36 @@ def fetch_with_retry(
     return None
 
 
+def _run_with_hard_timeout(fn: Callable[[], Any], timeout_seconds: float) -> Any:
+    """
+    Runs `fn()` in a daemon thread and hard-kills the wait after
+    `timeout_seconds`. Some third-party SDKs (e.g. AkShare) expose no timeout
+    parameter of their own and can hang indefinitely on a stalled upstream
+    connection — this bounds a single call's wall-clock time regardless.
+
+    Raises TimeoutError if the call is still running when the deadline hits
+    (the underlying thread is abandoned as a daemon and will not block
+    process exit). Re-raises any exception the callable itself raised.
+    """
+    result: list = [None]
+    exc: list = [None]
+
+    def _run():
+        try:
+            result[0] = fn()
+        except Exception as e:  # noqa: BLE001 — re-raised on the calling thread below
+            exc[0] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_seconds)
+    if t.is_alive():
+        raise TimeoutError(f"call timed out after {timeout_seconds}s")
+    if exc[0] is not None:
+        raise exc[0]
+    return result[0]
+
+
 def call_with_retry(
     fn: Callable[[], Any],
     *,
@@ -81,6 +112,7 @@ def call_with_retry(
     max_attempts: int = 3,
     backoff_base: float = 1.5,
     is_failure: Optional[Callable[[Any], bool]] = None,
+    timeout_seconds: Optional[float] = None,
 ) -> Optional[Any]:
     """
     Retry any zero-arg callable with the same backoff policy as
@@ -92,12 +124,21 @@ def call_with_retry(
     didn't raise (e.g. a library that returns an empty dataframe instead of
     raising on a transient upstream error).
 
+    `timeout_seconds`, if given, hard-bounds each individual attempt's
+    wall-clock time via a daemon-thread watchdog (see _run_with_hard_timeout)
+    — a hung call (e.g. AkShare, which exposes no timeout of its own) is
+    treated as a retryable failure and does not block the retry loop, or the
+    caller's scheduler, indefinitely.
+
     Returns fn()'s result, or None once every attempt is exhausted.
     """
     last_error = "unknown error"
     for attempt in range(1, max_attempts + 1):
         try:
-            result = fn()
+            if timeout_seconds is not None:
+                result = _run_with_hard_timeout(fn, timeout_seconds)
+            else:
+                result = fn()
             if is_failure is None or not is_failure(result):
                 return result
             last_error = "empty/invalid result"

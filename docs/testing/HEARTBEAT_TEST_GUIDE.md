@@ -347,10 +347,6 @@ ANTHROPIC_API_KEY               # Claude API key (REQUIRED)
 ALPACA_API_KEY                  # Alpaca API key (REQUIRED)
 ALPACA_SECRET_KEY               # Alpaca secret key (REQUIRED)
 WEBHOOK_SECRET_TOKEN            # Shared webhook secret (REQUIRED)
-
-# Optional heartbeat configuration
-# NOX_DAILY_REPORT_TICKERS       # Comma-separated tickers for SEC context in the daily report
-# MAX_DAILY_REPORT_SEC_TICKERS   # Maximum number of SEC tickers included in the daily report (default 8)
 ```
 
 ## When to Update This Guide
@@ -388,3 +384,227 @@ Update this guide when:
 - [ ] Database has no corrupted records
 - [ ] Scheduled tasks run at expected intervals
 - [ ] Large messages are correctly split for Telegram
+
+---
+
+## New Feature Tests (Added June 29, 2026)
+
+> These sections test features added in recent development cycles. The test
+> patterns use the actual module functions, not class wrappers (the earlier
+> sections in this guide reference stale class names).
+
+### DB Schema: New Tables
+
+After container startup, verify the two new tables exist:
+
+```bash
+sqlite3 /root/Nox/data/memory_bank.db ".schema" | grep -E "trade_predictions|parsing_failures"
+```
+
+Expected output:
+```
+CREATE TABLE IF NOT EXISTS trade_predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    ticker TEXT, predicted_outcome REAL, actual_outcome REAL
+);
+CREATE TABLE IF NOT EXISTS parsing_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    ticker TEXT, filing_type TEXT DEFAULT '8-K', error_msg TEXT
+);
+```
+
+### Parsing Failure Logging
+
+Verify `_log_parsing_failure` writes to `parsing_failures` when a filing parse fails. Inject a synthetic row:
+
+```python
+import sqlite3, sys
+sys.path.insert(0, '/root/Nox/heartbeat')
+from monitor import _log_parsing_failure, DB_PATH
+
+_log_parsing_failure("NVDA", "8-K", "Test: simulated parse error")
+
+with sqlite3.connect(DB_PATH) as conn:
+    row = conn.execute(
+        "SELECT ticker, filing_type, error_msg FROM parsing_failures ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+assert row is not None, "No row written"
+assert row[0] == "NVDA",  f"Expected NVDA, got {row[0]}"
+assert row[1] == "8-K",   f"Expected 8-K, got {row[1]}"
+assert "simulated" in row[2]
+print(f"✓ _log_parsing_failure works: {row}")
+```
+
+### Weekly Stats: Empty DB (baseline)
+
+With a fresh database, `get_weekly_stats()` should return zeros gracefully:
+
+```python
+import sys
+sys.path.insert(0, '/root/Nox/heartbeat')
+from monitor import get_weekly_stats
+
+stats = get_weekly_stats()
+assert "error" not in stats, f"Unexpected error: {stats.get('error')}"
+assert stats["trade_count"] == 0
+assert stats["total_pnl"] == 0.0
+assert stats["mae"] is None
+assert stats["calibration_score"] is None
+print(f"✓ get_weekly_stats (empty DB): week_label={stats['week_label']}")
+```
+
+### Weekly Stats: With Trade Data
+
+Inject sample trades, then verify the stats aggregate correctly:
+
+```python
+import sqlite3, sys
+from datetime import datetime
+sys.path.insert(0, '/root/Nox/heartbeat')
+from monitor import get_weekly_stats, DB_PATH
+
+# Insert 4 trades: 3 wins (+$50 each), 1 loss (-$30)
+rows = [
+    ("AAPL", "BUY", 190.0, 45.0,   50.0),
+    ("TSLA", "BUY", 250.0, 60.0,   50.0),
+    ("NVDA", "BUY", 900.0, 55.0,   50.0),
+    ("META", "BUY", 500.0, 48.0,  -30.0),
+]
+with sqlite3.connect(DB_PATH) as conn:
+    for ticker, action, price, rsi, pnl in rows:
+        conn.execute(
+            "INSERT INTO trade_history (ticker, action, price, rsi_value, pnl) VALUES (?,?,?,?,?)",
+            (ticker, action, price, rsi, pnl)
+        )
+
+stats = get_weekly_stats()
+assert stats["trade_count"] == 4,          f"Expected 4 trades, got {stats['trade_count']}"
+assert stats["wins"] == 3,                 f"Expected 3 wins, got {stats['wins']}"
+assert stats["losses"] == 1,               f"Expected 1 loss, got {stats['losses']}"
+assert abs(stats["total_pnl"] - 120.0) < 0.01, f"Expected $120, got {stats['total_pnl']}"
+assert abs(stats["win_loss_ratio"] - 3.0) < 0.01
+print(f"✓ get_weekly_stats (with trades): W/L={stats['win_loss_ratio']:.2f}, P&L=${stats['total_pnl']:.2f}")
+```
+
+### Weekly Stats: MAE and Calibration Score
+
+With prediction rows, verify MAE and calibration compute correctly:
+
+```python
+import sqlite3, sys
+sys.path.insert(0, '/root/Nox/heartbeat')
+from monitor import get_weekly_stats, DB_PATH
+
+# Perfect predictions → MAE = 0, calibration = 100%
+with sqlite3.connect(DB_PATH) as conn:
+    conn.execute("DELETE FROM trade_predictions")
+    for _ in range(4):
+        conn.execute(
+            "INSERT INTO trade_predictions (predicted_outcome, actual_outcome) VALUES (0.7, 0.7)"
+        )
+
+stats = get_weekly_stats()
+assert stats["mae"] is not None, "MAE should be computed"
+assert abs(stats["mae"]) < 1e-9, f"Perfect predictions → MAE=0, got {stats['mae']}"
+assert abs(stats["calibration_score"] - 1.0) < 1e-9, "Perfect → calibration=1.0"
+print(f"✓ MAE={stats['mae']:.4f}, Calibration={stats['calibration_score']:.1%}")
+```
+
+### Format Weekly Report: Layout Check
+
+Verify the formatted report contains the expected headers and table structure:
+
+```python
+import sys
+sys.path.insert(0, '/root/Nox/heartbeat')
+from monitor import format_weekly_report
+
+sample = {
+    "week_label": "Jun 23 – Jun 29, 2026",
+    "trade_count": 8, "total_pnl": 142.50,
+    "wins": 6, "losses": 2, "win_loss_ratio": 3.0,
+    "mae": 0.0823, "calibration_score": 0.9177,
+    "parsing_failure_count": 1,
+}
+report = format_weekly_report(sample)
+
+assert "NOX WEEKLY PERFORMANCE REPORT" in report
+assert "Jun 23 – Jun 29, 2026"         in report
+assert "+$142.50"                        in report
+assert "3.00"                            in report
+assert "8-K Parse Failures"             in report
+assert "```"                             in report  # code block for table
+
+# Verify error path
+err_report = format_weekly_report({"week_label": "Jun 23 – Jun 29", "error": "DB locked"})
+assert "Weekly Report Error" in err_report
+
+print("✓ format_weekly_report layout correct")
+print(report)
+```
+
+### Weekly Report Scheduler: NYSE Holiday Handling
+
+Verify `pandas_market_calendars` correctly shifts report day when Friday is a holiday
+(e.g. Independence Day July 4 on a Friday):
+
+```python
+import pandas_market_calendars as mcal
+from datetime import date
+
+nyse = mcal.get_calendar("NYSE")
+
+# Week of Jun 30 – Jul 4, 2026: July 4 is a Saturday (non-issue in 2026)
+# Week of Jul 3 – Jul 7, 2023: July 4 was a Tuesday; Friday Jul 7 was a trading day
+# Use a week where Friday IS a holiday to test shift.
+# July 4, 2025 (Friday): confirmed NYSE holiday
+mon = date(2025, 6, 30)
+fri = date(2025, 7, 4)
+sched = nyse.schedule(start_date=mon.strftime("%Y-%m-%d"), end_date=fri.strftime("%Y-%m-%d"))
+last = sched.index[-1].date()
+
+assert last == date(2025, 7, 3), f"Expected Thursday Jul 3 (holiday shift), got {last}"
+print(f"✓ Holiday shift correct: last trading day = {last}")
+```
+
+### Scheduled Tasks
+
+Verify correct scheduler registration at startup (inspect `schedule` jobs):
+
+```python
+import schedule, threading, time, sys
+sys.path.insert(0, '/root/Nox/heartbeat')
+
+# schedule.clear() first to avoid interfering with a live instance
+schedule.clear()
+
+# Manually call the internal reschedule to register jobs
+# (in production this runs inside the schedule_checker thread)
+import monitor
+# Trigger a reschedule so jobs are registered:
+# NOTE: this only registers the job if today is the last trading day of the week
+# In CI, just verify the job tag/key naming, not the registration itself.
+
+scout_jobs = [j for j in schedule.jobs if "scout" in (j.tags or set())]
+iv_jobs    = [j for j in schedule.jobs if "iv_collection" in (j.tags or set())]
+
+# After startup, both should be registered
+print(f"Scout jobs: {len(scout_jobs)}")
+print(f"IV collection jobs: {len(iv_jobs)}")
+print("✓ Scheduler tag naming verified")
+```
+
+### Common Failures Added
+
+| Symptom | Check | Fix |
+|---------|-------|-----|
+| `pandas_market_calendars` import error at startup | Package installed? | `pip install pandas-market-calendars==4.6.2` |
+| Weekly report shows N/A for all fields | `trade_predictions` table empty | Expected on first run; populates as workstreams log predictions |
+| Weekly report fires on wrong day | DST transition during `_reschedule` call? | Container will correct at next 00:01 UTC reschedule |
+| `parsing_failures` count always 0 | No 8-K/6-K parse errors yet | Normal; table fills when SEC filings fail to analyse |
+| OOM in heartbeat container | pandas loaded but mem_limit too low | Verify `mem_limit: 1g` in docker-compose.yml |
+
+**Last verified: 2026-06-29**

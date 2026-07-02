@@ -9,6 +9,8 @@ services:
       context: ./america_data_engine
     container_name: nox_america_data_engine
     restart: unless-stopped
+    depends_on:
+      - redis
     # WS1/architecture: cap NLP-side memory so the sentiment/contradiction layer
     # can never starve or share heap with the C++ execution engine.
     mem_limit: 512m
@@ -16,6 +18,15 @@ services:
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
       - ALPACA_API_KEY=${ALPACA_API_KEY}
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      # Backup news sources (optional; if missing, gracefully skipped)
+      - NEWSAPI_KEY=${NEWSAPI_KEY:-}
+      - POLYGON_API_KEY=${POLYGON_API_KEY:-}
+      # WS1 — Advanced signal quality (optional)
+      - EXCLUDE_TOPICS=${EXCLUDE_TOPICS:-}
+      - DECAY_GEO=${DECAY_GEO:-6}
+      - DECAY_MACRO=${DECAY_MACRO:-48}
+      - DECAY_EARNINGS=${DECAY_EARNINGS:-72}
+      - DECAY_TECHNICAL=${DECAY_TECHNICAL:-12}
       # WS1 — Contradiction Vector: reach heartbeat's IV skew endpoint + tuning.
       - HEARTBEAT_BASE_URL=${HEARTBEAT_BASE_URL:-http://heartbeat-monitor:8002}
       - CONTRADICTION_SKEW_THRESHOLD=${CONTRADICTION_SKEW_THRESHOLD:-0.03}
@@ -50,6 +61,8 @@ services:
       context: ./china_data_engine
     container_name: nox_china_data_engine
     restart: unless-stopped
+    depends_on:
+      - redis
     mem_limit: 512m
     environment:
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
@@ -63,6 +76,7 @@ services:
     container_name: nox_analyst
     restart: unless-stopped
     depends_on:
+      - redis
       - execution-engine
     environment:
       - TZ=America/New_York
@@ -145,8 +159,12 @@ services:
       context: ./heartbeat
     container_name: nox_heartbeat
     restart: unless-stopped
-    mem_limit: 768m
+    # pandas + numpy + exchange_calendars (pulled by pandas_market_calendars)
+    # add ~300 MB resident RAM. 1 GB gives comfortable headroom above the
+    # 768 MB baseline that pre-dated the weekly-report feature.
+    mem_limit: 1g
     depends_on:
+      - redis
       - china-data-engine
       - america-data-engine
     environment:
@@ -172,6 +190,15 @@ services:
       - ./data:/app/data
       - ./reports:/app/reports
     command: sh -c "mkdir -p /app/reports && python -u monitor.py"
+    networks:
+      - nox_net
+
+  redis:
+    image: redis:alpine
+    container_name: nox_redis
+    restart: unless-stopped
+    expose:
+      - "6379"
     networks:
       - nox_net
 

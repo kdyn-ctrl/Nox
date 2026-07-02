@@ -143,6 +143,23 @@ def math_tanh(x: float) -> float:
     return math.tanh(x)
 
 
+def should_include_article(headline: str, summary: str) -> bool:
+    """
+    Filters out low-signal topics (sports, entertainment, etc.) to reduce noise.
+    Exclusion list configurable via EXCLUDE_TOPICS env var (comma-separated).
+    """
+    exclude_topics = os.getenv("EXCLUDE_TOPICS", "")
+    if not exclude_topics:
+        return True
+
+    text = f"{headline} {summary}".lower()
+    topics = [t.strip() for t in exclude_topics.split(",") if t.strip()]
+    for topic in topics:
+        if topic in text:
+            return False
+    return True
+
+
 def score_news_batch(news: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Attaches a `sentiment` block to each news item in place and returns the list.
@@ -220,6 +237,253 @@ def fetch_alpaca_news() -> Optional[List[Dict[str, Any]]]:
     except requests.RequestException as e:
         print(f"[ERROR] [SCRAPER] Alpaca news fetch failed: {e}", flush=True)
         return None
+
+
+def fetch_newsapi_news() -> Optional[List[Dict[str, Any]]]:
+    """
+    Fetches news from NewsAPI (free tier: 100 req/day, includes global + tech +
+    finance). Filters for market-relevant keywords to avoid pure noise.
+    Backup source used by fetch_news_with_fallback() when Alpaca fails.
+
+    Returns [] if the key is unset (source not configured — not a failure) or
+    a legitimate empty result set. Returns None if the HTTP call itself failed
+    after retries.
+    """
+    api_key = os.getenv("NEWSAPI_KEY")
+    if not api_key:
+        return []
+
+    url = "https://newsapi.org/v2/everything"
+    # Market-relevant keywords: earnings, inflation, Fed, tech, energy, geopolitics
+    q = "(earnings OR inflation OR \"federal reserve\" OR fed OR nvda OR tsla OR aapl OR msft OR tech OR tariff OR sanctions OR oil OR energy) AND (market OR stock OR trading OR business)"
+    params = {
+        "q": q,
+        "sortBy": "publishedAt",
+        "language": "en",
+        "pageSize": 20,
+        "apiKey": api_key,
+    }
+    response = fetch_with_retry(url, source="NewsAPI news", params=params, timeout=HTTP_TIMEOUT)
+    if response is None:
+        return None
+    try:
+        response.raise_for_status()
+        articles = response.json().get("articles", [])
+
+        result = []
+        for article in articles:
+            headline = article.get("title", "")
+            description = article.get("description", "")
+            symbols = list(set(_TICKER_RE.findall(headline) + _TICKER_RE.findall(description)))
+
+            result.append({
+                "source": article.get("source", {}).get("name", "NewsAPI"),
+                "headline": headline,
+                "summary": description,
+                "url": article.get("url"),
+                "timestamp": article.get("publishedAt"),
+                "symbols": symbols,
+            })
+
+        score_news_batch(result)
+        print(f"[INFO] [SCRAPER] NewsAPI backup fetched ({len(result)} articles, sentiment scored).", flush=True)
+        return result
+    except requests.RequestException as e:
+        print(f"[WARN] [SCRAPER] NewsAPI backup fetch failed: {e}", flush=True)
+        return None
+
+
+def fetch_polygon_news() -> Optional[List[Dict[str, Any]]]:
+    """
+    Fetches news from Polygon.io free tier. Second backup source used by
+    fetch_news_with_fallback() when both Alpaca and NewsAPI fail.
+
+    Returns [] if the key is unset or a legitimate empty result set. Returns
+    None if the HTTP call itself failed after retries.
+    """
+    api_key = os.getenv("POLYGON_API_KEY")
+    if not api_key:
+        return []
+
+    url = "https://api.polygon.io/v2/reference/news"
+    params = {
+        "limit": 20,
+        "sort": "-published_utc",
+        "apiKey": api_key,
+    }
+    response = fetch_with_retry(url, source="Polygon news", params=params, timeout=HTTP_TIMEOUT)
+    if response is None:
+        return None
+    try:
+        response.raise_for_status()
+        results = response.json().get("results", [])
+
+        result = []
+        for article in results:
+            symbols = article.get("tickers", [])
+            result.append({
+                "source": "Polygon.io",
+                "headline": article.get("title", ""),
+                "summary": article.get("description", ""),
+                "url": article.get("article_url"),
+                "timestamp": article.get("published_utc"),
+                "symbols": symbols,
+            })
+
+        score_news_batch(result)
+        print(f"[INFO] [SCRAPER] Polygon backup fetched ({len(result)} articles, sentiment scored).", flush=True)
+        return result
+    except requests.RequestException as e:
+        print(f"[WARN] [SCRAPER] Polygon backup fetch failed: {e}", flush=True)
+        return None
+
+
+# Free RSS feeds require no API key — last-resort fallback when Alpaca,
+# NewsAPI, and Polygon have all failed or returned nothing.
+_RSS_FEEDS = [
+    ("Reuters Markets", "https://www.reutersagency.com/feed/?taxonomy=best-topics&post_type=best-news&storyline=market_news"),
+    ("Reuters Business", "https://feeds.reuters.com/reuters/businessNews"),
+    ("Reuters Tech", "https://feeds.reuters.com/reuters/technologyNews"),
+    ("CNBC Top News", "https://feeds.cnbc.com/id/100003114/device/rss/rss.html"),
+    ("DW Business", "https://www.dw.com/en/business/s-9097"),
+]
+
+
+def fetch_rss_news() -> Optional[List[Dict[str, Any]]]:
+    """
+    Fetches news from free RSS feeds (Reuters, CNBC, DW News). Provides
+    geopolitical + earnings + market news without an API key. Last-resort
+    fallback source in fetch_news_with_fallback().
+
+    Returns [] if every feed came back empty; returns None only if every
+    single feed request failed outright (all sources down).
+    """
+    result: List[Dict[str, Any]] = []
+    any_success = False
+
+    for feed_name, feed_url in _RSS_FEEDS:
+        response = fetch_with_retry(feed_url, source=f"RSS:{feed_name}", timeout=(5, 8))
+        if response is None:
+            print(f"[WARN] [SCRAPER] RSS feed '{feed_name}' failed after retries.", flush=True)
+            continue
+        try:
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            any_success = True
+
+            # RSS 2.0 standard: items are under /rss/channel/item
+            for item in root.findall(".//item")[:5]:  # limit to 5 per feed
+                title = item.findtext("title", "")
+                desc = item.findtext("description", "")
+                pub_date = item.findtext("pubDate")
+                link = item.findtext("link")
+                symbols = _TICKER_RE.findall(title)
+
+                result.append({
+                    "source": feed_name,
+                    "headline": title,
+                    "summary": desc[:500] if desc else "",  # cap summary length
+                    "url": link,
+                    "timestamp": pub_date,
+                    "symbols": list(set(symbols)),
+                })
+        except (requests.RequestException, ET.ParseError) as e:
+            print(f"[WARN] [SCRAPER] RSS feed '{feed_name}' failed to parse: {e}", flush=True)
+            continue
+
+    if not any_success:
+        return None
+
+    score_news_batch(result)
+    if result:
+        print(f"[INFO] [SCRAPER] RSS feeds fetched ({len(result)} articles, sentiment scored).", flush=True)
+    return result
+
+
+def deduplicate_news(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Deduplicates news items by headline hash to avoid double-scoring the same
+    story from multiple sources. Keeps the first (most recent) occurrence.
+    """
+    import hashlib
+
+    seen = set()
+    deduped = []
+
+    for item in news_items:
+        headline = (item.get("headline") or "").lower().strip()
+        if not headline:
+            continue
+        h = hashlib.md5(headline.encode()).hexdigest()
+        if h not in seen:
+            seen.add(h)
+            deduped.append(item)
+
+    return deduped
+
+
+def fetch_news_with_fallback() -> Optional[List[Dict[str, Any]]]:
+    """
+    Orchestrates multi-source news fetching with fallback logic.
+    Tries sources in order: Alpaca (primary) -> NewsAPI -> Polygon -> RSS
+    (last resort). Deduplicates, filters by topic, and scores all results
+    uniformly.
+
+    Returns None only if ALL sources failed outright (network/API failures
+    across the board) — distinct from a successful run that legitimately
+    found zero qualifying articles, which returns []. Callers should treat
+    None as a data gap the same way they treat fetch_alpaca_news() == None.
+    """
+    all_news: List[Dict[str, Any]] = []
+    any_source_reachable = False
+
+    news = fetch_alpaca_news()
+    if news is not None:
+        any_source_reachable = True
+    if news:
+        all_news.extend(news)
+        print(f"[INFO] [SCRAPER] Primary (Alpaca) succeeded: {len(news)} items", flush=True)
+    else:
+        print("[WARN] [SCRAPER] Primary (Alpaca) failed or empty, trying backups...", flush=True)
+
+        newsapi_items = fetch_newsapi_news()
+        if newsapi_items is not None:
+            any_source_reachable = True
+        if newsapi_items:
+            all_news.extend(newsapi_items)
+            print(f"[INFO] [SCRAPER] Secondary (NewsAPI) succeeded: {len(newsapi_items)} items", flush=True)
+
+        polygon_items = fetch_polygon_news()
+        if polygon_items is not None:
+            any_source_reachable = True
+        if polygon_items:
+            all_news.extend(polygon_items)
+            print(f"[INFO] [SCRAPER] Secondary (Polygon) succeeded: {len(polygon_items)} items", flush=True)
+
+        if not all_news:
+            rss_items = fetch_rss_news()
+            if rss_items is not None:
+                any_source_reachable = True
+            if rss_items:
+                all_news.extend(rss_items)
+                print(f"[INFO] [SCRAPER] Fallback (RSS) succeeded: {len(rss_items)} items", flush=True)
+
+    if not any_source_reachable:
+        print("[ERROR] [SCRAPER] All news sources failed outright — treating as data gap.", flush=True)
+        return None
+
+    deduped = deduplicate_news(all_news)
+
+    filtered = [
+        item for item in deduped
+        if should_include_article(item.get("headline", ""), item.get("summary", ""))
+    ]
+    if len(filtered) < len(deduped):
+        excluded = len(deduped) - len(filtered)
+        print(f"[INFO] [SCRAPER] Topic filter excluded {excluded} article(s).", flush=True)
+
+    print(f"[INFO] [SCRAPER] After dedup + filter: {len(filtered)} unique articles", flush=True)
+    return filtered
 
 
 def fetch_earnings_calendar(tickers: List[str]) -> Dict[str, Optional[List[Dict[str, Any]]]]:
