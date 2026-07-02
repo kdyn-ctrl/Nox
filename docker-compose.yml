@@ -74,6 +74,11 @@ services:
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     volumes:
       - ./logs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: 10
     networks:
       - nox_net
 
@@ -112,6 +117,11 @@ services:
       - CN_POSITIONS_PATH=/app/data/china_positions.json
     volumes:
       - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: 10
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.execution-webhook.rule=Path(`/webhook`)"
