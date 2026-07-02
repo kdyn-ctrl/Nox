@@ -1,6 +1,6 @@
 # PROJECT NOX: ARCHITECTURE & STATUS SYNC
 **Last Updated:** July 2, 2026  
-**Status:** 🟢 STABLE — Paper trading ready, live trading ($5k account) ready, IBKR migration in progress on `nocturnal` branch
+**Status:** 🟢 STABLE — Paper trading ready, live trading ($5k account) ready, IBKR migration in progress on private `main` branch
 
 ---
 
@@ -400,23 +400,26 @@ GET  /cn_status             → CN settlement gate state
 
 ## 7. GIT BRANCH STRATEGY
 
-### `main` (PUBLIC, SAFE FOR SHOWCASE)
+**Both `upstream/Nox` (public) and `private/Nocturnal` (private) now use `main` as their primary branch.**
+
+### `upstream/main` (PUBLIC, SAFE FOR SHOWCASE)
 - Production paper trading code
 - Alpaca-only (no IBKR, no multi-leg futures)
 - All tests passing
 - Mergeable to live trading accounts ($5k+)
 
-### `nocturnal` (PRIVATE, EXPERIMENTAL)
+### `private/main` (PRIVATE, EXPERIMENTAL)
 - IBKR integration work (in-progress)
 - Multi-source news pipeline (Polygon, NewsAPI backup)
 - Enhanced analysis (WS1-6 tuning, volatility models)
-- **Never merge to `main`** (stays confidential edge research)
+- **Never push IBKR or proprietary edge to `upstream/main`** (stays confidential edge research)
 - User's personal account strategies
 
 ### Feature Branches (Off `main`)
 - Prefix: `feature/`, `fix/`, `wip/`
 - Test locally before PR
 - Merge only to `main` if production-ready
+- **For public work:** Cherry-pick public-safe commits from `private/main` to `upstream/main` when ready
 
 ---
 
