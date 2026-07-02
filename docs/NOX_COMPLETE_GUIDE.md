@@ -33,12 +33,12 @@ It does three distinct things:
 
 **1. Monitors the market** — constantly checking whether conditions are healthy enough to trade.
 
-**2. Executes equity trades** — when TradingView sends it a signal, it validates that signal, decides how many shares to buy, and places the order with Alpaca.
+**2. Executes equity trades** — based on rule-based exit conditions (take-profit, stop-loss, RSI exhaustion, trend-break), it automatically manages positions and places orders with Alpaca.
 
-**3. Generates options signals** — independently, without needing TradingView, it scans a list of stocks every 30 minutes and sends you options trade ideas via Telegram. It can also place these options trades automatically if you enable that.
+**3. Generates options signals** — independently on a background timer, it scans a list of stocks every 30 minutes and sends you options trade ideas via Telegram. It can also place these options trades automatically if you enable that.
 
 Nox does **not** pick stocks from scratch or do its own fundamental analysis. It relies on:
-- TradingView strategy alerts for equity buy/sell decisions
+- Rule-based exit logic for equity position management
 - Quantitative models (Black-Scholes, Kelly Criterion) for options and sizing
 - Macro data (VIX, SPY trend) for regime classification
 
@@ -54,26 +54,23 @@ Here is the full flow of information through the system:
 ┌─────────────────────────────────────────────────────────────┐
 │                        EXTERNAL                              │
 │                                                              │
-│   TradingView Strategy ──────────────────────────────────┐  │
-│   (Pine Script alerts on 4H chart)                       │  │
-│                                                          │  │
-│   Yahoo Finance (VIX, SPY data) ──────┐                  │  │
-│   Alpaca Market Data (options chain) ─┤                  │  │
-└───────────────────────────────────────┼──────────────────┼──┘
-                                        │                  │
-                    ┌───────────────────▼──────────────────▼──────────────────────┐
+│   Yahoo Finance (VIX, SPY data) ──────┐                      │
+│   Alpaca Market Data (options chain) ─┤                      │
+└───────────────────────────────────────┼──────────────────────┘
+                                        │
+                    ┌───────────────────▼──────────────────────────────────────────┐
                     │                   YOUR VPS (Docker)                          │
                     │                                                              │
                     │  ┌─────────────┐    ┌──────────────────────────────────┐   │
                     │  │   Analyst   │───▶│        Execution Engine           │   │
                     │  │   Brain     │    │                                   │   │
-                    │  │  (C++)      │    │  • Validates webhook signals      │   │
-                    │  │             │    │  • Enforces all risk gates        │   │
+                    │  │  (C++)      │    │  • Rule-based position manager    │   │
+                    │  │             │    │  • Auto-apply exit rules          │   │
                     │  │  • VIX      │    │  • Sizes positions (Kelly)        │   │
                     │  │  • SPY SMA  │    │  • Routes to Alpaca               │   │
-                    │  │  • Regime   │    │  • Options signal generator       │◀──┘
-                    │  └─────────────┘    │    (BOT profile + PERSONAL)       │
-                    │                     └──────────────┬───────────────────-─┘
+                    │  │  • Regime   │    │  • Options signal generator       │   │
+                    │  └─────────────┘    │    (BOT profile + PERSONAL)       │   │
+                    │                     └──────────────┬───────────────────┘   │
                     │  ┌─────────────┐                   │
                     │  │  Heartbeat  │                   │
                     │  │  Monitor    │                   │
@@ -98,7 +95,7 @@ Here is the full flow of information through the system:
                     └──────────────────────────────────────────┘
 ```
 
-Every service runs in its own Docker container. They talk to each other over an internal network (`nox_net`) — nothing internal is exposed to the internet except the webhook endpoint that TradingView needs to reach.
+Every service runs in its own Docker container. They talk to each other over an internal network (`nox_net`) with no external exposure except error logging.
 
 ---
 
@@ -108,7 +105,8 @@ Every service runs in its own Docker container. They talk to each other over an 
 
 **The brain of the operation.** This is a C++ program that runs 24/7 and:
 
-- Listens at port 8080 for incoming trade signals (from TradingView)
+- Listens at port 8080 for incoming signals and commands
+- Continuously monitors open positions and applies exit rules
 - Validates every signal through a series of safety gates
 - Sizes positions using the Kelly Criterion formula
 - Places buy and sell orders with Alpaca
@@ -117,9 +115,10 @@ Every service runs in its own Docker container. They talk to each other over an 
 
 When you see any trade happen, it was this service that did it.
 
-**Key endpoint:** `POST /webhook` — this is the URL TradingView sends alerts to.
+**Key endpoint:** `POST /webhook` — accepts custom trade signals or regime updates.
 **Options endpoint:** `POST /options/price` — you can query Black-Scholes prices directly.
 **Health check:** `GET /health` — returns `{"status": "healthy"}` if running.
+**Trade ledger:** `GET /trades` — returns all executed trades with exit rules and P&L.
 
 ---
 
@@ -133,7 +132,7 @@ When you see any trade happen, it was this service that did it.
 4. Sends the regime classification to the Execution Engine via `/webhook`
 5. Alerts you on Telegram with the current market status
 
-This service does **not** generate buy or sell signals for equities. It only tells the system "the market is safe to trade" or "stop trading." The buy/sell decisions come from TradingView.
+This service classifies market conditions (RISK_ON / TRANSITION / RISK_OFF) but does not generate specific entry or exit signals. The exit rules are applied automatically by the Execution Engine based on position metrics and configured thresholds.
 
 ---
 
@@ -163,84 +162,74 @@ You don't interact with this service directly. It runs quietly in the background
 
 ---
 
-## 4. How Equity Trades Work — Step by Step
+## 4. How Equity Trades Work — Rule-Based Exits
 
-This is the most important section if you want to understand when and why Nox trades.
+This is the most important section if you want to understand when and why Nox manages positions.
 
-### Step 1 — TradingView fires an alert
+### Overview
 
-You have a strategy running on TradingView (the OpenClaw Weighted Alpha strategy on a 4-hour chart). When the strategy's conditions are met — specifically an EMA(9) crossing above/below EMA(21) with a volume filter — TradingView fires a webhook alert.
+Nox manages open positions continuously using quantitative rules. Rather than relying on external signals, it automatically closes positions when predefined conditions are met. All exit rules are applied in parallel on every evaluation cycle (every 5 minutes or configurable).
 
-That alert is a JSON message sent to your server that looks like this:
+### Exit Rules
 
-```json
-{
-  "secret_key": "your_secret",
-  "ticker": "SPY",
-  "action": "BUY",
-  "price": 580.50,
-  "rsi": 54.2,
-  "atr": 5.31,
-  "vol": 45000000,
-  "stop_loss_atr_multiplier": 2.0,
-  "risk_tier": 0,
-  "vix": 16.4,
-  "spy_price": 580.50,
-  "spy_200_sma": 565.00
-}
-```
+**1. Take-Profit Exit**
+- **Trigger:** Position reaches +15% (or configured `TAKE_PROFIT_PCT`)
+- **Action:** Market sell order placed immediately
+- **Reason:** Lock in gains before momentum reversal
+- **Alert:** `✅ [EXIT] AAPL sold at take-profit (+15.2%)`
 
-### Step 2 — Schema Gate
+**2. Stop-Loss Exit**
+- **Trigger:** Position falls to -8% (or configured `STOP_LOSS_PCT`)
+- **Action:** Market sell order placed immediately
+- **Reason:** Protect capital from further decline
+- **Alert:** `🛑 [EXIT] AAPL sold at stop-loss (-8.1%)`
 
-The execution engine receives the JSON and immediately checks if it's valid, well-formed JSON. If it's garbage or malformed, it returns HTTP 400 and ignores it. No business logic runs on bad data.
+**3. RSI Exhaustion Exit**
+- **Trigger:** RSI > 78 (overbought) AND price falls below 20-SMA
+- **Action:** Market sell order placed
+- **Reason:** Detect momentum exhaustion before reversal
+- **Alert:** `⚠️ [EXIT] AAPL sold on RSI exhaustion (78.5)`
 
-### Step 3 — Auth Gate
+**4. Trend-Break Exit**
+- **Trigger:** Price falls below 200-day SMA × 0.98
+- **Action:** Market sell order placed
+- **Reason:** Long-term trend has broken; position is no longer valid
+- **Alert:** `📉 [EXIT] AAPL sold on trend-break (below 200-SMA)`
 
-The `secret_key` field is checked against the `WEBHOOK_SECRET_TOKEN` in your environment. If it doesn't match, the signal is **silently dropped** — no error response is sent back, no Telegram alert. This is intentional: if someone is probing your endpoint, you don't want to tell them "wrong password."
+**5. Time-Stop Exit**
+- **Trigger:** Position held > 10 days (or configured `MAX_HOLD_DAYS`)
+- **Action:** Market sell order placed
+- **Reason:** Prevent indefinite hold; reduce capital lock-up
+- **Alert:** `⏱️ [EXIT] AAPL sold on time-stop (10 days)`
 
-### Step 4 — RSI Gate
+**6. Trailing Stop Exit**
+- **Trigger:** Price falls by ATR × 2.0 distance from entry
+- **Action:** Stop-loss order triggers at broker
+- **Reason:** Dynamic protection that adapts to volatility
+- **Alert:** `🛑 [EXIT] AAPL sold by trailing stop`
 
-For BUY signals: if RSI is below 30, the trade is blocked. RSI below 30 means the asset is extremely oversold — buying here risks catching a falling knife.
+### Position Sizing (Entry Rules)
 
-For SELL signals: if RSI is above 70, the trade is blocked. RSI above 70 means the asset is extremely overbought — selling at this exact moment might be early.
+When new positions are entered:
 
-If blocked, you get a `🚧 RSI GATE BLOCK` Telegram message.
+**Kelly Criterion (Tier 0)**
+- Mathematical formula based on historical win rate and win/loss ratio
+- Adapts position size to confidence level
+- Never exceeds 10% of portfolio per trade
 
-### Step 5 — Regime Gate
-
-The execution engine re-runs the regime calculation using the VIX and SPY values embedded in the signal (not stale cached values). The result determines:
-
-- **RISK_ON**: Trade proceeds normally with full capital
-- **TRANSITION**: Trade proceeds but position size is cut in half
-- **RISK_OFF**: Trade is hard-blocked. No order is placed.
-
-More on regimes in Section 5.
-
-### Step 6 — Live Equity Fetch
-
-Before sizing, the engine fetches your live portfolio value from Alpaca. It tries up to 3 times with exponential backoff (2s → 4s → 8s). If all 3 attempts fail, the trade is cancelled. This rule exists because sizing a position without knowing your account value could result in orders that violate your risk limits.
-
-### Step 7 — Position Sizing
-
-The engine calculates how many shares to buy. The method depends on the `risk_tier` field in the signal:
-
-- **Tier 0 (default)**: Kelly Criterion — mathematical formula based on win rate and win/loss ratio
+**Fixed Tiers (Tier 1, 3)**
 - **Tier 1**: 1% of portfolio regardless of Kelly
 - **Tier 3**: 5% of portfolio, wider stop loss (3.5× ATR)
 
-More on sizing in Section 6.
+### Regime Gates (Portfolio Protection)
 
-### Step 8 — Notional Value Gate
+Before ANY action, the regime is checked:
 
-After calculating shares, the engine checks that the total dollar value of the trade doesn't exceed 10% of your portfolio. This is a physical last-resort check in case something slipped through. If it would exceed 10%, the order is blocked and you get a `🚨 RULE-018` alert.
+- **RISK_ON**: All rules apply normally; full capital available
+- **TRANSITION**: All rules apply but position sizes are cut by 50%
+- **RISK_OFF**: Entry rules are blocked; only exit rules apply
 
-### Step 9 — Order Submission
-
-A market buy order is sent to Alpaca. Simultaneously, a trailing stop order is placed at `ATR × stop_loss_atr_multiplier` distance below the entry price. The trailing stop protects profits if the price rises, and limits losses if it falls.
-
-### Step 10 — Confirmation
-
-You receive a Telegram message confirming the order and stop placement.
+More on regimes in Section 5.
 
 ---
 
@@ -361,7 +350,7 @@ This means if you buy at $100 and the stock rises to $120, your stop is now at $
 
 ## 8. Options Signal Generator
 
-This is a self-contained system that runs inside the Execution Engine on a background timer. Unlike equity trades, **it does not need TradingView**. It generates its own signals by scanning the market every 30 minutes.
+This is a self-contained system that runs inside the Execution Engine on a background timer. It generates its own signals independently by scanning the market every 30 minutes.
 
 ### What it does
 
@@ -506,7 +495,7 @@ A buy order was successfully placed. The order ID lets you look it up in Alpaca.
 • Trigger: Webhook SELL Signal
 • Alpaca Order ID: xyz789
 ```
-A sell signal came in, the position was closed. This happens either from TradingView or from the trailing stop being hit.
+A position was closed by exit rule or trailing stop. This happens automatically when configured exit conditions are met.
 
 ---
 
@@ -642,7 +631,7 @@ All configuration lives in your `.env` file. This is the master control panel fo
 | `ALPACA_API_KEY` | Your Alpaca API key ID |
 | `ALPACA_SECRET_KEY` | Your Alpaca API secret key |
 | `ALPACA_BASE_URL` | `https://paper-api.alpaca.markets` for paper, `https://api.alpaca.markets` for live |
-| `WEBHOOK_SECRET_TOKEN` | Secret password that TradingView puts in its webhook payloads |
+| `WEBHOOK_SECRET_TOKEN` | Secret password required in webhook payloads for authentication |
 | `TELEGRAM_BOT_TOKEN` | Your Telegram bot's token |
 | `TELEGRAM_CHAT_ID` | Your Telegram chat ID (where alerts are sent) |
 | `KELLY_WIN_RATE` | Your strategy's historical win rate (e.g. `0.6842` = 68.42%) |
@@ -710,27 +699,30 @@ If you restart the engine and a buy was made before the restart (the record was 
 
 ## 13. Troubleshooting
 
-### "I haven't received any trade signals"
+### "I haven't received any exit signals"
 
 Work through this list in order:
 
-**1. Check if TradingView alerts are active**
-Go to TradingView → your chart → Alerts (bell icon). Look for your webhook alert. It should have a green active indicator. If it's grey, expired, or missing, recreate it.
+**1. Check if you have open positions**
+From your Alpaca dashboard or run `docker compose exec execution-engine curl localhost:8080/status`. Look at the `open_positions` field. If it's empty, no exit rules can fire.
 
-**2. Check the webhook URL**
-The alert's webhook URL should be `https://yourdomain.com/webhook` (or your server's IP). If your VPS IP changed, this URL is pointing nowhere.
+**2. Check the current regime**
+Look at your last Telegram analyst report. If it says RISK_OFF, the system is in protective mode but exit rules should still apply to existing positions.
 
 **3. Check that the engine is running**
-From your VPS: `docker-compose ps`. You should see `nox_execution` with status `Up`. If it's `Exit` or missing, run `docker-compose up -d execution-engine`.
+From your VPS: `docker-compose ps`. You should see `execution-engine` with status `Up`. If it's `Exit` or missing, run `docker-compose up -d execution-engine`.
 
-**4. Check the current regime**
-Look at your last Telegram analyst report. If it says RISK_OFF, all new buys are blocked — that's correct behaviour. Check the news. Something spooked the market.
+**4. Check your exit rule configuration**
+Verify your `.env` has the exit thresholds set:
+- `TAKE_PROFIT_PCT` (default: 15)
+- `STOP_LOSS_PCT` (default: 8)
+- `MAX_HOLD_DAYS` (default: 10)
 
-**5. Check the Pine Script is generating signals**
-Open TradingView, look at your 4H chart. Do you see buy/sell triangles on recent bars? If none for weeks, the EMA crossover conditions haven't been met. The strategy is waiting for the right market structure.
+**5. Check the trade ledger**
+From your VPS: `curl localhost:8080/trades | python3 -m json.tool`. Look for recent exits with reasons: `take_profit`, `stop_loss`, `rsi_exhaustion`, `trend_break`, `time_stop`.
 
 **6. Check your logs**
-From your VPS: `docker-compose logs -f execution-engine`. Look for WARN or ERROR lines.
+From your VPS: `docker-compose logs -f execution-engine | grep -i exit`. Look for exit rule evaluations and Telegram alerts sent.
 
 ---
 
@@ -819,7 +811,7 @@ docker-compose up -d --build execution-engine
 |-----|-------------|
 | `GET https://yourserver.com/health` | Check if execution engine is running |
 | `GET https://yourserver.com/last-report` | When did the analyst last report? |
-| `POST https://yourserver.com/webhook` | Where TradingView sends trade signals |
+| `POST https://yourserver.com/webhook` | Accepts custom trade signals (analyst or manual overrides) |
 | `POST https://yourserver.com/options/price` | Query Black-Scholes prices directly |
 
 ### Test the webhook manually

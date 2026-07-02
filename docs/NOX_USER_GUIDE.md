@@ -335,19 +335,21 @@ This is the most common operational question. Here is the honest answer:
 
 ### How equity signals actually work
 
-The execution engine does **not** self-generate buy/sell signals for equities. It is a receiver. The full pipeline is:
+Nox uses a rule-based system for equity trading. The full pipeline is:
 
 ```
-TradingView strategy fires an alert
+Analyst brain detects market conditions (every 6 hours)
         ↓
-TradingView sends a JSON webhook to your VPS (port 80/443 → execution engine port 8080)
+Regime classification (RISK_ON / TRANSITION / RISK_OFF)
         ↓
-Execution engine validates the signal, checks the regime, sizes the position
+Execution engine applies exit rules to open positions
         ↓
-Alpaca order is placed
+Take-profit, stop-loss, RSI exhaustion, trend-break rules trigger exits
+        ↓
+Alpaca orders are placed automatically
 ```
 
-**The analyst agent only sends `REPORT` signals.** It tells you the market regime (RISK_ON / RISK_OFF) but it does not send BUY or SELL signals. Only TradingView does that.
+The system continuously monitors open positions and executes exits based on quantitative rules rather than external signals.
 
 If you have not received a trade signal in months, one of the following is true:
 
@@ -355,69 +357,60 @@ If you have not received a trade signal in months, one of the following is true:
 
 ### Diagnosis checklist — run through these in order
 
-**Step 1: Is TradingView sending webhooks?**
-- Log into TradingView → open your strategy → go to Alerts
-- Check if any alerts exist and whether they are **active** (green dot)
-- TradingView free tier alerts expire after a certain time. If the alert is grey or deleted, it stopped sending months ago
-- **Fix:** Recreate the alert on the Pine Script strategy and set it to `Once Per Bar Close` with your webhook URL
-
-**Step 2: Is the webhook URL correct?**
-- The webhook target should be `https://<your-domain-or-ip>/webhook` (or `http://` if no SSL)
-- If your VPS IP changed, the URL is dead
-- **Fix:** Update the TradingView alert URL to your current server address
-
-**Step 3: Is the execution engine actually running?**
+**Step 1: Is the execution engine running?**
 - From your VPS: `docker-compose ps`
 - You should see `execution-engine` with status `Up`
 - **Fix:** `docker-compose up -d execution-engine`
 
-**Step 4: Is the regime blocking signals?**
-- The regime gate blocks all new BUY orders when `RISK_OFF` is active
+**Step 2: Do you have open positions?**
+- Check your Alpaca dashboard: https://app.alpaca.markets
+- If no positions exist, the exit rules have nothing to act on
+- Check your Telegram for recent trade alerts
+
+**Step 3: Is the regime blocking new trades?**
+- The regime gate stops new entries when `RISK_OFF` is active
 - RISK_OFF fires when VIX ≥ 35 OR SPY is more than 2% below its 200-day average
-- For most of 2025-2026, regime has alternated between RISK_ON and TRANSITION due to macro volatility
 - **Check:** Look at your last Telegram analyst report — what regime was reported?
-- **In TRANSITION:** Signals pass through but position sizes are cut by 50%
-- **In RISK_OFF:** All BUY signals are hard-blocked at the execution gate
+- **In TRANSITION:** Position sizes are cut by 50%
+- **In RISK_OFF:** All new BUY signals are hard-blocked
 
-**Step 5: Is the RSI gate blocking signals?**
-- The bot blocks BUY signals when RSI < 30 (deeply oversold — potential falling knife)
-- During extreme sell-offs, this gate can trigger frequently
-- **Check:** Your Telegram should show `🚧 RSI GATE BLOCK` messages if this is the cause
+**Step 4: Are exit rules triggering?**
+- Check the trade ledger: From the execution engine, `curl localhost:8080/trades`
+- Look for recent exits with reasons: `take_profit`, `stop_loss`, `rsi_exhaustion`, `trend_break`
+- Exits should fire automatically when conditions are met
+- **Check:** Your Telegram should show exit confirmations (e.g., `✅ [EXIT] AAPL sold at take-profit`)
 
-**Step 6: Is the Pine Script strategy generating signals at all?**
-- Open your TradingView chart and look at the strategy's equity curve
-- If no new triangles (buy/sell markers) appear on recent bars, the strategy hasn't fired
-- This means market conditions don't match the entry rules — the bot is working as intended, just patiently waiting
-- **What to do:** See "Course of Action" section below
+**Step 5: Check the execution engine logs**
+- `docker-compose logs -f execution-engine | grep -i exit`
+- Look for rule evaluations and position updates
+- If you see errors, the engine may have crashed or lost connection to Alpaca
 
 ---
 
-### Course of action — if no signals and you want to stay active
+### Course of action — if positions are stalled
 
-The regime and RSI gates exist for a reason: forcing trades in bad market conditions destroys capital. If conditions aren't right, the correct action is **not** to bypass the gates. Instead:
+The regime and RSI gates exist for a reason: forcing trades in bad market conditions destroys capital. If conditions aren't right, the system is working as intended. Instead:
 
-**Option A: Use the Options Signal Generator (available now)**
-The options signaler runs independently on a background thread every 30 minutes (configurable). It does not need TradingView. It generates advisory Telegram alerts automatically once the engine is running. During RISK_OFF regimes, long premium signals are suppressed but income strategies (cash-secured puts, covered calls) are still generated — these actually benefit from high volatility. See the Options Signal Generator section below.
+**Option A: Monitor regime changes**
+Check the analyst Telegram report daily. When regime returns to RISK_ON and VIX drops below 35, the execution engine will be ready for new positions. During TRANSITION, exits work but position sizes are reduced.
 
-**Option B: Verify and reconnect TradingView**
-1. Check TradingView alert status (Step 1 above)
-2. If the strategy isn't firing, look at the Pine Script conditions — the EMA crossover + volume filter may not have triggered in the current market structure
-3. Consider adjusting the strategy timeframe or adding the strategy to more tickers (the webhook payload just needs a `ticker` field — it's not hardcoded to SPY)
+**Option B: Use the Options Signal Generator**
+The options signaler runs independently on a background thread every 30 minutes (configurable). It generates advisory Telegram alerts automatically. During RISK_OFF regimes, long premium signals are suppressed but income strategies (cash-secured puts, covered calls) are still generated — these actually benefit from high volatility. See the Options Signal Generator section below.
 
-**Option C: Use paper trading to develop new signals**
-If you want to build new strategies without risking real capital:
+**Option C: Use paper trading to validate rules**
+If you want to test new exit rules without risking real capital:
 1. Set `ALPACA_BASE_URL=https://paper-api.alpaca.markets` in your `.env`
-2. Test new TradingView strategies by pointing alerts at the paper endpoint
-3. Run for 30–60 days to validate the signal quality before switching to live
+2. Run for 30–60 days to validate exit behavior before switching to live
+3. Check the trade ledger (`/trades` endpoint) to see rule evaluations
 
-**Option D: Monitor regime and wait**
-Check the analyst Telegram report daily. When regime returns to RISK_ON and VIX drops below 35, the gates open and signals will execute normally. During TRANSITION, smaller signals still go through at 50% size.
+**Option D: Verify exit rule configuration**
+Review the `.env` variables for exit rules (take-profit %, stop-loss %, RSI thresholds). These control when existing positions close. You can adjust them to fit your risk tolerance.
 
 ---
 
 ## Options Signal Generator
 
-This is a new self-contained advisory system built into the execution engine. Unlike equity signals, **it does not need TradingView**. It runs on a timer and sends Telegram alerts to you directly.
+This is a self-contained advisory system built into the execution engine. It runs independently on a background timer and sends Telegram alerts to you directly.
 
 ### What it does
 
@@ -530,43 +523,45 @@ The signal gives you the trade idea backed by quantitative analysis. You decide 
 
 ---
 
-## Developing Your Own Signals
+## Customizing Exit Rules
 
-If you want to build new trading strategies and feed them to the bot:
+The system uses quantitative rules to exit positions automatically. You can customize these in your `.env`:
 
-### Using TradingView + Pine Script (equity trades)
+### Exit Rule Configuration
 
-1. Write or find a Pine Script strategy on TradingView
-2. Test it on the chart — look for consistent signals without excessive whipsawing
-3. Add an alert: `Condition: Order fills` → Webhook URL: your server
-4. The webhook payload must match this format:
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `TAKE_PROFIT_PCT` | 15 | Close position at +15% profit |
+| `STOP_LOSS_PCT` | 8 | Close position at -8% loss |
+| `RSI_THRESHOLD_EXIT` | 78 | Close if RSI > 78 (overbought exhaustion) |
+| `TREND_BREAK_THRESHOLD` | 0.98 | Close if price falls below 200-SMA × this factor |
+| `MAX_HOLD_DAYS` | 10 | Close if held longer than N days |
+
+### Testing Custom Rules
+
+1. Update `.env` with your preferred exit thresholds
+2. Set `ALPACA_BASE_URL=https://paper-api.alpaca.markets` to test on paper
+3. Monitor Telegram for exit confirmations and check the trade ledger
+4. After 30–60 trading days, review the P&L and exit patterns
+5. Switch to live if the results match your expectations
+
+### Custom Signal Entry (Advanced)
+
+The `/webhook` endpoint accepts custom signals from Python scripts, trading bots, or other services. Format:
+
 ```json
 {
   "secret_key": "your_WEBHOOK_SECRET_TOKEN",
   "ticker": "AAPL",
   "action": "BUY",
   "price": 195.50,
-  "rsi": 54.2,
-  "atr": 2.31,
-  "vol": 45000000,
-  "stop_loss_atr_multiplier": 2.0,
-  "risk_tier": 0,
-  "vix": 16.4,
-  "spy_price": 580.0,
-  "spy_200_sma": 565.0
+  "risk_tier": 0
 }
 ```
-5. The bot validates, sizes, and executes. You get a Telegram confirmation.
 
-### Using paper trading to validate
+Examples:
+- **Python script:** Use the `requests` library to POST JSON to your server
+- **Jupyter notebook:** Same as Python
+- **External bot:** Anything that can make HTTP POST requests with the right JSON format
 
-Before going live with any new strategy:
-1. Set `ALPACA_BASE_URL=https://paper-api.alpaca.markets`
-2. Run the strategy on TradingView pointing to your server
-3. Monitor Telegram for signals and check Alpaca paper dashboard
-4. After 30–60 trading days, check the win rate and P&L
-5. Only switch to live if the paper results are solid
-
-### The signal pipeline is open
-
-The `/webhook` endpoint accepts signals from any source — not just TradingView. You could send signals from a Python script, a Jupyter notebook, another service, or anything that can make an HTTP POST request. The only requirement is the correct `secret_key` and the fields above.
+**Important:** Custom signals are evaluated against all exit rules and regime gates just like internal signals.
