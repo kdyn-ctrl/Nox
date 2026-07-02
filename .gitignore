@@ -53,3 +53,4 @@ reports/
 analyst_agent
 analyst/analyst_agent
 nox_engine
+data/china_positions.json
