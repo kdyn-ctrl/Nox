@@ -112,6 +112,15 @@ services:
       - EQUITY_SCAN_INTERVAL_MINUTES=${EQUITY_SCAN_INTERVAL_MINUTES:-30}
       - EQUITY_SCAN_MAX_SIGNALS=${EQUITY_SCAN_MAX_SIGNALS:-2}
       - EQUITY_SCAN_BYPASS_HOURS=${EQUITY_SCAN_BYPASS_HOURS:-false}
+      # Rule-based equity exits — the strategy-consistent inverse of the entry
+      # rules, evaluated every 5 min by the trailing-stop monitor. Set any
+      # threshold to 0 (or the toggle to false) to disable that rule.
+      - EQUITY_RULE_EXITS_ENABLED=${EQUITY_RULE_EXITS_ENABLED:-true}
+      - EQUITY_EXIT_TAKE_PROFIT_PCT=${EQUITY_EXIT_TAKE_PROFIT_PCT:-0.15}
+      - EQUITY_EXIT_STOP_LOSS_PCT=${EQUITY_EXIT_STOP_LOSS_PCT:-0.10}
+      - EQUITY_EXIT_RSI_CEILING=${EQUITY_EXIT_RSI_CEILING:-78}
+      - EQUITY_EXIT_SMA_BREAK=${EQUITY_EXIT_SMA_BREAK:-true}
+      - EQUITY_EXIT_MAX_HOLD_DAYS=${EQUITY_EXIT_MAX_HOLD_DAYS:-0}
       # Persistence — must match the volume mount below so data survives restarts.
       - MEMORY_BANK_PATH=/app/data/memory_bank.db
       - CN_POSITIONS_PATH=/app/data/china_positions.json
@@ -146,6 +155,10 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - ALPACA_API_KEY=${ALPACA_API_KEY}
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      # Must match execution-engine's ALPACA_BASE_URL so reports (EOD/EOW, /trades
+      # context, portfolio commands) reflect the same venue (paper/live) the
+      # engine is actually trading on — never hardcode paper vs live per-service.
+      - ALPACA_BASE_URL=${ALPACA_BASE_URL}
       # Shared secret used to authenticate requests to the china-data-engine API.
       - WEBHOOK_SECRET_TOKEN=${WEBHOOK_SECRET_TOKEN}
       # WS1 — port for the internal IV skew endpoint served to the data engines.

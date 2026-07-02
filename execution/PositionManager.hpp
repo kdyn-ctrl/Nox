@@ -37,6 +37,11 @@ public:
         if (sqlite3_open(db_path.c_str(), &db_)) {
             throw std::runtime_error("Can't open database: " + std::string(sqlite3_errmsg(db_)));
         }
+        // The heartbeat monitor (Python) shares this DB file. WAL lets a reader and
+        // a writer coexist without "database is locked"; busy_timeout makes the rare
+        // writer-writer collision block-and-retry for up to 5s instead of failing.
+        sqlite3_busy_timeout(db_, 5000);
+        sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", 0, 0, nullptr);
         initialize_database();
     }
 
@@ -108,23 +113,112 @@ private:
 
     void initialize_database() {
         std::lock_guard<std::mutex> lock(db_lock_);
-        const char* sql = "CREATE TABLE IF NOT EXISTS open_positions ("
-                          "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                          "ticker TEXT NOT NULL, "
-                          "option_type TEXT NOT NULL, "
-                          "strike REAL NOT NULL, "
-                          "quantity INTEGER NOT NULL, "
-                          "entry_price REAL NOT NULL, "
-                          "entry_date TEXT NOT NULL, "
-                          "profile_type TEXT NOT NULL, "
-                          "expiration_date TEXT NOT NULL);";
+        // open_positions: options the exit monitor manages (50%/stop/21-DTE rules).
+        // trade_history: the canonical, cross-service trade ledger. The execution
+        //   engine is the single writer (every equity + option entry/exit lands here);
+        //   the heartbeat monitor reads it for the EOD/EOW/monthly reports. Schema is
+        //   kept in sync with heartbeat/monitor.py init_db(); both create-if-not-exists
+        //   and additively migrate, so either service may create the file first.
+        const char* sql =
+            "CREATE TABLE IF NOT EXISTS open_positions ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "ticker TEXT NOT NULL, "
+            "option_type TEXT NOT NULL, "
+            "strike REAL NOT NULL, "
+            "quantity INTEGER NOT NULL, "
+            "entry_price REAL NOT NULL, "
+            "entry_date TEXT NOT NULL, "
+            "profile_type TEXT NOT NULL, "
+            "expiration_date TEXT NOT NULL);"
+            "CREATE TABLE IF NOT EXISTS trade_history ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, "
+            "ticker TEXT, "
+            "action TEXT, "
+            "price REAL, "
+            "rsi_value REAL, "
+            "sizing_kelly_ratio REAL, "
+            "pnl REAL, "
+            "asset_class TEXT DEFAULT 'equity', "
+            "quantity REAL DEFAULT 0, "
+            "detail TEXT DEFAULT '');";
         char* err_msg = nullptr;
         if (sqlite3_exec(db_, sql, 0, 0, &err_msg) != SQLITE_OK) {
             std::string err = "SQL error: " + std::string(err_msg);
             sqlite3_free(err_msg);
             throw std::runtime_error(err);
         }
+        // Additive migration for a trade_history table created by an older build
+        // (or by the monitor's original schema) that lacks the newer columns.
+        ensure_column_locked("trade_history", "asset_class", "TEXT DEFAULT 'equity'");
+        ensure_column_locked("trade_history", "quantity",    "REAL DEFAULT 0");
+        ensure_column_locked("trade_history", "detail",       "TEXT DEFAULT ''");
     }
+
+    // Adds `column` to `table` if it does not already exist. Idempotent; safe to
+    // call on every startup. Must be called with db_lock_ held.
+    void ensure_column_locked(const std::string& table,
+                              const std::string& column,
+                              const std::string& decl) {
+        std::string pragma = "PRAGMA table_info(" + table + ");";
+        sqlite3_stmt* stmt = nullptr;
+        bool exists = false;
+        if (sqlite3_prepare_v2(db_, pragma.c_str(), -1, &stmt, 0) == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const unsigned char* name = sqlite3_column_text(stmt, 1); // col 1 = name
+                if (name && column == reinterpret_cast<const char*>(name)) {
+                    exists = true;
+                    break;
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+        if (!exists) {
+            std::string alter = "ALTER TABLE " + table + " ADD COLUMN " + column + " " + decl + ";";
+            sqlite3_exec(db_, alter.c_str(), 0, 0, nullptr); // best-effort
+        }
+    }
+
+public:
+    // Append a trade to the canonical ledger. Called by the execution engine on
+    // every equity/option entry and exit. `action` is BUY/SELL (equity) or
+    // OPEN/CLOSE (option); `asset_class` is "equity" or "option". Best-effort:
+    // a ledger write must never abort or delay an order path, so failures are
+    // swallowed (the mutex + SQLite busy_timeout handle contention).
+    void record_trade(const std::string& ticker,
+                      const std::string& action,
+                      const std::string& asset_class,
+                      double quantity,
+                      double price,
+                      double rsi_value,
+                      double sizing_kelly_ratio,
+                      double pnl,
+                      const std::string& detail)
+    {
+        std::lock_guard<std::mutex> lock(db_lock_);
+        const char* sql =
+            "INSERT INTO trade_history "
+            "(ticker, action, price, rsi_value, sizing_kelly_ratio, pnl, asset_class, quantity, detail) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, 0) != SQLITE_OK) {
+            sqlite3_finalize(stmt);
+            return;
+        }
+        sqlite3_bind_text  (stmt, 1, ticker.c_str(),      -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text  (stmt, 2, action.c_str(),      -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(stmt, 3, price);
+        sqlite3_bind_double(stmt, 4, rsi_value);
+        sqlite3_bind_double(stmt, 5, sizing_kelly_ratio);
+        sqlite3_bind_double(stmt, 6, pnl);
+        sqlite3_bind_text  (stmt, 7, asset_class.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(stmt, 8, quantity);
+        sqlite3_bind_text  (stmt, 9, detail.c_str(),      -1, SQLITE_TRANSIENT);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+
+private:
 
     void monitor_positions(); // Implementation will be in a .cpp file
 
