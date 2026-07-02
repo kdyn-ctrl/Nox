@@ -21,7 +21,7 @@ import statistics
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
-import requests
+from retry_utils import fetch_with_retry
 
 HTTP_TIMEOUT = (5, 10)
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET_TOKEN", "")
@@ -39,18 +39,18 @@ MARKET_PROXY = os.getenv("CONTRADICTION_MARKET_PROXY", "SPY")
 
 def fetch_iv_skew(ticker: str) -> Dict[str, Any]:
     """Query the heartbeat's internal IV skew endpoint for one ticker."""
-    try:
-        resp = requests.get(
-            f"{HEARTBEAT_BASE}/iv/skew",
-            params={"ticker": ticker},
-            headers={"X-Nox-Token": WEBHOOK_SECRET},
-            timeout=HTTP_TIMEOUT,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-        return {"ticker": ticker, "method": "error", "error": f"HTTP {resp.status_code}"}
-    except requests.RequestException as e:
-        return {"ticker": ticker, "method": "error", "error": str(e)}
+    resp = fetch_with_retry(
+        f"{HEARTBEAT_BASE}/iv/skew",
+        source=f"IV skew:{ticker}",
+        params={"ticker": ticker},
+        headers={"X-Nox-Token": WEBHOOK_SECRET},
+        timeout=HTTP_TIMEOUT,
+    )
+    if resp is None:
+        return {"ticker": ticker, "method": "error", "error": "heartbeat unreachable after retries"}
+    if resp.status_code == 200:
+        return resp.json()
+    return {"ticker": ticker, "method": "error", "error": f"HTTP {resp.status_code}"}
 
 
 def aggregate_sentiment(news: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -210,6 +210,7 @@ def run_contradiction_check(news: List[Dict[str, Any]]) -> Dict[str, Any]:
     results.sort(key=lambda r: 0 if r.get("verdict", "").startswith("CONTRADICT") else 1)
 
     contradictions = [r for r in results if r.get("verdict", "").startswith("CONTRADICT")]
+    data_gaps = [r["ticker"] for r in results if r.get("verdict") == "NO_DATA"]
     payload = {
         "generated_at": datetime.now(tz=timezone.utc).isoformat(),
         "bypass": BYPASS,
@@ -220,10 +221,18 @@ def run_contradiction_check(news: List[Dict[str, Any]]) -> Dict[str, Any]:
         "results": results,
         # WS4 feed: aged-decay input for the analyst.
         "sentiment_scores": to_sentiment_scores(results),
+        "data_gaps": data_gaps,
+        "complete": not data_gaps,
     }
     print(
         f"[INFO] [CONTRADICTION-VECTOR] Evaluated {len(results)} ticker(s); "
         f"{len(contradictions)} contradiction(s) flagged.",
         flush=True,
     )
+    if data_gaps:
+        print(
+            f"[WARN] [CONTRADICTION-VECTOR] IV skew unavailable for: {', '.join(data_gaps)} "
+            f"— verdicts for these tickers are NO_DATA, not a real signal.",
+            flush=True,
+        )
     return payload

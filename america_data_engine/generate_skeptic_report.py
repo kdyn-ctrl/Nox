@@ -11,9 +11,16 @@ Output (written to /app/data/):
     skeptic_report_YYYY-MM-DD.json
     skeptic_report_YYYY-MM-DD.md
 
+If any workstream's data fetch fails after retries, NO skeptic_report is
+written — a partial report that looks complete is worse than no report,
+since Sunday review can't otherwise tell "no signal" apart from "fetch
+failed". Instead, skeptic_report_YYYY-MM-DD_INCOMPLETE.json is written,
+naming exactly which source(s) failed.
+
 Exit codes:
-    0 — report written successfully
-    1 — one or more pipeline stages failed (partial report still written)
+    0 — report written successfully, all data complete
+    1 — one or more pipeline stages failed; no report written, see the
+        _INCOMPLETE.json diagnostic file
 """
 
 import json
@@ -44,9 +51,15 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------------------
 
 def _run_contradiction() -> tuple[str, dict, str | None]:
+    # NOTE: a per-ticker "NO_DATA" verdict (thin/no options open interest for
+    # that instrument) is a real market-data outcome, not an API fetch
+    # failure — it is surfaced in result["data_gaps"] for the report body but
+    # does not block generation. Only a total Alpaca news outage does.
     try:
         print("[WS6] Fetching news for contradiction check...", flush=True)
         news = fetch_alpaca_news()
+        if news is None:
+            return "contradiction", {}, "Alpaca news fetch failed after retries — cannot run contradiction check."
         print(f"[WS6] {len(news)} article(s) fetched.", flush=True)
         result = run_contradiction_check(news)
         print(f"[WS6] Contradiction check: {len(result.get('results', []))} ticker(s) evaluated.", flush=True)
@@ -61,6 +74,9 @@ def _run_insider_clusters() -> tuple[str, dict, str | None]:
         result = detect_insider_clusters(WATCHLIST)
         n = len(result.get("signals", []))
         print(f"[WS6] Insider cluster scan: {n} cluster signal(s) found.", flush=True)
+        gaps = result.get("data_gaps", [])
+        if gaps:
+            return "insider_clusters", result, f"SEC Form 4 fetch failed for: {', '.join(gaps)}"
         return "insider_clusters", result, None
     except Exception:
         return "insider_clusters", {}, traceback.format_exc()
@@ -72,6 +88,9 @@ def _run_alt_macro() -> tuple[str, dict, str | None]:
         result = run_alt_macro_check()
         n = len(result.get("regions", []))
         print(f"[WS6] Alt-macro check: {n} region(s) evaluated.", flush=True)
+        gaps = result.get("data_gaps", [])
+        if gaps:
+            return "alt_macro", result, f"Source fetch failed for: {', '.join(gaps)}"
         return "alt_macro", result, None
     except Exception:
         return "alt_macro", {}, traceback.format_exc()
@@ -81,8 +100,11 @@ def _run_earnings() -> tuple[str, dict, str | None]:
     try:
         print("[WS6] Fetching 30-day earnings calendar...", flush=True)
         result = fetch_earnings_calendar(WATCHLIST)
-        total = sum(len(v) for v in result.values())
+        failed = [t for t, v in result.items() if v is None]
+        total = sum(len(v) for v in result.values() if v)
         print(f"[WS6] Earnings calendar: {total} event(s) found.", flush=True)
+        if failed:
+            return "earnings_calendar", result, f"Earnings fetch failed for: {', '.join(failed)}"
         return "earnings_calendar", result, None
     except Exception:
         return "earnings_calendar", {}, traceback.format_exc()
@@ -153,8 +175,9 @@ def _score_alt_macro(data: dict) -> tuple[str, list[str]]:
 # ---------------------------------------------------------------------------
 
 def _render_markdown(report: dict) -> str:
+    # Only ever called on a report whose pipeline had zero errors — main()
+    # aborts before this point and never writes the file otherwise.
     ts = report["generated_at"]
-    errors = report.get("pipeline_errors", {})
     lines: list[str] = []
 
     lines.append(f"# Nox Skeptic Report — {ts[:10]}")
@@ -176,8 +199,6 @@ def _render_markdown(report: dict) -> str:
     lines.append(f"### WS1 — Contradiction Vector: {cv['conviction']}")
     for b in cv["bullets"]:
         lines.append(f"- {b}")
-    if "contradiction" in errors:
-        lines.append(f"- **ERROR**: pipeline failed — see `pipeline_errors.contradiction`")
     lines.append(f"")
 
     # WS3 — Insider Clusters
@@ -185,8 +206,6 @@ def _render_markdown(report: dict) -> str:
     lines.append(f"### WS3 — Insider Cluster Filter: {ins['conviction']}")
     for b in ins["bullets"]:
         lines.append(f"- {b}")
-    if "insider_clusters" in errors:
-        lines.append(f"- **ERROR**: pipeline failed — see `pipeline_errors.insider_clusters`")
     lines.append(f"")
 
     # WS2 — Alt Macro
@@ -194,8 +213,6 @@ def _render_markdown(report: dict) -> str:
     lines.append(f"### WS2 — Alternative Macro: {am['conviction']}")
     for b in am["bullets"]:
         lines.append(f"- {b}")
-    if "alt_macro" in errors:
-        lines.append(f"- **ERROR**: pipeline failed — see `pipeline_errors.alt_macro`")
     lines.append(f"")
 
     # Earnings calendar
@@ -203,7 +220,7 @@ def _render_markdown(report: dict) -> str:
     ec = report.get("earnings_calendar", {})
     if ec:
         for ticker, events in sorted(ec.items()):
-            for ev in events:
+            for ev in (events or []):
                 lines.append(f"- **{ticker}** — {ev.get('date', '?')}: {ev.get('description', 'Earnings')}")
     else:
         lines.append(f"- No upcoming earnings found.")
@@ -253,7 +270,30 @@ def main() -> int:
         pipeline_data[key] = result
         if err:
             pipeline_errors[key] = err
-            print(f"[WS6] [WARN] Stage '{key}' failed:\n{err}", flush=True)
+            print(f"[WS6] [WARN] Stage '{key}' incomplete: {err}", flush=True)
+
+    # Skeptic report policy: NEVER write the reviewed skeptic_report_*.{json,md}
+    # from incomplete data — a partial report that looks complete is worse than
+    # no report, because a human reviewing it Sunday morning has no way to tell
+    # a real "no signal" apart from "we failed to fetch that source". Instead,
+    # write a clearly-named diagnostic file naming exactly what failed and abort.
+    if pipeline_errors:
+        gap_summary = "; ".join(f"{k}: {v}" for k, v in pipeline_errors.items())
+        incomplete_path = OUTPUT_DIR / f"skeptic_report_{date_str}_INCOMPLETE.json"
+        incomplete_path.write_text(json.dumps({
+            "generated_at": ts_str,
+            "report_date": date_str,
+            "status": "REPORT NOT GENERATED — incomplete data",
+            "pipeline_errors": pipeline_errors,
+            "partial_data": pipeline_data,
+        }, indent=2, default=str))
+        print(
+            f"[WS6] Report generation ABORTED — {len(pipeline_errors)} stage(s) incomplete: {gap_summary}. "
+            f"No skeptic_report_{date_str}.md/.json was written; partial data saved to {incomplete_path} "
+            f"for inspection.",
+            flush=True,
+        )
+        return 1
 
     # Score conviction
     c_level, c_bullets = _score_contradiction(pipeline_data.get("contradiction", {}))
@@ -274,7 +314,6 @@ def main() -> int:
             "insider_clusters": pipeline_data.get("insider_clusters", {}),
             "alt_macro":        pipeline_data.get("alt_macro", {}),
         },
-        "pipeline_errors": pipeline_errors,
         "bypass_flags": {
             flag: os.getenv(flag, "false")
             for flag in (
@@ -293,10 +332,6 @@ def main() -> int:
     md_path = OUTPUT_DIR / f"skeptic_report_{date_str}.md"
     md_path.write_text(_render_markdown(report))
     print(f"[WS6] Markdown report written: {md_path}", flush=True)
-
-    if pipeline_errors:
-        print(f"[WS6] Completed with {len(pipeline_errors)} stage error(s). Report is partial.", flush=True)
-        return 1
 
     print(f"[WS6] Report generation complete. Review before Sunday futures open.", flush=True)
     return 0

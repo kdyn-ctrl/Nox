@@ -26,6 +26,6 @@ RUN pip install --no-cache-dir \
 RUN mkdir -p /app/data
 VOLUME ["/app/data"]
 
-COPY monitor.py .
+COPY monitor.py retry_utils.py .
 
 CMD ["python", "-u", "monitor.py"]

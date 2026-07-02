@@ -2,6 +2,8 @@ import requests
 import akshare as ak
 from typing import Dict, Any, List
 
+from retry_utils import call_with_retry
+
 # RULE-008: All HTTP calls use a (connect_timeout, read_timeout) tuple.
 # A scalar timeout=10 only sets the read timeout — the connection can still
 # block indefinitely. The tuple form enforces both independently.
@@ -26,12 +28,12 @@ def fetch_eastmoney_hot_board() -> List[Dict[str, Any]]:
         ("stock_hot_rank_em",        ak.stock_hot_rank_em),
     ]
     for func_name, func in CANDIDATES:
+        df = call_with_retry(func, source=f"EastMoney hot board:{func_name}",
+                              is_failure=lambda d: d is None or d.empty)
+        if df is None:
+            print(f"[WARN] [SCRAPER] {func_name} returned empty dataframe after retries, trying next.", flush=True)
+            continue
         try:
-            df = func()
-            if df is None or df.empty:
-                print(f"[WARN] [SCRAPER] {func_name} returned empty dataframe, trying next.", flush=True)
-                continue
-
             print(f"[INFO] [SCRAPER] East Money hot board — using {func_name}. "
                   f"Columns: {df.columns.tolist()}", flush=True)
 
@@ -86,9 +88,10 @@ def fetch_china_pmi() -> Dict[str, Any]:
     }
 
     # 1. Fetch Official Manufacturing PMI
-    try:
-        df_mfg = ak.macro_china_pmi_yearly()
-        if not df_mfg.empty:
+    df_mfg = call_with_retry(ak.macro_china_pmi_yearly, source="China Manufacturing PMI",
+                              is_failure=lambda d: d is None or d.empty)
+    if df_mfg is not None:
+        try:
             latest = df_mfg.iloc[-1]
             mfg_val = latest.get('今值')
             mfg_date = latest.get('日期')
@@ -98,20 +101,21 @@ def fetch_china_pmi() -> Dict[str, Any]:
                 # Store the date string (e.g. "2025-08-31") as the month/reference date
                 result["month"] = str(mfg_date)
             print(f"[INFO] [SCRAPER] Manufacturing PMI fetched ({mfg_val}) for {mfg_date}.", flush=True)
-    except Exception as e:
-        print(f"[ERROR] [SCRAPER] China Manufacturing PMI fetch failed: {e}", flush=True)
+        except Exception as e:
+            print(f"[ERROR] [SCRAPER] China Manufacturing PMI parse failed: {e}", flush=True)
 
     # 2. Fetch Official Non-Manufacturing PMI
-    try:
-        df_non_mfg = ak.macro_china_non_man_pmi()
-        if not df_non_mfg.empty:
+    df_non_mfg = call_with_retry(ak.macro_china_non_man_pmi, source="China Non-Manufacturing PMI",
+                                  is_failure=lambda d: d is None or d.empty)
+    if df_non_mfg is not None:
+        try:
             latest = df_non_mfg.iloc[-1]
             non_mfg_val = latest.get('今值')
             if non_mfg_val is not None:
                 result["non_manufacturing"] = float(non_mfg_val)
             print(f"[INFO] [SCRAPER] Non-Manufacturing PMI fetched ({non_mfg_val}).", flush=True)
-    except Exception as e:
-        print(f"[ERROR] [SCRAPER] China Non-Manufacturing PMI fetch failed: {e}", flush=True)
+        except Exception as e:
+            print(f"[ERROR] [SCRAPER] China Non-Manufacturing PMI parse failed: {e}", flush=True)
 
     # Return results if we succeeded in getting at least one of the indicators
     if result["manufacturing"] > 0.0 or result["non_manufacturing"] > 0.0:
@@ -129,11 +133,11 @@ def fetch_pboc_lpr() -> Dict[str, Any]:
 
     Returns a dict with normalised English keys. Empty dict on failure.
     """
+    df = call_with_retry(ak.macro_china_lpr, source="PBOC LPR", is_failure=lambda d: d is None or d.empty)
+    if df is None:
+        print("[ERROR] [SCRAPER] PBOC LPR fetch failed after retries.", flush=True)
+        return {}
     try:
-        df = ak.macro_china_lpr()
-        if df.empty:
-            print("[WARN] [SCRAPER] PBOC LPR dataframe was empty.", flush=True)
-            return {}
         latest = df.iloc[-1]
         result = {
             "date":   str(latest.iloc[0]),
@@ -143,7 +147,7 @@ def fetch_pboc_lpr() -> Dict[str, Any]:
         print(f"[INFO] [SCRAPER] PBOC LPR fetched for {result['date']}.", flush=True)
         return result
     except Exception as e:
-        print(f"[ERROR] [SCRAPER] PBOC LPR fetch failed: {e}", flush=True)
+        print(f"[ERROR] [SCRAPER] PBOC LPR parse failed: {e}", flush=True)
         return {}
 
 
@@ -177,12 +181,12 @@ def fetch_cailian_news() -> List[Dict[str, str]]:
     for ticker in _CN_NEWS_TICKERS:
         if len(result) >= 10:
             break
+        df = call_with_retry(lambda t=ticker: ak.stock_news_em(symbol=t), source=f"stock_news_em:{ticker}",
+                              is_failure=lambda d: d is None or d.empty)
+        if df is None:
+            print(f"[WARN] [SCRAPER] stock_news_em returned empty for {ticker} after retries.", flush=True)
+            continue
         try:
-            df = ak.stock_news_em(symbol=ticker)
-            if df is None or df.empty:
-                print(f"[WARN] [SCRAPER] stock_news_em returned empty for {ticker}.", flush=True)
-                continue
-
             for _, row in df.head(5).iterrows():
                 title = str(row.get('新闻标题', '')).strip()
                 if not title or title in seen_titles:
@@ -197,7 +201,7 @@ def fetch_cailian_news() -> List[Dict[str, str]]:
                 })
 
         except Exception as e:
-            print(f"[WARN] [SCRAPER] stock_news_em failed for {ticker}: {e}", flush=True)
+            print(f"[WARN] [SCRAPER] stock_news_em parse failed for {ticker}: {e}", flush=True)
             continue
 
     if result:
