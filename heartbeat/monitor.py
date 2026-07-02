@@ -73,8 +73,8 @@ DAILY_REPORT_TICKERS = [t.strip() for t in DAILY_REPORT_TICKERS_RAW.split(",") i
 MAX_DAILY_REPORT_SEC_TICKERS = int(os.getenv("MAX_DAILY_REPORT_SEC_TICKERS", "8"))
 
 # Broad market scanner watchlist — covers all major S&P 500 sectors.
-# TradingView free tier limits you to ~5 alerts; this scanner covers 35+ tickers
-# by fetching bars from Alpaca and computing signals internally.
+# Scans 35+ tickers across all sectors by fetching bars from Alpaca and computing
+# signals internally every 30 minutes during market hours.
 SCANNER_WATCHLIST = [
     # Index ETFs
     "SPY", "QQQ", "IWM",
@@ -92,9 +92,8 @@ SCANNER_WATCHLIST = [
     "CAT", "BA", "RTX",
     # Growth / high-beta
     "PLTR", "SNOW", "CRM", "COIN",
-    # User's existing TradingView tickers
-    "XOM",  # already above, dedup is fine — set() used in scanner
 ]
+# Note: XOM appears twice above (energy + growth); dedup is fine — set() used in scanner
 
 # RULE-016 / Patch C: Global re-entrant lock for all SQLite write operations.
 # Three threads (main bot loop, schedule_checker, poll_sec_edgar) share the same
@@ -524,10 +523,9 @@ def get_us_news_context() -> tuple[str, bool]:
 
 
 # --- 2.8 BROAD MARKET SCANNER ---
-# Replaces / supplements TradingView alerts by scanning SCANNER_WATCHLIST
-# every 30 minutes during market hours and posting BUY signals directly to
-# the execution engine's internal /webhook endpoint over Docker's nox_net.
-# No Traefik, no public internet, no TradingView subscription needed.
+# Scans SCANNER_WATCHLIST every 30 minutes during market hours and posts
+# market signals directly to the execution engine's internal /webhook endpoint
+# over Docker's internal nox_net. Fully self-contained with no external dependencies.
 
 ALPACA_DATA_URL  = "https://data.alpaca.markets"
 # Broker/account host differs paper vs live — must track execution-engine's
@@ -1966,9 +1964,9 @@ def send_signals(message):
         if not signals:
             bot.reply_to(message, "📭 No signals received by the engine yet.\n\n"
                          "Possible causes:\n"
-                         "• TradingView hasn't fired any alerts\n"
-                         "• Auth secret mismatch (silently dropped)\n"
-                         "• Market scanner hasn't triggered (check market hours)")
+                         "• Market scanner hasn't triggered (check market hours)\n"
+                         "• Auth secret mismatch (signal silently dropped)\n"
+                         "• Execution engine not running or network issue")
             return
 
         signals = signals[-count:]  # most recent N
