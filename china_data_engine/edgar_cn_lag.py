@@ -14,12 +14,9 @@ from typing import Any, Dict, List
 # Chinese name aliases for US ADRs — Cailian headlines use Chinese names;
 # East Money A-share hot board shows Chinese stock codes (not US ADR symbols)
 # so we match on company name substrings instead.
+# Illustrative example only — the full curated ADR watchlist is kept private.
 _ADR_CN_NAMES: Dict[str, List[str]] = {
     "BABA": ["阿里巴巴", "阿里", "alibaba"],
-
-
-
-
 }
 
 

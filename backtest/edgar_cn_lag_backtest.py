@@ -35,27 +35,22 @@ from scipy import stats
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-EDGAR_HEADERS = {"User-Agent": "Nox/1.0 example@example.com"}
+# SEC EDGAR requires a descriptive User-Agent (else 403) — set your own via env.
+EDGAR_HEADERS = {"User-Agent": os.getenv("SEC_USER_AGENT", "Nox/1.0 example@example.com")}
 BENCHMARK_TICKER = "MCHI"
 DEFAULT_START = "2022-01-01"
 DEFAULT_END = "2025-12-31"
 MATERIALITY_THRESHOLD = 0.25  # magnitude >= this → HIGH materiality
 
-# CIKs zero-padded to 10 digits for EDGAR submissions API
+# CIKs zero-padded to 10 digits for EDGAR submissions API.
+# Illustrative example only — the full curated ADR watchlist is kept private.
 CN_ADR_CIKS: Dict[str, str] = {
     "BABA": "0001577552",
-
-
-
-
 }
 
 # HK dual-listed equivalents for cross-reference (informational only)
 HK_DUALS: Dict[str, str] = {
     "BABA": "9988.HK",
-
-
-
 }
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data")

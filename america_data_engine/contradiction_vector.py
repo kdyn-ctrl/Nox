@@ -30,6 +30,8 @@ HEARTBEAT_BASE = os.getenv("HEARTBEAT_BASE_URL", "http://heartbeat-monitor:8002"
 
 # Tunable thresholds. Per the architecture constraint, the whole gate is
 # bypassable via an explicit .env flag for backtesting.
+# Defaults below are illustrative placeholders — production values are tuned
+# via walk-forward validation and kept in a private .env, not in source.
 SKEW_THRESHOLD = float(os.getenv("CONTRADICTION_SKEW_THRESHOLD", "0.05"))       # |skew_pct|
 SENTIMENT_THRESHOLD = float(os.getenv("CONTRADICTION_SENTIMENT_THRESHOLD", "0.3"))
 BYPASS = os.getenv("CONTRADICTION_BYPASS", "false").lower() in ("true", "1", "yes")
@@ -38,22 +40,22 @@ BYPASS = os.getenv("CONTRADICTION_BYPASS", "false").lower() in ("true", "1", "ye
 MARKET_PROXY = os.getenv("CONTRADICTION_MARKET_PROXY", "SPY")
 
 # Half-life decay constants (hours) — sourced from DECAY_* in .env.
+# Placeholder defaults; the tuned per-category values live in a private .env.
 HALFLIFE_GEOPOLITICAL_HOURS = float(os.getenv("DECAY_GEO",      "24"))
 HALFLIFE_MACRO_HOURS        = float(os.getenv("DECAY_MACRO",    "24"))
 HALFLIFE_EARNINGS_HOURS     = float(os.getenv("DECAY_EARNINGS", "24"))
 HALFLIFE_TECHNICAL_HOURS    = float(os.getenv("DECAY_TECHNICAL","24"))
 
 # Anchor events — major structural news that act as reference points.
+# Illustrative subset; the full curated keyword corpus is kept private.
 _ANCHOR_KEYWORDS = [
     "sanction", "tariff", "war", "recession",
-
-
 ]
 
 # Manipulation theme keywords — flag coordinated/artificial moves (use cautiously).
+# Illustrative subset; the full curated list is kept private.
 _MANIPULATION_THEMES = [
     "short squeeze", "pump and dump", "manipulation",
-
 ]
 
 
