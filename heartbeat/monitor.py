@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 from telebot.util import smart_split
 from bs4 import BeautifulSoup
 
+from retry_utils import fetch_with_retry
+
 # --- 1. CONFIGURATION ---
 # RULE-009: Validate all required credentials at startup.
 # Any missing variable is a hard-abort — no silent runtime failures.
@@ -225,7 +227,7 @@ def get_filing_type(ticker: str) -> str:
     return "6-K" if ticker in CHINESE_ADRS else "8-K"
 
 
-def get_latest_sec_filing(ticker: str) -> str:
+def get_latest_sec_filing(ticker: str) -> tuple[str, bool]:
     """
     Fetches the actual text of the latest 8-K or 6-K filing for a ticker.
 
@@ -237,6 +239,11 @@ def get_latest_sec_filing(ticker: str) -> str:
     Token budget: truncated to 8,000 chars for the daily scout. The
     real-time pipeline (process_automated_filing) uses 40,000 chars
     because it sends a dedicated alert and can afford the larger context.
+
+    Returns (text, ok). ok=False only on a genuine fetch/parse failure (feed
+    unreachable, bad status, malformed entry, doc unreachable) — a ticker
+    simply having no recent filing is the common case and reports ok=True,
+    so the daily Scout is not blocked every single day a ticker stays quiet.
     """
     filing_type = get_filing_type(ticker)
     url = (
@@ -245,31 +252,35 @@ def get_latest_sec_filing(ticker: str) -> str:
     )
     headers = {'User-Agent': 'Nox/1.0 openclaw@vanhellsing.tech'}
     try:
-        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+        resp = fetch_with_retry(url, source=f"SEC {filing_type} feed:{ticker}", headers=headers, timeout=HTTP_TIMEOUT)
+        if resp is None:
+            return f"SEC feed unreachable for {ticker} after retries.", False
         if resp.status_code != 200:
-            return f"SEC feed returned {resp.status_code} for {ticker}."
+            return f"SEC feed returned {resp.status_code} for {ticker}.", False
 
         root = ET.fromstring(resp.content)
         ns = {'atom': 'http://www.w3.org/2005/Atom'}
         entries = root.findall('atom:entry', ns)
         if not entries:
-            return f"No recent {filing_type} filings found for {ticker}."
+            return f"No recent {filing_type} filings found for {ticker}.", True
 
         link_el = entries[0].find('atom:link', ns)
         if link_el is None:
-            return f"No filing index link found in feed for {ticker}."
+            return f"No filing index link found in feed for {ticker}.", False
 
         index_url = link_el.attrib.get('href', '')
         if not index_url:
-            return f"Empty filing index link for {ticker}."
+            return f"Empty filing index link for {ticker}.", False
 
         primary_url = resolve_primary_document(index_url, headers, filing_type)
         if not primary_url:
-            return f"Could not resolve primary {filing_type} document for {ticker}."
+            return f"Could not resolve primary {filing_type} document for {ticker}.", False
 
-        doc_res = requests.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
+        doc_res = fetch_with_retry(primary_url, source=f"SEC {filing_type} doc:{ticker}", headers=headers, timeout=HTTP_TIMEOUT)
+        if doc_res is None:
+            return f"Primary document unreachable for {ticker} after retries.", False
         if doc_res.status_code != 200:
-            return f"Primary document fetch returned {doc_res.status_code} for {ticker}."
+            return f"Primary document fetch returned {doc_res.status_code} for {ticker}.", False
 
         soup = BeautifulSoup(doc_res.text, "html.parser")
         for element in soup(["script", "style"]):
@@ -280,46 +291,46 @@ def get_latest_sec_filing(ticker: str) -> str:
         # the item numbers and key disclosures without burning excess tokens.
         cleaned = "\n".join(lines)[:8000]
         print(f"[INFO] [HEARTBEAT] Resolved {filing_type} text for {ticker} ({len(cleaned)} chars).", flush=True)
-        return f"SEC {filing_type} ({ticker}):\n{cleaned}"
+        return f"SEC {filing_type} ({ticker}):\n{cleaned}", True
     except Exception as e:
         print(f"[WARN] [HEARTBEAT] get_latest_sec_filing failed for {ticker}: {e}", flush=True)
-        return f"SEC pull failed for {ticker}: {str(e)}"
+        return f"SEC pull failed for {ticker}: {str(e)}", False
 
 # --- 2.5 CHINESE MARKET INTELLIGENCE (china-data-engine) ---
 
-def query_data_engine(endpoint: str, base_url: str = "http://china-data-engine:8000") -> dict:
+def query_data_engine(endpoint: str, base_url: str = "http://china-data-engine:8000") -> tuple[dict, bool]:
     """
-    Sends an authenticated GET request to an internal china-data-engine microservice.
+    Sends an authenticated GET request to an internal data-engine microservice
+    (china-data-engine or america-data-engine, selected via base_url).
 
-    The china-data-engine runs scrapers on a 15-minute APScheduler cycle and
-    caches results in memory, so this call always returns instantly — no live
-    scrape is triggered. If the china-data-engine is unreachable (e.g., still starting
-    up) we return an empty dict; the caller must handle that gracefully.
+    The data engines run scrapers on their own APScheduler cycle and cache
+    results in memory, so this call always returns instantly — no live scrape
+    is triggered. Retries with backoff before giving up.
 
     Authentication follows the same shared-secret pattern used by the analyst →
     execution webhook (RULE-004): the X-Nox-Token header carries WEBHOOK_SECRET.
     RULE-008 timeouts are enforced via HTTP_TIMEOUT.
+
+    Returns (payload, ok). On failure, payload is {} and ok is False, so the
+    caller can distinguish "reached the engine, cache is just empty" from
+    "could not reach the engine at all" instead of treating both as silence.
     """
     url = f"{base_url}{endpoint}"
     headers = {"X-Nox-Token": WEBHOOK_SECRET}
-    try:
-        res = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-        if res.status_code == 200:
-            return res.json()
-        print(
-            f"[WARN] [HEARTBEAT] china-data-engine at {base_url} returned HTTP {res.status_code} "
-            f"for {endpoint}.",
-            flush=True,
-        )
-    except Exception as e:
-        print(
-            f"[WARN] [HEARTBEAT] Could not reach china-data-engine at {url}: {e}",
-            flush=True,
-        )
-    return {}
+    res = fetch_with_retry(url, source=f"data-engine:{endpoint}", headers=headers, timeout=HTTP_TIMEOUT)
+    if res is None:
+        print(f"[WARN] [HEARTBEAT] Could not reach data engine at {url} after retries.", flush=True)
+        return {}, False
+    if res.status_code == 200:
+        return res.json(), True
+    print(
+        f"[WARN] [HEARTBEAT] data engine at {base_url} returned HTTP {res.status_code} for {endpoint}.",
+        flush=True,
+    )
+    return {}, False
 
 
-def get_chinese_market_context() -> str:
+def get_chinese_market_context() -> tuple[str, bool]:
     """
     Assembles three layers of Chinese market intelligence by querying the
     dedicated china-data-engine microservice over the internal nox_net Docker network.
@@ -336,11 +347,17 @@ def get_chinese_market_context() -> str:
 
     Each endpoint is queried independently so a failure on one source (e.g.,
     the sentiment endpoint) does not suppress PMI or LPR data.
+
+    Returns (text, ok). ok is True only if every underlying data-engine call
+    succeeded — a cache that is reachable but genuinely empty still counts as
+    ok, since that's real data, not a fetch failure.
     """
     sections = []
+    all_ok = True
 
     # --- East Money Hot Board (东方财富人气榜) ---
-    sentiment_payload = query_data_engine("/sentiment/china")
+    sentiment_payload, ok = query_data_engine("/sentiment/china")
+    all_ok = all_ok and ok
     hot_board = sentiment_payload.get("hot_board", [])
     if hot_board:
         lines = [
@@ -357,7 +374,8 @@ def get_chinese_market_context() -> str:
         sections.append("🇨🇳 East Money Hot Board: unavailable.")
 
     # --- China Manufacturing PMI (制造业PMI) ---
-    macro_payload = query_data_engine("/macro/china")
+    macro_payload, ok = query_data_engine("/macro/china")
+    all_ok = all_ok and ok
     pmi = macro_payload.get("pmi", {})
     if pmi:
         mfg     = pmi.get('manufacturing', 'N/A')
@@ -393,7 +411,8 @@ def get_chinese_market_context() -> str:
     # Injected as a fourth context layer for the scout — highest-velocity
     # Chinese-language news source. Claude uses these to detect intraday
     # policy signals that have not yet appeared in English-language feeds.
-    news_payload = query_data_engine("/news/cn")
+    news_payload, ok = query_data_engine("/news/cn")
+    all_ok = all_ok and ok
     news_cn = news_payload.get("news", [])
     if news_cn:
         lines = [
@@ -408,25 +427,30 @@ def get_chinese_market_context() -> str:
     else:
         sections.append("📰 Cailian Press: unavailable.")
 
-    return "\n\n".join(sections)
+    return "\n\n".join(sections), all_ok
 
 
-def get_us_news_context() -> str:
+def get_us_news_context() -> tuple[str, bool]:
     """
-    Assembles US news context by querying the america-china-data-engine.
+    Assembles US news context by querying the america-data-engine.
+
+    Returns (text, ok). ok is False only when the america-data-engine call
+    itself failed after retries — a reachable engine with a genuinely empty
+    news cache still returns ok=True.
     """
-    news_payload = query_data_engine("/news/us", "http://america-data-engine:8001")
+    news_payload, ok = query_data_engine("/news/us", "http://america-data-engine:8001")
     news_us = news_payload.get("news", [])
     if news_us:
         lines = [
             f"- {n.get('headline', '')}"
             for n in news_us[:5] #top 5
         ]
-        print(f"[INFO] [HEARTBEAT] US news received from america-china-data-engine ({len(lines)} headlines).", flush=True)
-        return "\n".join(lines)
+        print(f"[INFO] [HEARTBEAT] US news received from america-data-engine ({len(lines)} headlines).", flush=True)
+        return "\n".join(lines), ok
     else:
-        print("[WARN] [HEARTBEAT] US news from america-china-data-engine was empty.", flush=True)
-        return "US news headlines unavailable."
+        if ok:
+            print("[INFO] [HEARTBEAT] US news from america-data-engine was empty (not a failure).", flush=True)
+        return "US news headlines unavailable.", ok
 
 
 # --- 2.8 BROAD MARKET SCANNER ---
@@ -983,10 +1007,35 @@ def _send_telegram_section(section: str) -> None:
 
 def run_scout_protocol():
     try:
-        news_context    = get_us_news_context()
+        news_context, news_ok = get_us_news_context()
         report_tickers  = DAILY_REPORT_TICKERS[:MAX_DAILY_REPORT_SEC_TICKERS]
-        sec_context     = "\n\n".join([get_latest_sec_filing(t) for t in report_tickers])
-        chinese_context = get_chinese_market_context()
+        sec_results     = [get_latest_sec_filing(t) for t in report_tickers]
+        sec_context     = "\n\n".join(text for text, _ in sec_results)
+        sec_failed      = [t for t, (_, ok) in zip(report_tickers, sec_results) if not ok]
+        chinese_context, china_ok = get_chinese_market_context()
+
+        # Policy: never generate the daily audit from incomplete context — a
+        # confident-sounding report built on partial data is worse than no
+        # report, since there's no way for the reader to tell "nothing
+        # material happened" apart from "we couldn't reach a data source".
+        gaps = []
+        if not news_ok:
+            gaps.append("US news (america-data-engine unreachable)")
+        if sec_failed:
+            gaps.append(f"SEC filings unreachable for: {', '.join(sec_failed)}")
+        if not china_ok:
+            gaps.append("Chinese market intelligence (china-data-engine unreachable)")
+
+        if gaps:
+            gap_summary = "; ".join(gaps)
+            print(f"[WARN] [HEARTBEAT] Scout protocol SKIPPED — incomplete data: {gap_summary}", flush=True)
+            _send_telegram_section(
+                "*NOX DAILY AUDIT — SKIPPED*\n"
+                "────────────────────────\n"
+                "Refusing to generate today's audit from incomplete data.\n"
+                f"Missing: {gap_summary}"
+            )
+            return
 
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -1130,13 +1179,15 @@ def fetch_iv_skew(ticker: str) -> dict:
         "APCA-API-KEY-ID": ALPACA_API,
         "APCA-API-SECRET-KEY": ALPACA_SEC,
     }
-    try:
-        url = f"{ALPACA_BROKER_URL}/v1beta3/options/chains/{ticker}"
-        resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            return {"ticker": ticker, "method": "error",
-                    "error": f"chain HTTP {resp.status_code}"}
+    url = f"{ALPACA_BROKER_URL}/v1beta3/options/chains/{ticker}"
+    resp = fetch_with_retry(url, source=f"IV skew chain:{ticker}", headers=headers, timeout=HTTP_TIMEOUT)
+    if resp is None:
+        return {"ticker": ticker, "method": "error", "error": "options chain unreachable after retries"}
+    if resp.status_code != 200:
+        return {"ticker": ticker, "method": "error",
+                "error": f"chain HTTP {resp.status_code}"}
 
+    try:
         data = resp.json() or {}
         chains = data.get("chains", [])
         if not chains:
@@ -1980,12 +2031,15 @@ def poll_sec_edgar():
 
     while True:
         for feed_type, sec_url in SEC_FEEDS:
-            try:
-                response = requests.get(sec_url, headers=headers, timeout=HTTP_TIMEOUT)
-                if response.status_code != 200:
-                    print(f"[WARN] [HEARTBEAT] SEC {feed_type} feed returned {response.status_code}.", flush=True)
-                    continue
+            response = fetch_with_retry(sec_url, source=f"SEC radar:{feed_type}", headers=headers, timeout=HTTP_TIMEOUT)
+            if response is None:
+                print(f"[WARN] [HEARTBEAT] SEC {feed_type} feed unreachable after retries.", flush=True)
+                continue
+            if response.status_code != 200:
+                print(f"[WARN] [HEARTBEAT] SEC {feed_type} feed returned {response.status_code}.", flush=True)
+                continue
 
+            try:
                 root = ET.fromstring(response.content)
                 ns = {'atom': 'http://www.w3.org/2005/Atom'}
                 for entry in root.findall('atom:entry', ns):
@@ -2046,12 +2100,15 @@ def resolve_primary_document(index_url: str, headers: dict, filing_type: str = "
     We look for a row whose Type column is exactly '8-K' and return that
     document's href. Falls back to the first .htm file if no typed match.
     """
-    try:
-        idx_res = requests.get(index_url, headers=headers, timeout=HTTP_TIMEOUT)
-        if idx_res.status_code != 200:
-            print(f"[WARN] [HEARTBEAT] Index page returned {idx_res.status_code}: {index_url}", flush=True)
-            return None
+    idx_res = fetch_with_retry(index_url, source=f"SEC index page:{index_url}", headers=headers, timeout=HTTP_TIMEOUT)
+    if idx_res is None:
+        print(f"[WARN] [HEARTBEAT] Index page unreachable after retries: {index_url}", flush=True)
+        return None
+    if idx_res.status_code != 200:
+        print(f"[WARN] [HEARTBEAT] Index page returned {idx_res.status_code}: {index_url}", flush=True)
+        return None
 
+    try:
         soup = BeautifulSoup(idx_res.text, "html.parser")
         base_url = "https://www.sec.gov"
 
@@ -2187,7 +2244,10 @@ def process_automated_filing(ticker: str, filing_url: str, filing_type: str = "8
             return
 
         print(f"[INFO] [HEARTBEAT] Fetching primary {filing_type} doc for {ticker}: {primary_url}", flush=True)
-        doc_res = requests.get(primary_url, headers=headers, timeout=HTTP_TIMEOUT)
+        doc_res = fetch_with_retry(primary_url, source=f"SEC {filing_type} doc:{ticker}", headers=headers, timeout=HTTP_TIMEOUT)
+        if doc_res is None:
+            print(f"[WARN] [HEARTBEAT] Primary doc unreachable for {ticker} after retries, skipping.", flush=True)
+            return
         if doc_res.status_code != 200:
             return
 

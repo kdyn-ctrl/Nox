@@ -79,7 +79,9 @@ def _refresh_cache() -> None:
     print("[INFO] [AMERICA-DATA-ENGINE] Starting scheduled news scrape...", flush=True)
 
     news_us = fetch_alpaca_news()
-    if news_us:
+    if news_us is None:
+        print("[WARN] [AMERICA-DATA-ENGINE] Alpaca news fetch failed after retries; keeping previous cache.", flush=True)
+    elif news_us:
         _CACHE["news_us"] = news_us
 
         # WS1 — cross-check headline sentiment against live IV skew. Wrapped so a
@@ -105,9 +107,16 @@ def _refresh_earnings_cache() -> None:
     earnings = fetch_earnings_calendar(WATCHLIST)
     if earnings:
         _CACHE["earnings_calendar"] = earnings
-        total_events = sum(len(events) for events in earnings.values())
+        failed_tickers = [t for t, events in earnings.items() if events is None]
+        total_events = sum(len(events) for events in earnings.values() if events)
         print(f"[INFO] [AMERICA-DATA-ENGINE] Earnings calendar updated: {total_events} event(s) found.",
               flush=True)
+        if failed_tickers:
+            print(
+                f"[WARN] [AMERICA-DATA-ENGINE] Earnings fetch failed for: {', '.join(failed_tickers)} "
+                f"— their earnings data is stale/missing this cycle.",
+                flush=True,
+            )
 
     _CACHE["last_earnings_update"] = datetime.now(tz=timezone.utc).isoformat()
     print(f"[INFO] [AMERICA-DATA-ENGINE] Earnings refresh complete at {_CACHE['last_earnings_update']}.",
