@@ -25,13 +25,16 @@ Order matters for keeping momentum and for what you can pair with project work:
 - **Research/lab angle:** Chem eng departments often have process control / systems labs (PID controllers, feedback loops). Volunteering in one is a resume line that maps directly to your liquidity-gate and regime-reset logic — controls theory and trading-system risk gating are the same math (feedback, thresholds, hysteresis). This is a genuinely good talking point in interviews: "I built a control-loop-style abort mechanism for order execution, and here's the process-control class where I learned the underlying theory."
 - **Keep building the bot the whole time** as your one continuous portfolio piece — a 3-4 year build history on one non-trivial system is more impressive than a new class project every semester.
 
-## Stage 3 — Tsinghua (grad study)
+## Stage 3 — Tsinghua-Columbia Dual Master's Degree in Business Analytics (grad study)
 
-Realistic paths from a UF chem eng degree into Tsinghua:
-- **Tsinghua-Berkeley Shenzhen Institute (TBSI)** or **Tsinghua SEM (School of Economics and Management)** master's programs (e.g., Master of Quantitative Finance, or a Financial Engineering-flavored program) — these accept strong quant/engineering undergrads from non-finance majors if the application shows math + demonstrated quant work. Your bot is exactly the "demonstrated quant work" a chem eng transcript otherwise lacks.
-- **Tsinghua Department of Chemical Engineering** grad programs also exist if you want to keep the chem eng thread and pivot into commodities/energy trading later (physical trading desks at firms like Trafigura, Vitol, Glencore explicitly value chem/process eng grads who also understand derivatives — this is a real and less-crowded path into trading than pure quant finance).
-- Chinese-language requirement: most English-taught master's programs at Tsinghua (SEM's international programs) don't require fluency, but HSK 4-5 substantially widens options and matters for actually working in China afterward if that's part of the plan.
-- **Application leverage:** GRE/GMAT quant score, a strong SOP that explicitly connects "built a live multi-market trading system spanning US and China" (you have a China data engine — mention that you engaged with Chinese market structure specifically) to why Tsinghua/China market expertise matters to you. This is a genuinely differentiated narrative — most applicants don't have a working system that already touches Chinese equities.
+Target program: **Tsinghua-Columbia Dual Master's Degree Program in Business Analytics** — dual credential from top-tier China and US financial hubs.
+
+- **Program structure:** Columbia's 1-year MS Business Analytics + Tsinghua's Master's program in Business Analytics or SEM (School of Economics and Management). The dual degree offers concentrated quant curriculum across both institutions, with the strategic advantage of finishing Columbia's quantitative core (derivatives, stochastic calc, statistical learning) in Year 1, then Tsinghua's market microstructure and policy-regime modules in Year 2 — directly applicable to your multi-market trading system.
+- **Application strength:** your bot (live multi-market system, China data integration, documented backtesting) is the exact credential these programs hunt for. Dual-degree applicants are rare; most are pure finance/math. A chem-eng-to-quant narrative + shipped trading system is a genuinely differentiated story.
+- **Chinese-language:** most English-taught programs don't require fluency for admission, but HSK 4-5 substantially improves internship access and post-degree job prospects. Your existing work on Chinese data sources is evidence of intent.
+- **GRE target:** 170 quant (99th percentile). This is the threshold for top-tier dual-degree and research-track roles post-grad.
+- **Curriculum cross-stack:** Use Columbia for derivatives pricing, stochastic processes, and statistical learning. Use Tsinghua for China equity/futures microstructure, policy-driven regime dynamics, and cross-border market infrastructure — all directly testable in your bot.
+- **Post-grad leverage:** the dual master's + 3-4 year bot history + internships at quant firms is the credential package for research-track roles (Citadel, Two Sigma, D.E. Shaw) or China-facing quant shops (Harvest Fund Management, Qiyuan, Orenda).
 
 ## What "better job than current, before finishing school" actually looks like
 
