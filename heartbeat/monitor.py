@@ -66,6 +66,17 @@ DOMESTIC_WATCHLIST = [t.strip() for t in _us_raw.split(",") if t.strip()]
 CHINESE_ADRS       = [t.strip() for t in _cn_raw.split(",") if t.strip()]
 WATCHLIST          = DOMESTIC_WATCHLIST + CHINESE_ADRS
 
+# NYSE full-day closures, used by is_trading_day() to tell EOD/EOW reporting
+# apart from a live trading day. Defaults to the real 2026 calendar (including
+# the Jul-3 observed date for the Jul-4 Saturday holiday) so it works without
+# any .env changes; override via NOX_MARKET_HOLIDAYS for other years.
+_holidays_raw = os.getenv(
+    "NOX_MARKET_HOLIDAYS",
+    "2026-01-01,2026-01-19,2026-02-16,2026-04-03,2026-05-25,2026-06-19,"
+    "2026-07-03,2026-09-07,2026-11-26,2026-12-25",
+)
+MARKET_HOLIDAYS = {d.strip() for d in _holidays_raw.split(",") if d.strip()}
+
 # Daily report SEC context is pulled from this configurable ticker list.
 # If NOX_DAILY_REPORT_TICKERS is unset, default to the public watchlist.
 DAILY_REPORT_TICKERS_RAW = os.getenv("NOX_DAILY_REPORT_TICKERS", ",".join(WATCHLIST))
@@ -926,6 +937,14 @@ def is_market_hours() -> bool:
     return open_time <= now <= close_time
 
 
+def is_trading_day(dt: datetime) -> bool:
+    """True if `dt` (any tz) falls on a weekday that isn't a NYSE holiday."""
+    et_dt = dt.astimezone(ZoneInfo("America/New_York"))
+    if et_dt.weekday() >= 5:  # Saturday / Sunday
+        return False
+    return et_dt.strftime("%Y-%m-%d") not in MARKET_HOLIDAYS
+
+
 def run_market_scanner() -> None:
     """
     Whole-market scanner — covers every tradable US equity on Alpaca (~6000-8000 tickers).
@@ -1606,7 +1625,8 @@ def schedule_checker():
     _reschedule_iv_collection()
 
     # --- End-of-Day / End-of-Week reports (post-close) ---
-    # EOD 16:05 ET daily (weekends skipped inside run_eod_report); EOW 16:10 ET Friday.
+    # EOD 16:05 ET daily (narrative briefing on non-trading days, inside run_eod_report);
+    # EOW 16:10 ET Friday (narrative briefing if that Friday is a holiday).
     # DST-aware like the scout: recomputed nightly at 00:01 UTC.
     def _reschedule_eod_eow():
         schedule.clear("eod_report")
@@ -3206,16 +3226,141 @@ def _send_report(scope: str):
             pass
 
 
+def generate_narrative_report(scope: str) -> str:
+    """
+    Build a non-trading-day report ('day' or 'week'): no trade ledger table
+    (it would just be empty), instead a Claude-written explanation of why the
+    Skeptic pipeline made the moves it made, a market read, and upcoming
+    catalysts framed for a reader who isn't a market/tech expert.
+    """
+    et = ZoneInfo("America/New_York")
+    now = datetime.now(et)
+    title = "Weekend/Holiday Briefing" if scope == "day" else "Weekly Briefing"
+    period_desc = now.strftime("%A, %Y-%m-%d") if scope == "day" \
+        else f"week ending {now.strftime('%A, %Y-%m-%d')}"
+    start_utc = _period_start_utc(scope)
+
+    # ── Grounding: the Skeptic's own daily narratives + the raw trade list ──
+    with db_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT timestamp, claude_analysis FROM daily_audits "
+                "WHERE timestamp >= ? ORDER BY id ASC",
+                (start_utc,),
+            )
+            audits = c.fetchall()
+            c.execute(
+                "SELECT ticker, action, asset_class, quantity, price, pnl, timestamp "
+                "FROM trade_history WHERE timestamp >= ? ORDER BY id ASC",
+                (start_utc,),
+            )
+            trades = c.fetchall()
+
+    audit_text = "\n\n".join(f"[{ts}]\n{analysis}" for ts, analysis in audits) or "No Skeptic analysis recorded for this period."
+    trade_text = "\n".join(
+        f"- {ts} {action} {ticker} ({cls}) x{qty:g} @ ${price:.2f}"
+        + (f", P&L ${pnl:+.2f}" if action in ("SELL", "CLOSE") and pnl is not None else "")
+        for ticker, action, cls, qty, price, pnl, ts in trades
+    ) or "No trades were recorded for this period."
+
+    # ── Fresh market context — same calls cmd_pulse already relies on ──────
+    vix = fetch_vix_level()
+    news_data, news_ok = query_data_engine("/news/us", "http://america-data-engine:8001")
+    headlines = [a.get("headline", "") for a in news_data.get("news", [])[:8]] if news_ok else []
+    contradiction_data, contradiction_ok = query_data_engine("/contradiction/us", "http://america-data-engine:8001")
+    contradictions = {}
+    if contradiction_ok:
+        for result in contradiction_data.get("results", []):
+            if isinstance(result, dict):
+                ticker = result.get("ticker")
+                verdict = result.get("verdict", "NEUTRAL")
+                if ticker and verdict != "NEUTRAL":
+                    contradictions[ticker] = verdict
+    earnings_data, earnings_ok = query_data_engine("/earnings/calendar", "http://america-data-engine:8001")
+    upcoming_earnings = []
+    if earnings_ok:
+        earnings_cal = earnings_data.get("earnings_calendar", {})
+        today = datetime.now()
+        for ticker, events in earnings_cal.items():
+            for event in (events or []):
+                try:
+                    event_date = datetime.strptime(event.get("date", ""), "%Y-%m-%d").date()
+                    days_until = (event_date - today.date()).days
+                    if 0 <= days_until <= 7:
+                        upcoming_earnings.append(f"{ticker} ({event.get('date')})")
+                except (ValueError, AttributeError):
+                    pass
+
+    prompt = (
+        f"Period: {period_desc} (no live trading today — market closed for the weekend/holiday).\n\n"
+        f"Skeptic pipeline's own daily analyses this period:\n{audit_text}\n\n"
+        f"Trades recorded this period:\n{trade_text}\n\n"
+        f"Current VIX: {vix:.1f}\n"
+        f"Recent US headlines:\n" + "\n".join(f"- {h}" for h in headlines if h) + "\n\n"
+        f"Contradiction signals (text vs IV): {contradictions if contradictions else 'None flagged'}\n\n"
+        f"Upcoming earnings (next 7 days): {', '.join(upcoming_earnings) if upcoming_earnings else 'None'}\n\n"
+        "Write a briefing in THREE sections:\n\n"
+        "WHY THE SKEPTIC MOVED — Explain, in plain language, the reasoning behind this period's trades "
+        "(or, if none occurred, why the Skeptic found no qualifying setups), grounded in the analyses "
+        "and trade list above. Be direct that this is a numbers-driven test system without a "
+        "hand-crafted strategy — the Skeptic pipeline (contradiction/insider/macro checks) is the "
+        "closest thing to a strategy it currently has.\n\n"
+        "MARKET READ — 2-4 sentences on what's driving the tape and whether sentiment is constructive "
+        "or cautious.\n\n"
+        "UPCOMING EVENTS & EXPERT PERSPECTIVE — Explain the catalysts a technologist or market expert "
+        "would flag going into next week, in language a non-expert reader can learn from and act on."
+    )
+
+    response = claude.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1200,
+        system="You are a quantitative market analyst writing an educational weekend briefing for "
+               "someone new to trading. Be honest, specific, and reference actual tickers/events from "
+               "the data given. No preamble.",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    narrative = response.content[0].text
+
+    return (
+        f"🌙 *{title} — {period_desc}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{narrative}\n\n"
+        f"_Generated {now.strftime('%Y-%m-%d %H:%M ET')}. Markets closed — no trade ledger to report._"
+    )
+
+
+def _send_narrative_report(scope: str):
+    """Generate and Telegram-push a non-trading-day (weekend/holiday) briefing."""
+    try:
+        text = generate_narrative_report(scope)
+        for chunk in smart_split(text, chars_per_string=4096):
+            bot.send_message(CHAT_ID, chunk, parse_mode="Markdown")
+        logger.info(f"{scope}-narrative-report sent.")
+    except Exception as e:
+        logger.error(f"{scope}-narrative-report failed: {e}")
+        try:
+            bot.send_message(CHAT_ID, f"⚠️ {scope.upper()} briefing failed to generate: {e}")
+        except Exception:
+            pass
+
+
 def run_eod_report():
-    """End-of-day summary. Scheduled ~16:05 ET on trading days."""
-    if datetime.now(ZoneInfo("America/New_York")).weekday() >= 5:
-        return  # skip weekends
-    _send_report("day")
+    """End-of-day summary. Scheduled ~16:05 ET daily; narrative briefing on non-trading days."""
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if is_trading_day(now):
+        _send_report("day")
+    else:
+        _send_narrative_report("day")
 
 
 def run_eow_report():
-    """End-of-week summary. Scheduled ~16:10 ET Friday."""
-    _send_report("week")
+    """End-of-week summary. Scheduled ~16:10 ET Friday; narrative briefing if Friday is a holiday."""
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if is_trading_day(now):
+        _send_report("week")
+    else:
+        _send_narrative_report("week")
 
 
 @bot.message_handler(commands=['eod'])
