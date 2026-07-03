@@ -1,0 +1,42 @@
+[
+ {
+  "Description": "Generic API Key",
+  "StartLine": 271,
+  "EndLine": 273,
+  "StartColumn": 12,
+  "EndColumn": 1,
+  "Match": "API_KEY=\nANALYST_CYCLE_HOURS=6",
+  "Secret": "ANALYST_CYCLE_HOURS=6",
+  "File": "README.md",
+  "SymlinkFile": "",
+  "Commit": "427ce8c26255dfca153a6f12f321a4a62d763374",
+  "Entropy": 3.8208888,
+  "Author": "Kdyn-ctrl",
+  "Email": "kdynkc@gmail.com",
+  "Date": "2026-06-19T03:54:13Z",
+  "Message": "initial commit: autonomous quantitative trading system framework",
+  "Tags": [],
+  "RuleID": "generic-api-key",
+  "Fingerprint": "427ce8c26255dfca153a6f12f321a4a62d763374:README.md:generic-api-key:271"
+ },
+ {
+  "Description": "Generic API Key",
+  "StartLine": 271,
+  "EndLine": 273,
+  "StartColumn": 12,
+  "EndColumn": 1,
+  "Match": "API_KEY=\nANALYST_CYCLE_HOURS=6",
+  "Secret": "ANALYST_CYCLE_HOURS=6",
+  "File": "README.md",
+  "SymlinkFile": "",
+  "Commit": "bae3c501664b45ab0bc7fbb7cb3f6828b16a31f6",
+  "Entropy": 3.8208888,
+  "Author": "Kdyn-ctrl",
+  "Email": "kdynkc@gmail.com",
+  "Date": "2026-06-19T03:54:13Z",
+  "Message": "initial commit: autonomous quantitative trading system framework",
+  "Tags": [],
+  "RuleID": "generic-api-key",
+  "Fingerprint": "bae3c501664b45ab0bc7fbb7cb3f6828b16a31f6:README.md:generic-api-key:271"
+ }
+]

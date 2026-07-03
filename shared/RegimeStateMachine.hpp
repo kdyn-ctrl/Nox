@@ -137,10 +137,10 @@ public:
 
 
     // The main function your Analyst Agent calls every morning.
-    // Hardcoded defaults must match the walk-forward OOS winning parameters.
-    // Update these when walk_forward.sh produces a new validated winner.
+    // Defaults below are illustrative placeholders — production thresholds are
+    // derived from private walk-forward validation, not committed to source.
     AllocationStrategy evaluate(double current_vix, double spy_price, double spy_200_sma) {
-        return evaluate(current_vix, spy_price, spy_200_sma, 35.0, 0.98);
+        return evaluate(current_vix, spy_price, spy_200_sma, 30.0, 0.95);
     }
 
     // Overloaded evaluate function for the backtester to use configurable parameters.

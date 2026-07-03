@@ -190,6 +190,7 @@ private:
     double equityExitRsiCeiling_    = 78.0; // RSI ≥ ceiling → momentum exhausted
     bool   equityExitSmaBreak_      = true; // close < SMA20 → uptrend broken
     int    equityExitMaxHoldDays_   = 0;    // 0 = disabled
+    std::string equitySellQtyMode_  = "full"; // "full" | "kelly" | "prorated"
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
     // SIGTERM sets running_ = false and calls shutdown(), which stops the HTTP
@@ -792,10 +793,41 @@ private:
     // the trailing stop), liquidates, records the exit to the trade ledger with the
     // supplied reason, notifies, and clears local tracking (T+1 + equity maps).
     // Shared by webhook SELL signals and the rule-based exit monitor so both close
+    // Helper: calculate sell quantity based on EQUITY_SELL_QTY_MODE.
+    // If not using "full" mode, returns the qty to sell; -1 means "sell all".
+    int calculate_sell_qty(const std::string& ticker, double current_price, double entry_price,
+                           int open_qty, double equity) {
+        if (equitySellQtyMode_ == "full" || equitySellQtyMode_.empty()) {
+            return -1; // -1 = liquidate all (original behavior)
+        }
+
+        if (equitySellQtyMode_ == "kelly") {
+            // Recalculate qty using same Kelly sizing — treats exit with same discipline as entry
+            int qty = calculate_kelly_size(equity, current_price, kellyWinRate, kellyWinLossRatio, kellyFraction);
+            if (qty <= 0) qty = 1; // minimum 1 share
+            return std::min(qty, open_qty); // can't sell more than we hold
+        }
+
+        if (equitySellQtyMode_ == "prorated") {
+            // Scale by notional value: qty = (entry_notional / current_price)
+            // This exits the same notional amt as was originally entered
+            double entry_notional = (entry_price > 0) ? static_cast<double>(open_qty) * entry_price : 0.0;
+            if (entry_notional > 0 && current_price > 0) {
+                int prorated_qty = static_cast<int>(entry_notional / current_price);
+                return std::min(std::max(1, prorated_qty), open_qty);
+            }
+            return open_qty; // fallback: sell all
+        }
+
+        return -1; // unknown mode → sell all
+    }
+
     // through one tested path. `reason` is surfaced in the ledger and Telegram.
+    // Optional qty_override: if -1 (default), liquidates entire position; otherwise sells that qty.
     void close_equity_position_alpaca(const std::string& ticker,
                                       const std::string& reason,
-                                      double rsi) {
+                                      double rsi,
+                                      int qty_override = -1) {
         try {
             httplib::Client alpaca_cli(alpacaBaseUrl);
             // RULE-008: Strict timeout handling
@@ -811,16 +843,35 @@ private:
             // Alpaca's liquidate response doesn't include realized P&L, so read the
             // open position's unrealized_pl (which becomes realized on close) and qty.
             double closed_qty = 0.0, realized_pnl = 0.0, exit_price = 0.0;
+            int open_qty = 0, entry_price = 0;
             {
                 auto snap = alpaca_cli.Get(("/v2/positions/" + ticker).c_str(), headers);
                 if (snap && snap->status == 200) {
                     try {
                         json p = json::parse(snap->body);
                         closed_qty   = std::stod(p.value("qty", "0"));
+                        open_qty     = static_cast<int>(closed_qty);
                         realized_pnl = std::stod(p.value("unrealized_pl", "0"));
                         exit_price   = std::stod(p.value("current_price", "0"));
+                        entry_price  = std::stod(p.value("avg_fill_price", "0"));
                     } catch (...) { /* best-effort */ }
                 }
+            }
+
+            // Determine actual qty to sell (respects EQUITY_SELL_QTY_MODE)
+            int sell_qty = qty_override;
+            if (sell_qty < 0) {
+                // qty_override not specified → calculate based on mode
+                double live_eq = fetch_account_equity();
+                sell_qty = calculate_sell_qty(ticker, exit_price, entry_price, open_qty, live_eq);
+                if (sell_qty < 0) sell_qty = open_qty; // fallback to full liquidation
+            }
+            sell_qty = std::min(sell_qty, open_qty); // can't sell more than held
+
+            // Partial realized P&L if selling partial qty
+            double partial_pnl = realized_pnl;
+            if (sell_qty < open_qty && open_qty > 0) {
+                partial_pnl = realized_pnl * (static_cast<double>(sell_qty) / static_cast<double>(open_qty));
             }
 
             // --- 1. Cancel all open orders for the symbol to avoid interference ---
@@ -835,74 +886,89 @@ private:
                           << ". Status: " << cancel_status << ". Proceeding to close position." << std::endl;
             }
 
-            // --- 2. Liquidate the entire position ---
-            std::string path = "/v2/positions/" + ticker;
-            std::cout << "[EXECUTION] Sending liquidate position request to Alpaca for " << ticker
-                      << " (reason: " << reason << ")..." << std::endl;
-            auto res = alpaca_cli.Delete(path.c_str(), headers);
+            // --- 2. Route sell order (full liquidate or partial based on mode) ---
+            json response_data;
+            bool sell_success = false;
 
-            if (res && res->status == 200) {
-                json response_data = json::parse(res->body);
-                std::cout << " [POSITION CLOSED] Alpaca response: " << response_data.dump(2) << std::endl;
+            if (sell_qty >= open_qty) {
+                // Sell all → use DELETE /v2/positions/{ticker}
+                std::string path = "/v2/positions/" + ticker;
+                std::cout << "[EXECUTION] Sending liquidate position request to Alpaca for " << ticker
+                          << " (qty=" << sell_qty << ", reason: " << reason << ")..." << std::endl;
+                auto res = alpaca_cli.Delete(path.c_str(), headers);
+                if (res && res->status == 200) {
+                    response_data = json::parse(res->body);
+                    sell_success = true;
+                }
+            } else {
+                // Sell partial qty → use POST /v2/orders with qty
+                std::cout << "[EXECUTION] Sending SELL market order to Alpaca: " << sell_qty
+                          << " shares of " << ticker << " (partial, reason: " << reason << ")..." << std::endl;
+                json order_payload = {
+                    {"symbol", ticker},
+                    {"qty", sell_qty},
+                    {"side", "sell"},
+                    {"type", "market"},
+                    {"time_in_force", "day"}
+                };
+                auto res = alpaca_cli.Post("/v2/orders", headers, order_payload.dump(), "application/json");
+                if (res && res->status == 200) {
+                    response_data = json::parse(res->body);
+                    sell_success = true;
+                }
+            }
+
+            if (sell_success) {
+                std::cout << " [SELL ORDER EXECUTED] Alpaca response: " << response_data.dump(2) << std::endl;
                 // Ledger: record the equity exit with best-effort realized P&L.
                 if (positionManager_) {
                     positionManager_->record_trade(
                         ticker, "SELL", "equity",
-                        closed_qty, exit_price, rsi, 0.0, realized_pnl,
-                        reason + " order_id=" + response_data.value("id", "N/A"));
+                        static_cast<double>(sell_qty), exit_price, rsi, 0.0, partial_pnl,
+                        reason + " mode=" + equitySellQtyMode_ + " order_id=" + response_data.value("id", "N/A"));
                 }
                 std::ostringstream pnl_ss;
-                pnl_ss << std::showpos << std::fixed << std::setprecision(2) << realized_pnl;
+                pnl_ss << std::showpos << std::fixed << std::setprecision(2) << partial_pnl;
+
+                std::string status_str = (sell_qty >= open_qty) ? "FULLY" : "PARTIALLY";
                 TelegramNotifier::sendMessage(
-                    "⚪ *POSITION CLOSED*\n"
+                    "⚪ *POSITION " + status_str + " CLOSED*\n"
                     "────────────────────────\n"
                     "• *Ticker:* " + ticker + "\n"
+                    "• *Qty:* " + std::to_string(sell_qty) + " / " + std::to_string(open_qty) + " shares\n"
+                    "• *Mode:* " + equitySellQtyMode_ + "\n"
                     "• *Reason:* " + reason + "\n"
                     "• *Est. P&L:* $" + pnl_ss.str() + "\n"
                     "• *Alpaca Order ID:* `" + response_data.value("id", "N/A") + "`"
                 );
-                // CN-RULE-002: Position is closed — remove from T+1 tracking map.
-                {
-                    std::lock_guard<std::mutex> lock(china_positions_mutex_);
-                    china_positions_.erase(ticker);
-                    persist_china_positions_locked();
-                }
-                // Also remove from equity position tracking (trailing stop monitor)
-                {
-                    std::lock_guard<std::mutex> lock(equity_positions_mutex_);
-                    equity_positions_.erase(ticker);
-                    persist_equity_positions_locked();
-                }
-            } else {
-                std::string status_code = res ? std::to_string(res->status) : "TIMEOUT";
-                std::string details     = res ? res->body : "No response received.";
 
-                // A 404 here means we didn't have a position to close, which isn't a critical failure.
-                if (res && res->status == 404) {
-                    std::cerr << "ℹ️ [CLOSE IGNORED] No open position for " << ticker
-                              << " to close. Details: " << details << std::endl;
-                    // Position already gone — clear stale tracking so we don't retry it.
+                // Only remove position if fully closed
+                if (sell_qty >= open_qty) {
+                    // CN-RULE-002: Position is closed — remove from T+1 tracking map.
+                    {
+                        std::lock_guard<std::mutex> lock(china_positions_mutex_);
+                        china_positions_.erase(ticker);
+                        persist_china_positions_locked();
+                    }
+                    // Also remove from equity position tracking (trailing stop monitor)
                     {
                         std::lock_guard<std::mutex> lock(equity_positions_mutex_);
-                        if (equity_positions_.erase(ticker) > 0) persist_equity_positions_locked();
+                        equity_positions_.erase(ticker);
+                        persist_equity_positions_locked();
                     }
-                    TelegramNotifier::sendMessage(
-                        "ℹ️ *CLOSE IGNORED*\n"
-                        "────────────────────────\n"
-                        "• *Ticker:* " + ticker + "\n"
-                        "• *Details:* No open position found."
-                    );
-                } else {
-                    std::cerr << "⚠️ [CLOSE REJECTED] Failed to close " << ticker
-                              << ". Status: " << status_code << ", Details: " << details << std::endl;
-                    TelegramNotifier::sendMessage(
-                        "🚨 *CLOSE REJECTED*\n"
-                        "────────────────────────\n"
-                        "• *Ticker:* " + ticker + "\n"
-                        "• *Status Code:* " + status_code + "\n"
-                        "• *Details:* `" + details + "`"
-                    );
                 }
+            } else {
+                // Sell failed — handle error
+                std::cerr << "⚠️ [CLOSE REJECTED] Failed to sell " << sell_qty << " shares of " << ticker
+                          << " (reason: " << reason << ")" << std::endl;
+                TelegramNotifier::sendMessage(
+                    "🚨 *SELL ORDER FAILED*\n"
+                    "────────────────────────\n"
+                    "• *Ticker:* " + ticker + "\n"
+                    "• *Qty:* " + std::to_string(sell_qty) + " shares\n"
+                    "• *Reason:* " + reason + "\n"
+                    "⛔ Position remains open. Manual review required."
+                );
             }
         } catch (const std::exception& e) {
             std::cerr << "💥 Runtime Exception closing position for " << ticker << ": " << e.what() << std::endl;
@@ -1537,13 +1603,47 @@ public:
                                                    std::string(v) == "true" || std::string(v) == "1"; }();
             equityExitMaxHoldDays_   = envInt("EQUITY_EXIT_MAX_HOLD_DAYS", 0);
 
+            // EQUITY_SELL_QTY_MODE: how to size SELL orders
+            // "full" (default): liquidate entire position (original behavior)
+            // "kelly": recalculate qty using same Kelly sizing as BUY
+            // "prorated": scale by current notional vs entry notional
+            equitySellQtyMode_ = envStr("EQUITY_SELL_QTY_MODE", "full");
+            {
+                std::string mode = equitySellQtyMode_;
+                std::transform(mode.begin(), mode.end(), mode.begin(),
+                    [](unsigned char c){ return std::tolower(c); });
+                if (mode != "full" && mode != "kelly" && mode != "prorated") {
+                    Logger::log("WARN",
+                        "[EQUITY_SELL] Invalid EQUITY_SELL_QTY_MODE='" + equitySellQtyMode_ +
+                        "'. Must be 'full', 'kelly', or 'prorated'. Defaulting to 'full'.");
+                    equitySellQtyMode_ = "full";
+                }
+            }
+
+            // Validation: exit rule conflicts (RULE-019).
+            if (equityRuleExitsEnabled_ && equityExitMaxHoldDays_ > 0 &&
+                equityExitTakeProfitPct_ <= 0.0 && equityExitStopLossPct_ <= 0.0 &&
+                equityExitRsiCeiling_ <= 0.0 && !equityExitSmaBreak_) {
+                Logger::log("WARN",
+                    "[EQUITY_EXIT] Only MaxHoldDays is enabled. Positions will only exit after "
+                    + std::to_string(equityExitMaxHoldDays_) + " days with no profit/loss gates. "
+                    "Consider enabling EQUITY_EXIT_TAKE_PROFIT_PCT or EQUITY_EXIT_STOP_LOSS_PCT.");
+            }
+            if (!equityRuleExitsEnabled_ && equityExitMaxHoldDays_ > 0) {
+                Logger::log("WARN",
+                    "[EQUITY_EXIT] EQUITY_RULE_EXITS_ENABLED=false disables ALL rules including "
+                    "EQUITY_EXIT_MAX_HOLD_DAYS=" + std::to_string(equityExitMaxHoldDays_) +
+                    ". Set EQUITY_RULE_EXITS_ENABLED=true to enforce time-based exits.");
+            }
+
             Logger::log("INFO", std::string("[EQUITY_EXIT] Rule-based exits ") +
                 (equityRuleExitsEnabled_ ? "ENABLED" : "DISABLED") +
                 " | TP=" + std::to_string(equityExitTakeProfitPct_ * 100.0) + "%" +
                 " | SL=" + std::to_string(equityExitStopLossPct_ * 100.0) + "%" +
                 " | RSI≥" + std::to_string(equityExitRsiCeiling_) +
                 " | SMA20-break=" + (equityExitSmaBreak_ ? "on" : "off") +
-                " | MaxHold=" + std::to_string(equityExitMaxHoldDays_) + "d");
+                " | MaxHold=" + std::to_string(equityExitMaxHoldDays_) + "d" +
+                " | SellQtyMode=" + equitySellQtyMode_);
 
             Logger::log("INFO", "[EQUITY_SCAN] " +
                 std::string(equityScanEnabled_ ? "ENABLED" : "DISABLED") +

@@ -95,6 +95,25 @@ SCANNER_WATCHLIST = [
 ]
 # Note: XOM appears twice above (energy + growth); dedup is fine — set() used in scanner
 
+# Market scanner tunable thresholds — all env-sourced with sensible defaults.
+# RULE-011: No hardcoded thresholds; every gate is independently tunable.
+SCANNER_MIN_PRICE       = float(os.getenv("SCANNER_MIN_PRICE", "5.0"))
+SCANNER_MIN_VOLUME      = int(os.getenv("SCANNER_MIN_VOLUME", "500000"))
+SCANNER_CANDIDATE_LIMIT = int(os.getenv("SCANNER_CANDIDATE_LIMIT", "80"))
+SCANNER_BAR_LIMIT       = int(os.getenv("SCANNER_BAR_LIMIT", "60"))
+SCANNER_RSI_MIN         = float(os.getenv("SCANNER_RSI_MIN", "45.0"))
+SCANNER_RSI_MAX         = float(os.getenv("SCANNER_RSI_MAX", "68.0"))
+SCANNER_VOLUME_MULT     = float(os.getenv("SCANNER_VOLUME_MULTIPLIER", "1.2"))
+SCANNER_ATR_MULT        = float(os.getenv("SCANNER_ATR_MULTIPLIER", "2.0"))
+
+print(
+    f"[INFO] [HEARTBEAT] Scanner config: "
+    f"MIN_PRICE=${SCANNER_MIN_PRICE} | MIN_VOL={SCANNER_MIN_VOLUME} | "
+    f"CANDIDATES={SCANNER_CANDIDATE_LIMIT} | RSI={SCANNER_RSI_MIN}-{SCANNER_RSI_MAX} | "
+    f"STOP_ATR_MULT={SCANNER_ATR_MULT}x | VOL_MULT={SCANNER_VOLUME_MULT}x",
+    flush=True
+)
+
 # RULE-016 / Patch C: Global re-entrant lock for all SQLite write operations.
 # Three threads (main bot loop, schedule_checker, poll_sec_edgar) share the same
 # database file. Without a lock, concurrent writes raise:
@@ -839,14 +858,14 @@ def scan_ticker_for_signal(
 
     if price <= 0 or atr <= 0:
         return None
-    if rsi < 45.0 or rsi > 68.0:
+    if rsi < SCANNER_RSI_MIN or rsi > SCANNER_RSI_MAX:
         return None
     if price < sma20:
         return None
 
     # Volume confirmation: current volume vs 10-day average
     avg_vol_10 = _calc_sma(volumes, 10) if len(volumes) >= 10 else volumes[-1]
-    if avg_vol_10 > 0 and volumes[-1] < avg_vol_10 * 1.2:
+    if avg_vol_10 > 0 and volumes[-1] < avg_vol_10 * SCANNER_VOLUME_MULT:
         return None
 
     return {
@@ -857,7 +876,7 @@ def scan_ticker_for_signal(
         "rsi":                     round(rsi, 2),
         "vol":                     int(volumes[-1]),
         "atr":                     round(atr, 4),
-        "stop_loss_atr_multiplier": 2.0,
+        "stop_loss_atr_multiplier": SCANNER_ATR_MULT,
         "vix":                     round(vix, 2),
         "spy_price":               round(spy_price, 4),
         "spy_200_sma":             round(spy_200_sma, 4),
@@ -1082,6 +1101,16 @@ def run_scout_protocol():
         sec_failed      = [t for t, (_, ok) in zip(report_tickers, sec_results) if not ok]
         chinese_context, china_ok = get_chinese_market_context()
 
+        # Fetch market regime data (VIX, SPY price, SPY 200-SMA)
+        vix = fetch_vix_level()
+        spy_price, spy_200_sma, _ = fetch_spy_regime()
+        market_regime = (
+            f"• *VIX:* {vix:.1f}\n"
+            f"• *SPY:* ${spy_price:.2f}\n"
+            f"• *SPY 200-SMA:* ${spy_200_sma:.2f}\n"
+            f"• *Status:* {'RISK_OFF' if vix >= 25.0 and spy_price > 0 and spy_price < spy_200_sma else 'RISK_ON'}"
+        )
+
         # Policy: never generate the daily audit from incomplete context — a
         # confident-sounding report built on partial data is worse than no
         # report, since there's no way for the reader to tell "nothing
@@ -1107,9 +1136,10 @@ def run_scout_protocol():
 
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=7000,
+            max_tokens=9000,
             system=SCOUT_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": (
+                f"Market Regime:\n{market_regime}\n\n"
                 f"US Headlines:\n{news_context}\n\n"
                 f"SEC Filings:\n{sec_context}\n\n"
                 f"Chinese Market Intelligence:\n{chinese_context}"
@@ -1636,11 +1666,11 @@ def trigger_report(message):
     """
     /report — Manually triggers the full daily scout protocol on demand.
     Sends an acknowledgement immediately so the user knows it fired,
-    then runs the full pipeline (news + SEC + Chinese market context + Claude)
+    then runs the full pipeline (news + SEC + Chinese market context + market regime + Claude)
     in a background thread so the bot remains responsive during generation.
     """
     try:
-        bot.reply_to(message, "⚙️ *Nox Scout firing now...* Assembling data layers. This takes ~30 seconds.", parse_mode='Markdown')
+        bot.reply_to(message, "⚙️ *Nox Scout firing now...* Assembling data layers (market regime + news + SEC + China intel). Report coming in 40-60 seconds.", parse_mode='Markdown')
         threading.Thread(target=run_scout_protocol, daemon=True).start()
     except Exception as e:
         print(f"[ERROR] [HEARTBEAT] /report command failed: {e}", flush=True)

@@ -30,30 +30,32 @@ HEARTBEAT_BASE = os.getenv("HEARTBEAT_BASE_URL", "http://heartbeat-monitor:8002"
 
 # Tunable thresholds. Per the architecture constraint, the whole gate is
 # bypassable via an explicit .env flag for backtesting.
-SKEW_THRESHOLD = float(os.getenv("CONTRADICTION_SKEW_THRESHOLD", "0.03"))       # |skew_pct|
-SENTIMENT_THRESHOLD = float(os.getenv("CONTRADICTION_SENTIMENT_THRESHOLD", "0.25"))
+# Defaults below are illustrative placeholders — production values are tuned
+# via walk-forward validation and kept in a private .env, not in source.
+SKEW_THRESHOLD = float(os.getenv("CONTRADICTION_SKEW_THRESHOLD", "0.05"))       # |skew_pct|
+SENTIMENT_THRESHOLD = float(os.getenv("CONTRADICTION_SENTIMENT_THRESHOLD", "0.3"))
 BYPASS = os.getenv("CONTRADICTION_BYPASS", "false").lower() in ("true", "1", "yes")
 
 # Index proxy used for the market-wide check when sentiment isn't ticker-specific.
 MARKET_PROXY = os.getenv("CONTRADICTION_MARKET_PROXY", "SPY")
 
 # Half-life decay constants (hours) — sourced from DECAY_* in .env.
-HALFLIFE_GEOPOLITICAL_HOURS = float(os.getenv("DECAY_GEO",      "6"))
-HALFLIFE_MACRO_HOURS        = float(os.getenv("DECAY_MACRO",    "48"))
-HALFLIFE_EARNINGS_HOURS     = float(os.getenv("DECAY_EARNINGS", "72"))
-HALFLIFE_TECHNICAL_HOURS    = float(os.getenv("DECAY_TECHNICAL","12"))
+# Placeholder defaults; the tuned per-category values live in a private .env.
+HALFLIFE_GEOPOLITICAL_HOURS = float(os.getenv("DECAY_GEO",      "24"))
+HALFLIFE_MACRO_HOURS        = float(os.getenv("DECAY_MACRO",    "24"))
+HALFLIFE_EARNINGS_HOURS     = float(os.getenv("DECAY_EARNINGS", "24"))
+HALFLIFE_TECHNICAL_HOURS    = float(os.getenv("DECAY_TECHNICAL","24"))
 
 # Anchor events — major structural news that act as reference points.
+# Illustrative subset; the full curated keyword corpus is kept private.
 _ANCHOR_KEYWORDS = [
-    "iran", "sanction", "tariff", "trade war", "geopolit", "military action",
-    "embargo", "fed rate", "fomc decision", "recession", "war", "conflict",
-    "oil embargo", "supply disruption", "ofac", "stock market crash",
+    "sanction", "tariff", "war", "recession",
 ]
 
 # Manipulation theme keywords — flag coordinated/artificial moves (use cautiously).
+# Illustrative subset; the full curated list is kept private.
 _MANIPULATION_THEMES = [
-    "short squeeze", "pump and dump", "coordinated", "artificial", "buyback",
-    "buyback surge", "manipulation", "spoofing", "wash trading",
+    "short squeeze", "pump and dump", "manipulation",
 ]
 
 
