@@ -38,5 +38,25 @@
   "Tags": [],
   "RuleID": "generic-api-key",
   "Fingerprint": "bae3c501664b45ab0bc7fbb7cb3f6828b16a31f6:README.md:generic-api-key:271"
+ },
+ {
+  "Description": "False positive: environment variable example in baseline",
+  "StartLine": 1,
+  "EndLine": 1,
+  "StartColumn": 1,
+  "EndColumn": 1,
+  "Match": "ANALYST_CYCLE_HOURS=6",
+  "Secret": "ANALYST_CYCLE_HOURS=6",
+  "File": ".gitleaks-baseline.json",
+  "SymlinkFile": "",
+  "Commit": "f249ad7",
+  "Entropy": 3.8208888,
+  "Author": "Kdyn-ctrl",
+  "Email": "kdynkc@gmail.com",
+  "Date": "2026-07-02T22:36:00Z",
+  "Message": "feat: add private journal entries",
+  "Tags": [],
+  "RuleID": "generic-api-key",
+  "Fingerprint": "f249ad7:.gitleaks-baseline.json:generic-api-key:baseline"
  }
 ]

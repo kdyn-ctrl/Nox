@@ -9,8 +9,12 @@ useDefault = true
 # Real secrets always have a live-looking value, so this shouldn't hide
 # anything genuine — see scripts/check_public_safe.sh for how this is used.
 [allowlist]
-description = "Placeholder / empty env values in example docs"
+description = "Placeholder / empty env values in example docs, and known non-secret env vars"
 regexes = [
   '''=\s*$''',
   '''=\s*["']?(your[-_].*|<.*>|xxx+|example[-_.@].*|REDACTED|\.\.\.|paper-secret|live-secret)["']?\s*$''',
+  # Environment variable names flagged as generic-api-key but are not secrets
+  '''ANALYST_CYCLE_HOURS=\d+''',
+  '''KELLY_WIN_RATE=0\.\d+''',
+  '''KELLY_WIN_LOSS_RATIO=\d+\.\d+''',
 ]
