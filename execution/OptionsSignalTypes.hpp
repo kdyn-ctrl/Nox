@@ -37,6 +37,10 @@ struct OptionsSignal {
     bool free_capital_mode  = false;
     double allocated_capital = 0.0;
     std::string profile_name; // "PERSONAL" or "BOT" — for Telegram labelling
+
+    // Sector/trend gate (advisory-suppress, mirrors the RISK_OFF regime gate)
+    bool sector_conflict = false; // true if bias opposes the ticker's sector-ETF trend
+    std::string sector_etf;       // e.g. "XLK" — empty if ticker has no sector mapping
 };
 
 // ─── RiskProfile ──────────────────────────────────────────────────────────────
