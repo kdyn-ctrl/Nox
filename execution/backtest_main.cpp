@@ -18,12 +18,22 @@
 //   stop=2.0          (exit at 2× debit/credit paid — i.e. lose 100% + premium)
 //   capital=35000     (determines strategy tier gate)
 //   profile=personal  (use aggressive personal profile; default = bot)
+//   fillmodel=adverse_selection  (also model asymmetric fills — see below)
+//   fillgamma=0.2      fillqueuemult=3.0      fillseed=<n>
 //
 // Methodology:
 //   - No real historical options chain: IV is proxied as HRV30 × 1.15
 //     (HRV plus a modest variance-risk-premium assumption).
 //   - All Greeks and prices are Black-Scholes European; no early-exercise value.
-//   - Slippage, commissions, and bid/ask spread are NOT modelled.
+//   - Naive fill (default): every PROFIT_TARGET/STOP_LOSS touch fills at 100%.
+//     Commissions and bid/ask spread are NOT modelled either way.
+//   - Optional adverse-selection fill model (fillmodel=adverse_selection, see
+//     BacktestFillModel.hpp): a touch that CROSSES the level always fills (the
+//     "price moved against you" case); a touch that reverses without crossing
+//     only fills probabilistically, scaled by underlying daily volume as a
+//     liquidity PROXY (no real option-level volume/depth exists in this data
+//     source). This corrects the naive model's tendency to always "catch" the
+//     favorable reversals a real resting order would have missed.
 //   - Use results to assess signal quality and strategy direction, not exact P&L.
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
@@ -31,6 +41,8 @@
 #include "nlohmann/json.hpp"
 #include "OptionEngine.hpp"
 #include "OptionsSignalTypes.hpp"
+#include "BacktestFillModel.hpp"
+#include "BacktestErrorModel.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -39,6 +51,7 @@
 #include <iostream>
 #include <map>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -46,12 +59,14 @@
 using json = nlohmann::json;
 using namespace nox::options;
 using namespace nox::options_signal;
+using namespace nox::backtest;
 
 // ─── Data types ──────────────────────────────────────────────────────────────
 
 struct Bar {
     std::string date;
     double high = 0.0, low = 0.0, close = 0.0;
+    double volume = 0.0; // underlying volume; used only as a liquidity PROXY
 };
 
 struct BacktestConfig {
@@ -63,6 +78,8 @@ struct BacktestConfig {
     double initial_capital               = 35000.0; // ADVANCED tier by default
     double rfr                           = 0.05;
     RiskProfile profile                  = RiskProfile::bot();
+    FillModelConfig fill                 = FillModelConfig::fromEnv();
+    ErrorConfig     errors               = ErrorConfig::fromEnv();
 };
 
 struct Trade {
@@ -72,8 +89,16 @@ struct Trade {
     double iv_entry    = 0.0, hrv_entry  = 0.0, rsi_entry = 0.0;
     double entry_price = 0.0, exit_price = 0.0;
     double pnl         = 0.0; // per underlying share; × 100 for dollar P&L
+    // Counterfactual P&L had the position been held to expiry instead of
+    // exiting on the profit-target / stop rule — the honest input a
+    // "missed exit" error model needs (see BacktestErrorModel.hpp). Equals
+    // pnl for trades that already ran to EXPIRY.
+    double pnl_if_held_to_expiry = 0.0;
     bool   bias_right  = false;
     bool   is_long     = true;
+    // Adverse-selection variant only: a profit-target touch that reversed
+    // before ever getting filled (the naive model would have "caught" it).
+    bool   target_touched_not_filled = false;
 };
 
 // ─── OHLCV fetch (Yahoo Finance) ──────────────────────────────────────────────
@@ -100,6 +125,7 @@ std::vector<Bar> fetchBars(const std::string& symbol, const std::string& range) 
         const auto& H  = q.at("high");
         const auto& L  = q.at("low");
         const auto& C  = q.at("close");
+        const auto& V  = q.at("volume");
 
         std::vector<Bar> bars;
         bars.reserve(ts.size());
@@ -114,7 +140,8 @@ std::vector<Bar> fetchBars(const std::string& symbol, const std::string& range) 
                 oss.str(),
                 H[i].is_null() ? C[i].get<double>() : H[i].get<double>(),
                 L[i].is_null() ? C[i].get<double>() : L[i].get<double>(),
-                C[i].get<double>()
+                C[i].get<double>(),
+                (i < V.size() && !V[i].is_null()) ? V[i].get<double>() : 0.0
             });
         }
         std::cerr << " " << bars.size() << " bars\n";
@@ -149,6 +176,15 @@ double calcSMA(const std::vector<Bar>& b, size_t end, int n) {
     if (end < static_cast<size_t>(n - 1)) return b[end].close;
     double s = 0.0;
     for (int i = 0; i < n; ++i) s += b[end - i].close;
+    return s / n;
+}
+
+// Rolling average underlying volume — used only as a liquidity PROXY for the
+// adverse-selection fill model; no real option-level volume exists here.
+double calcAvgVolume(const std::vector<Bar>& b, size_t end, int n = 20) {
+    if (end < static_cast<size_t>(n - 1)) return b[end].volume;
+    double s = 0.0;
+    for (int i = 0; i < n; ++i) s += b[end - i].volume;
     return s / n;
 }
 
@@ -265,6 +301,80 @@ double valuePosition(const std::string& strat,
     return bsp(K1, leg1_type);
 }
 
+// ─── Entry setup (strike/DTE selection, shared by both simulate variants) ────
+
+struct EntrySetup {
+    double K1 = 0.0, K2 = 0.0;
+    OptionType leg1_type = OptionType::Call;
+    int    dte           = 0;
+    double expiry_yrs    = 0.0;
+    double entry_price   = 0.0;
+    bool   is_long       = true;
+    bool   bias_bullish  = false;
+    bool   bias_bearish  = false;
+};
+
+EntrySetup buildEntrySetup(const std::string& strat, double spot0,
+                          double iv_entry, double rfr, const RiskProfile& prof) {
+    EntrySetup es;
+
+    // DTE from profile
+    es.dte = prof.dte_long;
+    if (strat == "CSP" || strat == "CC")
+        es.dte = prof.dte_income;
+    else if (strat == "BULL_CALL_SPREAD" || strat == "BEAR_PUT_SPREAD" ||
+             strat == "STRADDLE"         || strat == "STRANGLE")
+        es.dte = prof.dte_spread;
+    es.expiry_yrs = es.dte / 365.0;
+
+    // Strike selection
+    double K1 = spot0, K2 = 0.0;
+    OptionType leg1_type = OptionType::Call;
+
+    if (strat == "LONG_CALL") {
+        K1 = findStrikeForDelta(spot0, es.expiry_yrs, iv_entry, prof.delta_long, OptionType::Call, rfr);
+        leg1_type = OptionType::Call;
+    } else if (strat == "LONG_PUT") {
+        K1 = findStrikeForDelta(spot0, es.expiry_yrs, iv_entry, prof.delta_long, OptionType::Put, rfr);
+        leg1_type = OptionType::Put;
+    } else if (strat == "CSP") {
+        K1 = findStrikeForDelta(spot0, es.expiry_yrs, iv_entry, prof.delta_income, OptionType::Put, rfr);
+        leg1_type = OptionType::Put;
+    } else if (strat == "CC") {
+        K1 = findStrikeForDelta(spot0, es.expiry_yrs, iv_entry, prof.delta_income, OptionType::Call, rfr);
+        leg1_type = OptionType::Call;
+    } else if (strat == "BULL_CALL_SPREAD") {
+        K1 = findStrikeForDelta(spot0, es.expiry_yrs, iv_entry, prof.delta_long,        OptionType::Call, rfr);
+        K2 = findStrikeForDelta(spot0, es.expiry_yrs, iv_entry, prof.delta_spread_wing, OptionType::Call, rfr);
+        if (K2 <= K1) K2 = K1 + ((spot0 < 200.0) ? 1.0 : 5.0);
+        leg1_type = OptionType::Call;
+    } else if (strat == "BEAR_PUT_SPREAD") {
+        K1 = findStrikeForDelta(spot0, es.expiry_yrs, iv_entry, prof.delta_long,        OptionType::Put, rfr);
+        K2 = findStrikeForDelta(spot0, es.expiry_yrs, iv_entry, prof.delta_spread_wing, OptionType::Put, rfr);
+        if (K2 >= K1) K2 = K1 - ((spot0 < 200.0) ? 1.0 : 5.0);
+        leg1_type = OptionType::Put;
+    } else if (strat == "STRADDLE") {
+        K1 = std::round(spot0);
+        leg1_type = OptionType::Call;
+    } else if (strat == "STRANGLE") {
+        K1 = findStrikeForDelta(spot0, es.expiry_yrs, iv_entry, prof.delta_income, OptionType::Call, rfr);
+        K2 = findStrikeForDelta(spot0, es.expiry_yrs, iv_entry, prof.delta_income, OptionType::Put,  rfr);
+        leg1_type = OptionType::Call;
+    }
+
+    es.K1 = K1; es.K2 = K2; es.leg1_type = leg1_type;
+    es.entry_price = valuePosition(strat, spot0, es.expiry_yrs, iv_entry, rfr, K1, K2, leg1_type);
+
+    // Long positions pay debit; short positions receive credit.
+    es.is_long = (strat != "CSP" && strat != "CC");
+
+    // Directional check: did price go the right way?
+    es.bias_bullish = (strat == "LONG_CALL" || strat == "BULL_CALL_SPREAD" || strat == "CSP");
+    es.bias_bearish = (strat == "LONG_PUT"  || strat == "BEAR_PUT_SPREAD"  || strat == "CC");
+
+    return es;
+}
+
 // ─── Simulate one trade ───────────────────────────────────────────────────────
 
 Trade simulateTrade(const std::string& ticker,
@@ -278,62 +388,11 @@ Trade simulateTrade(const std::string& ticker,
     double spot0 = bars[entry_idx].close;
     double rfr   = cfg.rfr;
 
-    // DTE from profile
-    int dte = prof.dte_long;
-    if (strat == "CSP" || strat == "CC")
-        dte = prof.dte_income;
-    else if (strat == "BULL_CALL_SPREAD" || strat == "BEAR_PUT_SPREAD" ||
-             strat == "STRADDLE"         || strat == "STRANGLE")
-        dte = prof.dte_spread;
-    double expiry_yrs = dte / 365.0;
-
-    // Strike selection
-    double K1 = spot0, K2 = 0.0;
-    OptionType leg1_type = OptionType::Call;
-
-    if (strat == "LONG_CALL") {
-        K1 = findStrikeForDelta(spot0, expiry_yrs, iv_entry, prof.delta_long, OptionType::Call, rfr);
-        leg1_type = OptionType::Call;
-    } else if (strat == "LONG_PUT") {
-        K1 = findStrikeForDelta(spot0, expiry_yrs, iv_entry, prof.delta_long, OptionType::Put, rfr);
-        leg1_type = OptionType::Put;
-    } else if (strat == "CSP") {
-        K1 = findStrikeForDelta(spot0, expiry_yrs, iv_entry, prof.delta_income, OptionType::Put, rfr);
-        leg1_type = OptionType::Put;
-    } else if (strat == "CC") {
-        K1 = findStrikeForDelta(spot0, expiry_yrs, iv_entry, prof.delta_income, OptionType::Call, rfr);
-        leg1_type = OptionType::Call;
-    } else if (strat == "BULL_CALL_SPREAD") {
-        K1 = findStrikeForDelta(spot0, expiry_yrs, iv_entry, prof.delta_long,        OptionType::Call, rfr);
-        K2 = findStrikeForDelta(spot0, expiry_yrs, iv_entry, prof.delta_spread_wing, OptionType::Call, rfr);
-        if (K2 <= K1) K2 = K1 + ((spot0 < 200.0) ? 1.0 : 5.0);
-        leg1_type = OptionType::Call;
-    } else if (strat == "BEAR_PUT_SPREAD") {
-        K1 = findStrikeForDelta(spot0, expiry_yrs, iv_entry, prof.delta_long,        OptionType::Put, rfr);
-        K2 = findStrikeForDelta(spot0, expiry_yrs, iv_entry, prof.delta_spread_wing, OptionType::Put, rfr);
-        if (K2 >= K1) K2 = K1 - ((spot0 < 200.0) ? 1.0 : 5.0);
-        leg1_type = OptionType::Put;
-    } else if (strat == "STRADDLE") {
-        K1 = std::round(spot0);
-        leg1_type = OptionType::Call;
-    } else if (strat == "STRANGLE") {
-        K1 = findStrikeForDelta(spot0, expiry_yrs, iv_entry, prof.delta_income, OptionType::Call, rfr);
-        K2 = findStrikeForDelta(spot0, expiry_yrs, iv_entry, prof.delta_income, OptionType::Put,  rfr);
-        leg1_type = OptionType::Call;
-    }
-
-    double entry_price = valuePosition(strat, spot0, expiry_yrs, iv_entry, rfr, K1, K2, leg1_type);
-    if (entry_price <= 0.01) {
+    EntrySetup es = buildEntrySetup(strat, spot0, iv_entry, rfr, prof);
+    if (es.entry_price <= 0.01) {
         // Spread collapsed or invalid IV — skip
         Trade t; t.exit_reason = "INVALID"; return t;
     }
-
-    // Long positions pay debit; short positions receive credit.
-    bool is_long = (strat != "CSP" && strat != "CC");
-
-    // Directional check: did price go the right way?
-    bool bias_bullish = (strat == "LONG_CALL" || strat == "BULL_CALL_SPREAD" || strat == "CSP");
-    bool bias_bearish = (strat == "LONG_PUT"  || strat == "BEAR_PUT_SPREAD"  || strat == "CC");
 
     Trade t;
     t.ticker      = ticker;
@@ -343,29 +402,29 @@ Trade simulateTrade(const std::string& ticker,
     t.iv_entry    = iv_entry;
     t.hrv_entry   = hrv_entry;
     t.rsi_entry   = rsi_entry;
-    t.entry_price = entry_price;
-    t.is_long     = is_long;
+    t.entry_price = es.entry_price;
+    t.is_long     = es.is_long;
     t.exit_reason = "EXPIRY";
 
-    double exit_price = entry_price;
+    double exit_price = es.entry_price;
     size_t exit_idx   = entry_idx;
 
-    for (int day = 1; day <= dte; ++day) {
+    for (int day = 1; day <= es.dte; ++day) {
         size_t idx = entry_idx + static_cast<size_t>(day);
         if (idx >= bars.size()) break;
 
         double spot   = bars[idx].close;
-        double t_rem  = std::max(0.0, expiry_yrs - day / 365.0);
+        double t_rem  = std::max(0.0, es.expiry_yrs - day / 365.0);
         double hrv_d  = calcHRV(bars, idx);
         double iv_d   = hrv_d * 1.15;
 
-        double cur    = valuePosition(strat, spot, t_rem, iv_d, rfr, K1, K2, leg1_type);
-        double pnl_d  = is_long ? (cur - entry_price) : (entry_price - cur);
+        double cur    = valuePosition(strat, spot, t_rem, iv_d, rfr, es.K1, es.K2, es.leg1_type);
+        double pnl_d  = es.is_long ? (cur - es.entry_price) : (es.entry_price - cur);
 
-        if (pnl_d >= entry_price * cfg.profit_target_pct) {
+        if (pnl_d >= es.entry_price * cfg.profit_target_pct) {
             exit_price = cur; exit_idx = idx; t.exit_reason = "PROFIT_TARGET"; break;
         }
-        if (pnl_d <= -(entry_price * cfg.stop_loss_mult)) {
+        if (pnl_d <= -(es.entry_price * cfg.stop_loss_mult)) {
             exit_price = cur; exit_idx = idx; t.exit_reason = "STOP_LOSS"; break;
         }
 
@@ -376,13 +435,132 @@ Trade simulateTrade(const std::string& ticker,
     t.exit_price = exit_price;
     t.exit_date  = bars[exit_idx].date;
     t.spot_exit  = bars[exit_idx].close;
-    t.pnl        = is_long ? (exit_price - entry_price) : (entry_price - exit_price);
+    t.pnl        = es.is_long ? (exit_price - es.entry_price) : (es.entry_price - exit_price);
 
-    if (bias_bullish)      t.bias_right = t.spot_exit > t.spot_entry;
-    else if (bias_bearish) t.bias_right = t.spot_exit < t.spot_entry;
+    // Counterfactual: value the position at the last reachable bar within its
+    // DTE (the held-to-expiry outcome) regardless of the exit rule that fired,
+    // so an error model can ask "what if the exit had been missed?" honestly
+    // instead of guessing a give-back multiplier.
+    {
+        size_t exp_idx = entry_idx + static_cast<size_t>(es.dte);
+        if (exp_idx >= bars.size()) exp_idx = bars.size() - 1;
+        double t_rem_exp = std::max(0.0, es.expiry_yrs - static_cast<double>(exp_idx - entry_idx) / 365.0);
+        double hrv_exp   = calcHRV(bars, exp_idx);
+        double iv_exp    = hrv_exp * 1.15;
+        double val_exp   = valuePosition(strat, bars[exp_idx].close, t_rem_exp, iv_exp, rfr,
+                                         es.K1, es.K2, es.leg1_type);
+        t.pnl_if_held_to_expiry = es.is_long ? (val_exp - es.entry_price)
+                                             : (es.entry_price - val_exp);
+    }
+
+    if (es.bias_bullish)      t.bias_right = t.spot_exit > t.spot_entry;
+    else if (es.bias_bearish) t.bias_right = t.spot_exit < t.spot_entry;
     else {
         // Vol play: right if actual move > expected one-SD move
-        double expected_move = hrv_entry * t.spot_entry * std::sqrt(dte / 252.0);
+        double expected_move = hrv_entry * t.spot_entry * std::sqrt(es.dte / 252.0);
+        t.bias_right = std::abs(t.spot_exit - t.spot_entry) > expected_move;
+    }
+
+    return t;
+}
+
+// Reprices the position at a day's underlying low/high/close to build an
+// approximate daily value RANGE for the option position — there is no real
+// option-level OHLC in this data source, so this is a modeled proxy, not a
+// traded range.
+OptionBarRange syntheticOptionBar(const std::string& strat, double t_rem, double iv, double rfr,
+                                  double K1, double K2, OptionType leg1_type,
+                                  double spot_low, double spot_high, double spot_close) {
+    double v_low   = valuePosition(strat, spot_low,   t_rem, iv, rfr, K1, K2, leg1_type);
+    double v_high  = valuePosition(strat, spot_high,  t_rem, iv, rfr, K1, K2, leg1_type);
+    double v_close = valuePosition(strat, spot_close, t_rem, iv, rfr, K1, K2, leg1_type);
+    OptionBarRange r;
+    r.low         = std::min(v_low, v_high);
+    r.high        = std::max(v_low, v_high);
+    r.close_value = v_close;
+    return r;
+}
+
+// Adverse-selection variant of simulateTrade(): the PROFIT_TARGET exit is a
+// resting limit order that only fills for certain when price crosses through
+// it; STOP_LOSS is treated as a stop-market order (fills for certain once
+// touched, force_certain=true). See BacktestFillModel.hpp for the fill math.
+Trade simulateTradeAdverseSelection(const std::string& ticker,
+                                    const std::string& strat,
+                                    const std::vector<Bar>& bars,
+                                    size_t entry_idx,
+                                    const BacktestConfig& cfg,
+                                    double iv_entry, double hrv_entry, double rsi_entry,
+                                    std::mt19937& rng)
+{
+    const RiskProfile& prof = cfg.profile;
+    double spot0 = bars[entry_idx].close;
+    double rfr   = cfg.rfr;
+
+    EntrySetup es = buildEntrySetup(strat, spot0, iv_entry, rfr, prof);
+    if (es.entry_price <= 0.01) {
+        Trade t; t.exit_reason = "INVALID"; return t;
+    }
+
+    Trade t;
+    t.ticker      = ticker;
+    t.strategy    = strat;
+    t.entry_date  = bars[entry_idx].date;
+    t.spot_entry  = spot0;
+    t.iv_entry    = iv_entry;
+    t.hrv_entry   = hrv_entry;
+    t.rsi_entry   = rsi_entry;
+    t.entry_price = es.entry_price;
+    t.is_long     = es.is_long;
+    t.exit_reason = "EXPIRY";
+
+    double target_level = profitTargetLevel(es.entry_price, cfg.profit_target_pct, es.is_long);
+    double stop_level    = stopLossLevel(es.entry_price, cfg.stop_loss_mult, es.is_long);
+    bool target_from_above = approachedFromAboveForTarget(es.is_long);
+    bool stop_from_above    = approachedFromAboveForStop(es.is_long);
+
+    double exit_price = es.entry_price;
+    size_t exit_idx   = entry_idx;
+
+    for (int day = 1; day <= es.dte; ++day) {
+        size_t idx = entry_idx + static_cast<size_t>(day);
+        if (idx >= bars.size()) break;
+
+        double t_rem  = std::max(0.0, es.expiry_yrs - day / 365.0);
+        double hrv_d  = calcHRV(bars, idx);
+        double iv_d   = hrv_d * 1.15;
+
+        OptionBarRange ob = syntheticOptionBar(strat, t_rem, iv_d, rfr, es.K1, es.K2, es.leg1_type,
+                                               bars[idx].low, bars[idx].high, bars[idx].close);
+        double day_vol = bars[idx].volume;
+        double avg_vol = calcAvgVolume(bars, idx, 20);
+
+        FillOutcome fo_target = simulateFill(ob, target_level, target_from_above,
+                                             day_vol, avg_vol, cfg.fill, rng, false);
+        if (fo_target.touched && !fo_target.filled) t.target_touched_not_filled = true;
+        if (fo_target.filled) {
+            exit_price = target_level; exit_idx = idx; t.exit_reason = "PROFIT_TARGET"; break;
+        }
+
+        FillOutcome fo_stop = simulateFill(ob, stop_level, stop_from_above,
+                                           day_vol, avg_vol, cfg.fill, rng, true);
+        if (fo_stop.filled) {
+            exit_price = stop_level; exit_idx = idx; t.exit_reason = "STOP_LOSS"; break;
+        }
+
+        exit_price = ob.close_value;
+        exit_idx   = idx;
+    }
+
+    t.exit_price = exit_price;
+    t.exit_date  = bars[exit_idx].date;
+    t.spot_exit  = bars[exit_idx].close;
+    t.pnl        = es.is_long ? (exit_price - es.entry_price) : (es.entry_price - exit_price);
+
+    if (es.bias_bullish)      t.bias_right = t.spot_exit > t.spot_entry;
+    else if (es.bias_bearish) t.bias_right = t.spot_exit < t.spot_entry;
+    else {
+        double expected_move = hrv_entry * t.spot_entry * std::sqrt(es.dte / 252.0);
         t.bias_right = std::abs(t.spot_exit - t.spot_entry) > expected_move;
     }
 
@@ -391,14 +569,23 @@ Trade simulateTrade(const std::string& ticker,
 
 // ─── Run full backtest ────────────────────────────────────────────────────────
 
-std::vector<Trade> runBacktest(const BacktestConfig& cfg) {
+struct BacktestResult {
+    std::vector<Trade> baseline; // naive 100%-fill simulation — always computed
+    std::vector<Trade> variant;  // adverse-selection fill simulation — only when requested
+};
+
+BacktestResult runBacktest(const BacktestConfig& cfg) {
     // Capital tier from initial_capital
     std::string tier = "STARTER";
     if      (cfg.initial_capital >= 75000.0) tier = "FREE_CAPITAL";
     else if (cfg.initial_capital >= 30000.0) tier = "ADVANCED";
     else if (cfg.initial_capital >= 5000.0)  tier = "STANDARD";
 
-    std::vector<Trade> all_trades;
+    bool run_variant = (cfg.fill.mode != FillMode::Naive);
+    std::mt19937 rng(cfg.fill.rng_seed != 0 ? cfg.fill.rng_seed
+                                             : static_cast<unsigned>(std::random_device{}()));
+
+    BacktestResult result;
 
     for (const auto& ticker : cfg.watchlist) {
         auto bars = fetchBars(ticker, cfg.range);
@@ -421,14 +608,18 @@ std::vector<Trade> runBacktest(const BacktestConfig& cfg) {
 
             Trade t = simulateTrade(ticker, strat, bars, i, cfg, iv, hrv, rsi);
             if (t.exit_reason != "INVALID") {
-                all_trades.push_back(t);
+                result.baseline.push_back(t);
                 ++n_signals;
+                if (run_variant) {
+                    Trade tv = simulateTradeAdverseSelection(ticker, strat, bars, i, cfg, iv, hrv, rsi, rng);
+                    result.variant.push_back(tv);
+                }
             }
         }
         std::cerr << "  " << ticker << ": " << n_signals << " signals\n";
     }
 
-    return all_trades;
+    return result;
 }
 
 // ─── Formatted report ─────────────────────────────────────────────────────────
@@ -590,11 +781,107 @@ void printReport(const std::vector<Trade>& trades, const BacktestConfig& cfg) {
     printSection("Methodology");
     std::cout << "  IV proxy   : HRV30 × 1.15 (no historical options chain available)\n"
               << "  Pricing    : Black-Scholes European, re-priced daily at mark-to-model\n"
-              << "  Slippage   : NOT modelled — real fills will be worse by $0.05-0.30/share\n"
+              << "  Fill model : NAIVE (this report) — every PROFIT_TARGET/STOP_LOSS touch\n"
+              << "               fills at 100%, no slippage/commissions. Rerun with\n"
+              << "               fillmodel=adverse_selection to see a fill model that only\n"
+              << "               guarantees fills on the trades that moved against you.\n"
               << "  P&L scale  : per 1 contract = × $100. Multiply by your contract count.\n"
               << "  When ready : integrate a real historical options chain (Polygon.io,\n"
               << "               CBOE DataShop) to replace the IV proxy with real market prices.\n";
 
+    std::cout << "\n" << line('=', 62) << "\n\n";
+}
+
+// Prints a side-by-side comparison of the naive baseline vs. the
+// adverse-selection variant — only called when fillmodel=adverse_selection
+// was requested, so a run without it never shows a meaningless "variant ==
+// baseline" section.
+void printFillComparison(const std::vector<Trade>& baseline, const std::vector<Trade>& variant,
+                         const FillModelConfig& fill_cfg) {
+    printSection("Fill-Model Comparison (Naive vs. Adverse-Selection)");
+    if (baseline.empty() || variant.empty()) {
+        std::cout << "  Not enough trades to compare.\n" << line('=', 62) << "\n\n";
+        return;
+    }
+
+    auto stats = [](const std::vector<Trade>& trades) {
+        int wins = 0; double total = 0.0;
+        for (const auto& t : trades) { if (t.pnl > 0.0) ++wins; total += t.pnl; }
+        int n = static_cast<int>(trades.size());
+        return std::make_tuple(static_cast<double>(wins) / n, total * 100.0 / n, total * 100.0);
+    };
+    auto [wr_base, avg_base, tot_base] = stats(baseline);
+    auto [wr_var,  avg_var,  tot_var]  = stats(variant);
+
+    int touched_not_filled = 0;
+    for (const auto& t : variant) if (t.target_touched_not_filled) ++touched_not_filled;
+
+    std::cout << "  gamma=" << fill_cfg.gamma << "  queue_mult=" << fill_cfg.queue_mult << "\n\n";
+    std::cout << std::left << std::setw(22) << "" << std::setw(14) << "Naive"
+              << "Adverse-Selection\n";
+    std::cout << std::left << std::setw(22) << "Win rate"
+              << std::setw(14) << pct(wr_base) << pct(wr_var) << "\n";
+    std::cout << std::left << std::setw(22) << "Avg P&L per trade"
+              << std::setw(14) << ("$" + dollar(avg_base)) << ("$" + dollar(avg_var)) << "\n";
+    std::cout << std::left << std::setw(22) << "Total P&L (1 ctr)"
+              << std::setw(14) << ("$" + dollar(tot_base)) << ("$" + dollar(tot_var)) << "\n";
+    std::cout << "\n  Profit-target touches never filled: " << touched_not_filled
+              << " / " << variant.size() << " trades\n"
+              << "  (these are fills the naive model always \"caught\" that a real\n"
+              << "   resting limit order would have missed)\n";
+    std::cout << "\n" << line('=', 62) << "\n\n";
+}
+
+// Error-injection resilience comparison: the clean baseline vs. the same trades
+// with operational errors (ghost fills, missed exits, adverse fills) injected.
+// Answers "does the edge survive the drawdown errors inflict, or does it flip
+// the strategy to a loss?" — reported as P&L retention + a survival verdict.
+void printErrorInjectionReport(const std::vector<Trade>& trades, const ErrorConfig& ecfg) {
+    printSection("Error-Injection Resilience (Clean vs. Errors)");
+    if (trades.empty()) {
+        std::cout << "  No trades to stress.\n" << line('=', 62) << "\n\n";
+        return;
+    }
+
+    std::vector<TradeView> views;
+    views.reserve(trades.size());
+    for (const auto& t : trades)
+        views.push_back({t.entry_price, t.pnl, t.pnl_if_held_to_expiry, t.exit_reason});
+
+    ErrorImpact impact = applyErrors(views, ecfg);
+    ErrorSummary s     = summarize(views, impact);
+
+    std::cout << "  Injected rates : ghost_fill=" << pct(ecfg.ghost_fill_rate)
+              << "  missed_exit=" << pct(ecfg.missed_exit_rate)
+              << "  adverse_fill=" << pct(ecfg.adverse_fill_rate)
+              << " (slip " << pct(ecfg.adverse_slippage_pct) << ")\n";
+    std::cout << "  Seed           : " << ecfg.seed << "  (deterministic)\n";
+    std::cout << "  Errors fired   : " << impact.ghost_fills << " ghost fill(s), "
+              << impact.missed_exits << " missed exit(s), "
+              << impact.adverse_fills << " adverse fill(s)\n\n";
+
+    std::cout << std::left << std::setw(26) << "" << std::setw(16) << "Clean"
+              << "With Errors\n";
+    std::cout << std::left << std::setw(26) << "Total P&L (1 ctr)"
+              << std::setw(16) << ("$" + dollar(s.baseline_total * 100.0))
+              << ("$" + dollar(s.injected_total * 100.0)) << "\n";
+    std::cout << std::left << std::setw(26) << "Max drawdown"
+              << std::setw(16) << ("$" + dollar(s.max_drawdown_baseline * 100.0))
+              << ("$" + dollar(s.max_drawdown_injected * 100.0)) << "\n";
+    std::cout << std::left << std::setw(26) << "P&L retained"
+              << pct(s.retention) << " of the clean run's profit\n\n";
+
+    if (s.still_profitable)
+        std::cout << "  VERDICT: ✅ STILL PROFITABLE through injected errors "
+                  << "(kept " << pct(s.retention) << " of clean P&L).\n";
+    else
+        std::cout << "  VERDICT: ❌ NOT profitable once these errors hit — the edge does\n"
+                  << "           not absorb this error rate. Tighten the defense that\n"
+                  << "           prevents whichever error dominates above.\n";
+
+    std::cout << "\n  Note: errors are the UN-defended counterfactual — Phase 1's ghost-fill\n"
+              << "  reconciliation, the exit monitor, and the fill model exist precisely to\n"
+              << "  keep these rates near zero live. This measures exposure if one lapses.\n";
     std::cout << "\n" << line('=', 62) << "\n\n";
 }
 
@@ -615,8 +902,18 @@ int main(int argc, char* argv[]) {
                 "  stop=2.0                   stop loss at X× debit paid\n"
                 "  capital=35000              starting capital (sets tier gate)\n"
                 "  profile=personal           use aggressive personal profile\n"
+                "  fillmodel=adverse_selection  also model asymmetric fills (see header)\n"
+                "  fillgamma=0.2              touch-fill liquidity scale factor\n"
+                "  fillqueuemult=3.0          queue-ahead size, × rolling avg volume\n"
+                "  fillseed=<n>               seed the fill-model RNG (0 = random)\n"
+                "  errghostrate=0.05          inject ghost-fill (double-lot) errors at this rate\n"
+                "  errmissedrate=0.10         inject missed-exit (rode to expiry) errors\n"
+                "  erradverserate=0.15        inject adverse-fill (slippage) errors\n"
+                "  errslippct=0.15            adverse-fill haircut, fraction of entry premium\n"
+                "  errseed=<n>                seed the error-injection RNG (deterministic)\n"
                 "\nExample:\n"
-                "  nox_backtest watchlist=AAPL,NVDA range=2y capital=50000\n";
+                "  nox_backtest watchlist=AAPL,NVDA range=2y capital=50000\n"
+                "  nox_backtest watchlist=AAPL range=2y fillmodel=adverse_selection\n";
             return 0;
         }
 
@@ -639,10 +936,33 @@ int main(int argc, char* argv[]) {
         else if (key == "profile" && val == "personal") {
             cfg.profile = RiskProfile::personal();
         }
+        else if (key == "fillmodel") {
+            cfg.fill.mode = (val == "adverse_selection") ? FillMode::AdverseSelection : FillMode::Naive;
+        }
+        else if (key == "fillgamma")     { cfg.fill.gamma       = std::stod(val); }
+        else if (key == "fillqueuemult") { cfg.fill.queue_mult  = std::stod(val); }
+        else if (key == "fillseed")      { cfg.fill.rng_seed    = static_cast<unsigned>(std::stoul(val)); }
+        else if (key == "errghostrate")  { cfg.errors.ghost_fill_rate      = std::stod(val); }
+        else if (key == "errmissedrate") { cfg.errors.missed_exit_rate     = std::stod(val); }
+        else if (key == "erradverserate"){ cfg.errors.adverse_fill_rate    = std::stod(val); }
+        else if (key == "errslippct")    { cfg.errors.adverse_slippage_pct = std::stod(val); }
+        else if (key == "errseed")       { cfg.errors.seed = static_cast<std::uint32_t>(std::stoul(val)); }
     }
 
     std::cerr << "\nFetching historical OHLCV...\n";
-    auto trades = runBacktest(cfg);
-    printReport(trades, cfg);
+    auto result = runBacktest(cfg);
+    printReport(result.baseline, cfg);
+    if (cfg.fill.mode != FillMode::Naive)
+        printFillComparison(result.baseline, result.variant, cfg.fill);
+    else
+        std::cout << "  Adverse-selection fill model available — rerun with\n"
+                  << "  fillmodel=adverse_selection to compare against this naive baseline.\n\n";
+
+    if (cfg.errors.active())
+        printErrorInjectionReport(result.baseline, cfg.errors);
+    else
+        std::cout << "  Error-injection resilience test available — rerun with e.g.\n"
+                  << "  errghostrate=0.05 errmissedrate=0.10 erradverserate=0.15 to see\n"
+                  << "  whether the strategy still profits through operational errors.\n\n";
     return 0;
 }

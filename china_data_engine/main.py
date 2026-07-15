@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Query, Security, status
 from fastapi.security import APIKeyHeader
 
 from edgar_cn_lag import check_ticker_in_cn_media
+from china_macro_lag import compute_macro_lag, _adr_tickers
 from scrapers import (
     fetch_cailian_news,
     fetch_china_pmi,
@@ -260,3 +261,30 @@ def lag_check(ticker: str = Query(..., description="US ADR ticker, e.g. BABA")) 
         "cache_age_minutes": cache_age_minutes,
         "last_updated":      _CACHE["last_updated"],
     }
+
+
+@app.get(
+    "/lag/macro",
+    summary="WS8 — China macro (PMI) information-lag verdict for the ADR basket",
+    tags=["ws8"],
+    dependencies=[Security(verify_token)],
+)
+def lag_macro() -> Dict[str, Any]:
+    """
+    The China macro information-lag signal the execution engine consumes through
+    its Skeptic intelligence layer. Fuses the cached PMI print with the WS7
+    per-ticker media-lag check: a fresh PMI release the US ADR session hasn't
+    priced (and that Chinese retail media hasn't yet propagated) becomes a
+    directional, `fresh`-flagged edge on the basket; a stale one is still
+    surfaced as lower-conviction confirmation.
+
+    Stateless — computed on demand from the current cache, same as /lag/check.
+    """
+    # Per-ticker media-lag flags for the ADR basket, reusing the WS7 check.
+    media_lag = {
+        t: check_ticker_in_cn_media(t, _CACHE["hot_board"], _CACHE["news_cn"])["lag_open"]
+        for t in _adr_tickers()
+    }
+    payload = compute_macro_lag(_CACHE.get("pmi", {}), media_lag)
+    payload["last_updated"] = _CACHE["last_updated"]
+    return payload

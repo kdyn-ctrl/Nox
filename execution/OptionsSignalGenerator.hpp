@@ -6,6 +6,7 @@
 #include "OptionEngine.hpp"
 #include "OptionsSignalTypes.hpp"
 #include "OptionsOrderRouter.hpp"
+#include "SkepticIntelligence.hpp"
 #include "../shared/RegimeStateMachine.hpp"
 
 #include <algorithm>
@@ -24,6 +25,7 @@
 #include <string>
 #include <functional>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using json = nlohmann::json;
@@ -155,11 +157,30 @@ private:
 
 } // namespace nox::liquidity
 
+#ifdef NOX_UNIT_TEST
+// Forward declaration for the test-only friend grant below — the actual
+// struct is defined per-test-file at global scope (see
+// execution/test/test_quality_dte_sizing.cpp / test_sector_trend_gate.cpp).
+struct NoxUnitTestAccess;
+#endif
+
 namespace nox::options_signal {
 
 // ─── Enumerations ─────────────────────────────────────────────────────────────
 
 enum class DirectionalBias { Bullish, Bearish, Neutral };
+
+// ─── QualityScore — setup conviction, computed from raw inputs only ───────────
+// No OptionsSignal dependency, so it's computable as soon as strategy/bias are
+// chosen — well before contract params or sizing are decided. This is what
+// makes it usable to influence DTE selection and position sizing, not just
+// ranking after the fact (see computeQualityScore()).
+struct QualityScore {
+    double quality_score     = 0.0;
+    double sma_distance_atrs = 0.0; // how far price is from SMA20 in ATR units
+    double vol_deviation     = 0.0; // abs(IV/HRV - 1.0)
+    double rsi_extremity     = 0.0; // abs(RSI - 50) / 50
+};
 
 // ─── ScoredSignal — internal ranking wrapper ──────────────────────────────────
 // run_scan() collects these, sorts by quality_score descending, then dispatches
@@ -245,6 +266,16 @@ public:
         double vix      = fetchVix();
         SpySnapshot spy = fetchSpy();
 
+        // Sector/trend gate: fetch each distinct sector ETF in this scan's
+        // watchlist once (not once per ticker — many tickers share a sector).
+        std::unordered_map<std::string, SectorSnapshot> sector_cache;
+        for (const auto& ticker : watchlist) {
+            auto sector_it = sectorEtfMap().find(ticker);
+            if (sector_it == sectorEtfMap().end()) continue;
+            if (sector_cache.count(sector_it->second)) continue;
+            sector_cache[sector_it->second] = fetchSectorTrend(sector_it->second);
+        }
+
         AllocationStrategy regime{};
         if (vix > 0.0 && spy.valid) {
             regime = regimeMachine_.evaluate(vix, spy.price, spy.sma200);
@@ -269,7 +300,7 @@ public:
                     continue;
                 }
                 auto result = evaluateTicker(ticker, effective_capital, tier,
-                                             fc_mode, vix, spy, regime);
+                                             fc_mode, vix, spy, regime, sector_cache);
                 if (result) candidates.push_back(std::move(*result));
             } catch (const std::exception& e) {
                 log("WARN", "[OPTIONS_SCAN] Exception on " + ticker + ": " + e.what());
@@ -294,6 +325,29 @@ public:
 
         for (const auto& sc : candidates) {
             if (dispatched >= limit) break;
+
+            // Sector/trend gate: suppress auto-execution when the signal's bias
+            // opposes its own sector ETF's EMA trend, even if the broad SPY/VIX
+            // regime looks fine (a sector-wide rotation, not a market-wide one).
+            // Advisory alerts still go out; only live execution is blocked.
+            double sector_gate_enabled = 1.0;
+            if (const char* v = std::getenv("SECTOR_TREND_GATE_ENABLED")) { try { sector_gate_enabled = std::stod(v); } catch (...) {} }
+            if (sc.signal.sector_conflict && sector_gate_enabled > 0.5) {
+                log("WARN", "[OPTIONS_SCAN][SECTOR_GATE] " + sc.signal.underlying +
+                    " (" + sc.signal.sector_etf + ") execution suppressed — bias opposes sector trend.");
+                sendTelegram(sc.formatted_alert);
+                sendTelegram(
+                    "⚠️ *SECTOR TREND GATE — " + sc.signal.underlying + "*\n"
+                    "────────────────────────\n"
+                    "Strategy: " + sc.signal.strategy + "\n"
+                    "Sector ETF " + sc.signal.sector_etf + " trend opposes this signal's bias.\n"
+                    "Auto-execution suppressed — sector-wide headwind.\n"
+                    "_Advisory signal still valid._"
+                );
+                dispatched++;
+                continue;
+            }
+
             sendTelegram(sc.formatted_alert);
             if (profile_.auto_execute) {
                 double rel_spread = fetchUnderlyingSpread(sc.signal.underlying);
@@ -327,6 +381,15 @@ public:
                 std::to_string(suppressed) + " lower-quality setup(s) suppressed by cap.");
         }
     }
+
+#ifdef NOX_UNIT_TEST
+    // Test-only access to private members (buildContractParams, assembleSignal,
+    // computeEma, sectorConflicts, etc.) — see execution/test/test_quality_dte_sizing.cpp
+    // and execution/test/test_sector_trend_gate.cpp. Declared at global scope
+    // (::NoxUnitTestAccess) since the test files define it there, not inside
+    // nox::options_signal.
+    friend struct ::NoxUnitTestAccess;
+#endif
 
 private:
     // ── Config ────────────────────────────────────────────────────────────────
@@ -423,22 +486,37 @@ private:
 
     // ── Signal quality score ──────────────────────────────────────────────────
     // Combines three independent conviction signals into a single rank value.
-    // Higher = stronger setup. Used to pick the best N per scan cycle.
+    // Higher = stronger setup. Computed from raw underlying/IV inputs only (no
+    // OptionsSignal dependency) so it's available BEFORE DTE selection and
+    // sizing decide anything — not just after the fact for ranking (see
+    // evaluateTicker(), buildContractParams(), assembleSignal()).
+    static QualityScore computeQualityScore(const UnderlyingData& d, double iv_sigma, double rsi) {
+        QualityScore q;
+        q.sma_distance_atrs = (d.atr14 > 0)
+            ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
+        q.vol_deviation     = (d.hrv30 > 0.01)
+            ? std::abs(iv_sigma / d.hrv30 - 1.0) : 0.0;
+        q.rsi_extremity     = std::abs(rsi - 50.0) / 50.0;
+        // Weights: trend conviction matters most, vol signal second, RSI third
+        q.quality_score     = q.sma_distance_atrs * 0.50
+                             + q.vol_deviation      * 0.30
+                             + q.rsi_extremity      * 0.20;
+        return q;
+    }
+
+    // Thin wrapper for the ranking/logging path in run_scan() — computes the
+    // same score from an already-assembled OptionsSignal.
     static ScoredSignal scoreSignal(const OptionsSignal& sig,
                                     const std::string& formatted_alert,
                                     const UnderlyingData& d) {
+        QualityScore q = computeQualityScore(d, sig.iv_level, sig.rsi);
         ScoredSignal sc;
-        sc.signal          = sig;
-        sc.formatted_alert = formatted_alert;
-        sc.sma_distance_atrs = (d.atr14 > 0)
-            ? std::abs(d.price - d.sma20) / d.atr14 : 0.0;
-        sc.vol_deviation   = (sig.hrv30 > 0.01)
-            ? std::abs(sig.iv_level / sig.hrv30 - 1.0) : 0.0;
-        sc.rsi_extremity   = std::abs(sig.rsi - 50.0) / 50.0;
-        // Weights: trend conviction matters most, vol signal second, RSI third
-        sc.quality_score   = sc.sma_distance_atrs * 0.50
-                           + sc.vol_deviation      * 0.30
-                           + sc.rsi_extremity      * 0.20;
+        sc.signal            = sig;
+        sc.formatted_alert   = formatted_alert;
+        sc.quality_score     = q.quality_score;
+        sc.sma_distance_atrs = q.sma_distance_atrs;
+        sc.vol_deviation     = q.vol_deviation;
+        sc.rsi_extremity     = q.rsi_extremity;
         return sc;
     }
 
@@ -533,6 +611,212 @@ private:
             return {price, sum / 200.0, true};
         } catch (...) {}
         return {};
+    }
+
+    // ── Market data: sector/trend gate ─────────────────────────────────────────
+    //
+    // The broad VIX/SPY regime gate doesn't catch a sector-wide move against a
+    // single-name signal (e.g. a bullish tech name firing straight into a tech
+    // rotation while SPY itself is fine). This computes a sector ETF's
+    // EMA-fast-vs-EMA-slow trend, fetched once per distinct ETF per scan cycle
+    // (see run_scan()'s sector_cache), and is checked at dispatch time the same
+    // way the RISK_OFF regime gate is.
+
+    struct SectorSnapshot {
+        double price    = 0.0;
+        double ema_fast = 0.0;
+        double ema_slow = 0.0;
+        bool   valid    = false;
+    };
+
+    // Seeds on the simple average of the first `period` closes, then runs an
+    // EMA forward over the remainder. Returns 0.0 (treat as invalid) if there
+    // isn't enough history.
+    static double computeEma(const std::vector<double>& closes, int period) {
+        if (static_cast<int>(closes.size()) < period) return 0.0;
+        double seed = 0.0;
+        for (int i = 0; i < period; ++i) seed += closes[static_cast<size_t>(i)];
+        seed /= period;
+        double k   = 2.0 / (period + 1.0);
+        double ema = seed;
+        for (size_t i = static_cast<size_t>(period); i < closes.size(); ++i)
+            ema = closes[i] * k + ema * (1.0 - k);
+        return ema;
+    }
+
+    // Ticker → sector ETF. Structural lookup data (not a tuned threshold), so
+    // it's a static table rather than env-configured. Unmapped tickers fail
+    // open — the gate is simply skipped for them.
+    static const std::unordered_map<std::string, std::string>& sectorEtfMap() {
+        static const std::unordered_map<std::string, std::string> m = {
+            {"AAPL", "XLK"}, {"MSFT", "XLK"}, {"NVDA", "XLK"}, {"AMD", "XLK"},
+            {"AVGO", "XLK"}, {"ORCL", "XLK"}, {"SMCI", "XLK"}, {"SOXX", "XLK"},
+            {"GOOGL", "XLC"}, {"META", "XLC"}, {"NFLX", "XLC"}, {"DIS", "XLC"},
+            {"AMZN", "XLY"}, {"TSLA", "XLY"}, {"SHOP", "XLY"}, {"UBER", "XLY"},
+            {"JPM", "XLF"}, {"GS", "XLF"}, {"BAC", "XLF"}, {"SOFI", "XLF"},
+            {"XOM", "XLE"}, {"F", "XLE"},
+            {"LLY", "XLV"}, {"JNJ", "XLV"}, {"UNH", "XLV"},
+        };
+        return m;
+    }
+
+    SectorSnapshot fetchSectorTrend(const std::string& etf_symbol) const {
+        try {
+            int ema_fast_period = 20, ema_slow_period = 50;
+            if (const char* v = std::getenv("SECTOR_TREND_EMA_FAST")) { try { ema_fast_period = std::max(2, std::stoi(v)); } catch (...) {} }
+            if (const char* v = std::getenv("SECTOR_TREND_EMA_SLOW")) { try { ema_slow_period = std::max(2, std::stoi(v)); } catch (...) {} }
+
+            httplib::Client cli("https://query1.finance.yahoo.com");
+            cli.set_connection_timeout(std::chrono::seconds(8));
+            cli.set_read_timeout(std::chrono::seconds(15));
+
+            auto res = cli.Get(("/v8/finance/chart/" + etf_symbol + "?interval=1d&range=6mo").c_str());
+            if (!res || res->status != 200) return {};
+
+            auto body = json::parse(res->body);
+            const auto& closes = body.at("chart").at("result").at(0)
+                                      .at("indicators").at("quote").at(0).at("close");
+
+            std::vector<double> valid_closes;
+            for (const auto& c : closes) {
+                if (!c.is_null()) valid_closes.push_back(c.get<double>());
+            }
+            if (valid_closes.size() < static_cast<size_t>(ema_slow_period)) return {};
+
+            SectorSnapshot s;
+            s.price    = valid_closes.back();
+            s.ema_fast = computeEma(valid_closes, ema_fast_period);
+            s.ema_slow = computeEma(valid_closes, ema_slow_period);
+            s.valid    = (s.ema_fast > 0.0 && s.ema_slow > 0.0);
+            return s;
+        } catch (...) {}
+        return {};
+    }
+
+    // True if `bias` opposes the sector's own trend — a bullish signal into a
+    // sector downtrend, or a bearish signal into a sector uptrend. Neutral
+    // bias never conflicts (nothing directional to contradict); an unfetched/
+    // ambiguous snapshot fails open (no conflict).
+    static bool sectorConflicts(DirectionalBias bias, const SectorSnapshot& sec) {
+        if (!sec.valid || bias == DirectionalBias::Neutral) return false;
+        bool downtrend = sec.ema_fast < sec.ema_slow && sec.price < sec.ema_fast;
+        bool uptrend   = sec.ema_fast > sec.ema_slow && sec.price > sec.ema_fast;
+        if (bias == DirectionalBias::Bullish) return downtrend;
+        return uptrend; // Bearish
+    }
+
+    // ── Skeptic intelligence — WS2 alt-macro + WS3 insider + China lag ────────
+    // The piece that finally makes the non-contradiction Skeptic workstreams
+    // move real trades. Queries the america-data-engine's /insider/clusters and
+    // /macro/alt feeds (already live, never previously consumed) and the
+    // china-data-engine's /lag/macro feed, folding them into one
+    // size-multiplier / suppress verdict via the pure SkepticIntelligence
+    // decision layer.
+    //
+    // Fail-open: any unreachable/malformed feed contributes an empty input, so
+    // decide() returns a 1.0x no-op — a dead Skeptic never blocks or distorts
+    // execution.
+    nox::skeptic::Decision fetchSkepticIntelligence(const std::string& ticker,
+                                                    nox::skeptic::Dir dir) const {
+        using namespace nox::skeptic;
+        Inputs in;
+        try {
+            const char* secret = std::getenv("WEBHOOK_SECRET_TOKEN");
+            if (!secret) return Decision{}; // no auth → treat as no-op (1.0x)
+
+            httplib::Client cli("http://america-data-engine:8001");
+            cli.set_connection_timeout(std::chrono::seconds(3));
+            cli.set_read_timeout(std::chrono::seconds(5));
+            httplib::Headers headers = {{"X-Nox-Token", secret}};
+
+            auto getJson = [&](const char* path, json& out) -> bool {
+                try {
+                    auto res = cli.Get(path, headers);
+                    if (!res || res->status != 200) return false;
+                    out = json::parse(res->body);
+                    return true;
+                } catch (...) { return false; }
+            };
+
+            auto toDir = [](const std::string& s) -> Dir {
+                std::string l; l.reserve(s.size());
+                for (char c : s) l.push_back(static_cast<char>(::tolower(c)));
+                if (l.find("bull") != std::string::npos) return Dir::Bullish;
+                if (l.find("bear") != std::string::npos) return Dir::Bearish;
+                return Dir::Neutral;
+            };
+
+            // WS3 — insider Form 4 buy-clusters.
+            json insider;
+            if (getJson("/insider/clusters", insider) && insider.contains("signals")) {
+                for (const auto& s : insider["signals"]) {
+                    if (s.value("ticker", "") == ticker) {
+                        in.insider.has_cluster   = true;
+                        in.insider.insider_count = s.value("insider_count", 0);
+                        break;
+                    }
+                }
+            }
+
+            // WS2 — alt-macro physical-supply verdict. Match the ticker against
+            // each chokepoint region's exposed instruments.
+            json alt;
+            if (getJson("/macro/alt", alt) && alt.contains("regions")) {
+                for (const auto& r : alt["regions"]) {
+                    bool applies = false;
+                    if (r.contains("tickers"))
+                        for (const auto& t : r["tickers"])
+                            if (t.get<std::string>() == ticker) { applies = true; break; }
+                    if (!applies) continue;
+                    std::string bias = r.value("bias", "");
+                    if (bias.empty() || r.value("bias", json()).is_null()) continue;
+                    in.alt_macro.applies  = true;
+                    in.alt_macro.bias     = toDir(bias); // "BULLISH_OIL"/"BEARISH_OIL"
+                    double ps = r.value("physical_stress", 0.0);
+                    in.alt_macro.strength = std::abs(ps);
+                    in.alt_macro.text_contradicts_physical =
+                        (r.value("verdict", "") == "TEXT_CONTRADICTS_PHYSICAL");
+                    break; // first matching region wins
+                }
+            }
+
+            // China macro information-lag feed (WS8). Lives on the separate
+            // china-data-engine (which owns the PMI + retail-media lag data),
+            // not the america-data-engine the WS2/WS3 feeds come from.
+            const char* cn_base = std::getenv("CHINA_DATA_ENGINE_URL");
+            httplib::Client cn_cli(cn_base ? cn_base : "http://china-data-engine:8000");
+            cn_cli.set_connection_timeout(std::chrono::seconds(3));
+            cn_cli.set_read_timeout(std::chrono::seconds(5));
+            json cn;
+            bool cn_ok = false;
+            try {
+                auto res = cn_cli.Get("/lag/macro", headers);
+                if (res && res->status == 200) { cn = json::parse(res->body); cn_ok = true; }
+            } catch (...) { cn_ok = false; }
+            if (cn_ok && cn.contains("results")) {
+                for (const auto& e : cn["results"]) {
+                    if (e.value("ticker", "") != ticker) continue;
+                    std::string bias = e.value("bias", "");
+                    if (bias.empty()) break;
+                    in.china.applies  = true;
+                    in.china.bias     = toDir(bias);
+                    in.china.strength = e.value("strength", 0.0);
+                    in.china.fresh    = e.value("fresh", false);
+                    in.china.release  = e.value("release", "");
+                    break;
+                }
+            }
+        } catch (...) {
+            return Decision{}; // any unexpected failure → no-op
+        }
+
+        Decision d = decide(dir, in, Knobs::fromEnv());
+        if (d.reason != "skeptic_neutral") {
+            log(d.suppress ? "WARN" : "INFO",
+                "[SKEPTIC][" + ticker + "] " + d.reason +
+                " size_mult=" + fmt(d.size_mult, 2) + " — " + d.detail);
+        }
+        return d;
     }
 
     // ── Market data: Earnings Calendar (america-data-engine) ──────────────────
@@ -909,7 +1193,8 @@ private:
 
     ContractParams buildContractParams(const std::string& strategy,
                                        double spot, double atr,
-                                       double rfr, double iv_sigma) const {
+                                       double rfr, double iv_sigma,
+                                       double quality_score = 0.5) const {
         ContractParams p;
 
         // Target DTE from profile
@@ -919,6 +1204,30 @@ private:
         else if (strategy == "STRADDLE" || strategy == "STRANGLE" ||
                  strategy == "BULL_CALL_SPREAD" || strategy == "BEAR_PUT_SPREAD")
             target_dte = profile_.dte_spread;
+
+        // Quality-driven DTE — theta-sensitive long-premium strategies only.
+        // A weak setup (low momentum/conviction) needs more time for the thesis
+        // to play out or theta kills it before it can; a strong setup doesn't
+        // need to overpay for time it won't use. Short-premium strategies
+        // (CSP/CC) are excluded — decay is their edge, not their enemy.
+        bool is_theta_sensitive_long = (strategy == "LONG_CALL" || strategy == "LONG_PUT" ||
+                                        strategy == "BULL_CALL_SPREAD" || strategy == "BEAR_PUT_SPREAD");
+        if (is_theta_sensitive_long) {
+            double q_high = 0.55, q_low = 0.25, high_relax_pct = 0.50;
+            int    low_floor_days = 21;
+            if (const char* v = std::getenv("QUALITY_DTE_HIGH_THRESHOLD")) { try { q_high = std::stod(v); } catch (...) {} }
+            if (const char* v = std::getenv("QUALITY_DTE_LOW_THRESHOLD"))  { try { q_low  = std::stod(v); } catch (...) {} }
+            if (const char* v = std::getenv("QUALITY_DTE_LOW_FLOOR_DAYS")) { try { low_floor_days = std::max(1, std::stoi(v)); } catch (...) {} }
+            if (const char* v = std::getenv("QUALITY_DTE_HIGH_RELAX_PCT")) { try { high_relax_pct = std::stod(v); } catch (...) {} }
+
+            if (quality_score >= q_high) {
+                int relaxed = static_cast<int>(target_dte * (1.0 - high_relax_pct));
+                target_dte = std::max(1, relaxed); // never below 1 day
+            } else if (quality_score <= q_low) {
+                target_dte = std::max(target_dte, low_floor_days); // push weak setups out, never shrink strong ones
+            }
+            // mid-band: profile default stands unchanged
+        }
 
         p.expiry = target_dte / 365.0;
 
@@ -1007,7 +1316,7 @@ private:
                                  double rfr, double confidence,
                                  const std::string& tier,
                                  bool fc_mode, double allocated_capital,
-                                 double hrv30) const
+                                 double hrv30, double quality_score = 0.5) const
     {
         using namespace nox::options;
 
@@ -1043,7 +1352,50 @@ private:
         OptionGreeks g1 = compute_greeks(primary);
 
         double max_risk   = computeMaxRisk(allocated_capital, tier);
-        double contracts  = std::max(1.0, std::floor(max_risk / (g1.price * 100.0)));
+
+        // Quality-driven sizing multiplier — a low-conviction setup gets a
+        // smaller slice of the risk budget, a high-conviction one a slightly
+        // larger one. Applied standalone (no AlphaDecayStore/decay_scale on
+        // this codebase — see CLAUDE.md).
+        double quality_size_mult = 1.0;
+        {
+            double q_low = 0.25, q_high = 0.55, mult_min = 0.60, mult_max = 1.15;
+            if (const char* v = std::getenv("QUALITY_DTE_LOW_THRESHOLD"))  { try { q_low  = std::stod(v); } catch (...) {} }
+            if (const char* v = std::getenv("QUALITY_DTE_HIGH_THRESHOLD")) { try { q_high = std::stod(v); } catch (...) {} }
+            if (const char* v = std::getenv("QUALITY_SIZE_MULT_MIN"))      { try { mult_min = std::stod(v); } catch (...) {} }
+            if (const char* v = std::getenv("QUALITY_SIZE_MULT_MAX"))      { try { mult_max = std::stod(v); } catch (...) {} }
+            if (quality_score <= q_low)       quality_size_mult = mult_min;
+            else if (quality_score >= q_high) quality_size_mult = mult_max;
+            else if (q_high > q_low)
+                quality_size_mult = mult_min + (mult_max - mult_min) * (quality_score - q_low) / (q_high - q_low);
+        }
+
+        // Hard short-DTE risk ceiling — a structural cap on convexity risk, not
+        // a smooth regime multiplier. A trade landing at/under the short-DTE
+        // threshold can't exceed a small fixed % of capital regardless of tier,
+        // though a high-quality setup earns back some room toward the tier's
+        // normal risk_pct rather than being starved as hard as a weak one.
+        {
+            int resolved_dte = static_cast<int>(std::round(cp.expiry * 365.0));
+            int short_dte_days = 14;
+            double ceiling_pct = 0.010, relax = 0.50, q_high = 0.55;
+            if (const char* v = std::getenv("SHORT_DTE_THRESHOLD_DAYS"))        { try { short_dte_days = std::max(1, std::stoi(v)); } catch (...) {} }
+            if (const char* v = std::getenv("SHORT_DTE_RISK_PCT_CEILING"))      { try { ceiling_pct = std::stod(v); } catch (...) {} }
+            if (const char* v = std::getenv("SHORT_DTE_QUALITY_CEILING_RELAX")) { try { relax = std::stod(v); } catch (...) {} }
+            if (const char* v = std::getenv("QUALITY_DTE_HIGH_THRESHOLD"))      { try { q_high = std::stod(v); } catch (...) {} }
+
+            if (resolved_dte <= short_dte_days && allocated_capital > 0.0) {
+                double effective_ceiling_pct = ceiling_pct;
+                if (quality_score >= q_high) {
+                    double tier_pct = max_risk / allocated_capital;
+                    if (tier_pct > ceiling_pct)
+                        effective_ceiling_pct = ceiling_pct + (tier_pct - ceiling_pct) * relax;
+                }
+                max_risk = std::min(max_risk, allocated_capital * effective_ceiling_pct);
+            }
+        }
+
+        double contracts  = std::max(1.0, std::floor((max_risk * quality_size_mult) / (g1.price * 100.0)));
 
         // Per-contract P&L geometry
         if (strategy == "LONG_CALL" || strategy == "LONG_PUT") {
@@ -1263,7 +1615,8 @@ private:
         const std::string& ticker,
         double effective_capital, const std::string& tier, bool fc_mode,
         double vix, const SpySnapshot& spy,
-        const AllocationStrategy& regime)
+        const AllocationStrategy& regime,
+        const std::unordered_map<std::string, SectorSnapshot>& sector_cache = {})
     {
         log("INFO", "[OPTIONS_SCAN] Scanning " + ticker + "...");
 
@@ -1308,15 +1661,50 @@ private:
             }
         }
 
-        ContractParams cp = buildContractParams(strategy, d.price, d.atr14, rfr, iv_sigma);
+        // Computed once, early — feeds both quality-driven DTE selection and
+        // quality-driven sizing below, plus the ranking score at dispatch time.
+        double quality_score = computeQualityScore(d, iv_sigma, d.rsi14).quality_score;
+
+        ContractParams cp = buildContractParams(strategy, d.price, d.atr14, rfr, iv_sigma, quality_score);
         if (cp.strike <= 0.0) {
             log("WARN", "[OPTIONS_SCAN] Could not determine valid strike for " + ticker);
             return std::nullopt;
         }
 
+        // Skeptic intelligence (WS2 alt-macro + WS3 insider + China lag). Maps
+        // the trade's directional bias to a size multiplier and, on a hard
+        // opposition (fresh unpriced China move against us, or a headline that
+        // contradicts the physical supply data), suppresses the entry outright.
+        // Non-directional vol plays pass Neutral, so those can only be nudged
+        // by the neutral-safe inputs, never suppressed.
+        nox::skeptic::Dir skeptic_dir =
+            (bias == DirectionalBias::Bullish) ? nox::skeptic::Dir::Bullish :
+            (bias == DirectionalBias::Bearish) ? nox::skeptic::Dir::Bearish :
+                                                 nox::skeptic::Dir::Neutral;
+        nox::skeptic::Decision skeptic = fetchSkepticIntelligence(ticker, skeptic_dir);
+        if (skeptic.suppress) {
+            log("WARN", "[OPTIONS_SCAN][SKEPTIC] " + ticker + " / " + strategy +
+                " suppressed — " + skeptic.detail);
+            return std::nullopt;
+        }
+
+        double sized_capital = effective_capital * skeptic.size_mult;
+
         OptionsSignal sig = assembleSignal(ticker, d, strategy, cp,
                                            iv_rank, iv_sigma, rfr, regime_clearance,
-                                           tier, fc_mode, effective_capital, d.hrv30);
+                                           tier, fc_mode, sized_capital, d.hrv30, quality_score);
+
+        // Sector/trend gate verdict — computed here (once per ticker) from the
+        // per-scan sector_cache, carried on the signal so run_scan()'s dispatch
+        // loop can check it without recomputing.
+        auto sector_it = sectorEtfMap().find(ticker);
+        if (sector_it != sectorEtfMap().end()) {
+            sig.sector_etf = sector_it->second;
+            auto cache_it = sector_cache.find(sector_it->second);
+            if (cache_it != sector_cache.end()) {
+                sig.sector_conflict = sectorConflicts(bias, cache_it->second);
+            }
+        }
 
         std::string alert = formatAlert(sig, vix, regime);
         return scoreSignal(sig, alert, d);
