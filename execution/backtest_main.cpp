@@ -15,7 +15,10 @@
 //   range=2y          (Yahoo Finance range: 1y, 2y, 5y)
 //   scan=5            (scan every N trading days — 5 = weekly)
 //   profit=0.50       (exit at 50% of max profit)
-//   stop=2.0          (exit at 2× debit/credit paid — i.e. lose 100% + premium)
+//   stop=2.0          (exit at 2x debit/credit paid on a SHORT position — a
+//                      long's value floors at 0, so mult>=1.0 clamps to a
+//                      100%-loss/worthless exit; use stop<1.0 to bail earlier
+//                      on longs, e.g. stop=0.5 exits at a 50% premium loss)
 //   capital=35000     (determines strategy tier gate)
 //   profile=personal  (use aggressive personal profile; default = bot)
 //   fillmodel=adverse_selection  (also model asymmetric fills — see below)
@@ -43,6 +46,8 @@
 #include "OptionsSignalTypes.hpp"
 #include "BacktestFillModel.hpp"
 #include "BacktestErrorModel.hpp"
+#include "BacktestKellySizing.hpp"
+#include "BacktestWalkForward.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -54,6 +59,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using json = nlohmann::json;
@@ -77,9 +83,17 @@ struct BacktestConfig {
     double stop_loss_mult                = 2.00;
     double initial_capital               = 35000.0; // ADVANCED tier by default
     double rfr                           = 0.05;
+    // Audit §3 H5: entries were priced frictionless at the BS mid — "the
+    // single biggest omitted cost, 2-10% each way retail" per the audit.
+    // Both 0.0 by default (RULE-D5 no-op); set via CLI (haircutpct=/
+    // commissionpercontract=) to see the cost-adjusted edge.
+    double bid_ask_haircut_pct           = 0.0; // fraction of entry premium given up to the spread
+    double commission_per_contract       = 0.0; // flat $ per contract per leg, charged at entry
     RiskProfile profile                  = RiskProfile::bot();
     FillModelConfig fill                 = FillModelConfig::fromEnv();
     ErrorConfig     errors               = ErrorConfig::fromEnv();
+    KellySizingConfig kelly              = KellySizingConfig::fromEnv();
+    WalkForwardConfig wfo                = WalkForwardConfig::fromEnv();
 };
 
 struct Trade {
@@ -150,6 +164,21 @@ std::vector<Bar> fetchBars(const std::string& symbol, const std::string& range) 
         std::cerr << " parse error\n";
         return {};
     }
+}
+
+// Approximate day count since a fixed epoch, from a "YYYY-MM-DD" string.
+// Used both for annualization spans AND (critically) to measure real ELAPSED
+// CALENDAR DAYS between bars — bars are trading days, not calendar days, so a
+// bar-index delta is NOT a day delta. A few days of calendar drift from
+// ignoring real month lengths is immaterial at backtest scale. Single
+// implementation (RULE-D6) — this used to be duplicated as kellyDayNumber/
+// approxDayNumber further down.
+long dateOrdinal(const std::string& date) {
+    if (date.size() < 10) return 0;
+    int y = std::stoi(date.substr(0, 4));
+    int m = std::stoi(date.substr(5, 2));
+    int d = std::stoi(date.substr(8, 2));
+    return static_cast<long>(y) * 365 + m * 30 + d;
 }
 
 // ─── Technical indicators (strict no-lookahead: only bars[0..end_idx]) ───────
@@ -253,6 +282,15 @@ std::string pickStrategy(Bias bias, double iv, double hrv,
     if (prefer_buy  && ok("STRADDLE"))           return "STRADDLE";
     if (ok("CSP"))                               return "CSP";
     return "LONG_CALL";
+}
+
+// Number of option legs opened for a strategy — only used to scale a flat
+// per-contract commission (audit §3 H5). Matches buildEntrySetup()'s own
+// strategy set; anything not listed defaults to 1 (the single-leg shape).
+int legsForStrategy(const std::string& strat) {
+    if (strat == "BULL_CALL_SPREAD" || strat == "BEAR_PUT_SPREAD" ||
+        strat == "STRADDLE"         || strat == "STRANGLE") return 2;
+    return 1;
 }
 
 // ─── Strike selection (delta-targeted, standard listed increments) ────────────
@@ -365,14 +403,33 @@ EntrySetup buildEntrySetup(const std::string& strat, double spot0,
     es.K1 = K1; es.K2 = K2; es.leg1_type = leg1_type;
     es.entry_price = valuePosition(strat, spot0, es.expiry_yrs, iv_entry, rfr, K1, K2, leg1_type);
 
-    // Long positions pay debit; short positions receive credit.
-    es.is_long = (strat != "CSP" && strat != "CC");
+    // Long positions pay debit; short positions receive credit. STRANGLE is
+    // sold for a credit too — the live engine now routes it as a real short
+    // strangle (Track 2 §2 C3), so the backtester's sign convention has to
+    // match or it's pricing a position the live system never takes.
+    es.is_long = (strat != "CSP" && strat != "CC" && strat != "STRANGLE");
 
     // Directional check: did price go the right way?
     es.bias_bullish = (strat == "LONG_CALL" || strat == "BULL_CALL_SPREAD" || strat == "CSP");
     es.bias_bearish = (strat == "LONG_PUT"  || strat == "BEAR_PUT_SPREAD"  || strat == "CC");
 
     return es;
+}
+
+// Applies the bid-ask haircut + flat per-leg commission to a freshly-built
+// entry price (audit §3 H5 — "entries frictionless at BS mid ... the single
+// biggest omitted cost"). Both knobs default to 0.0 (RULE-D5 no-op), so this
+// is an identity transform unless a caller opts in via CLI. Long positions
+// pay more; short/credit positions collect less (and can go to 0 if costs
+// exceed the whole credit — same as a real trade that isn't worth opening).
+void applyEntryCosts(EntrySetup& es, const std::string& strat, const BacktestConfig& cfg) {
+    if (cfg.bid_ask_haircut_pct <= 0.0 && cfg.commission_per_contract <= 0.0) return;
+    double commission_per_share = legsForStrategy(strat) * cfg.commission_per_contract / 100.0;
+    if (es.is_long) {
+        es.entry_price = es.entry_price * (1.0 + cfg.bid_ask_haircut_pct) + commission_per_share;
+    } else {
+        es.entry_price = std::max(0.0, es.entry_price * (1.0 - cfg.bid_ask_haircut_pct) - commission_per_share);
+    }
 }
 
 // ─── Simulate one trade ───────────────────────────────────────────────────────
@@ -382,15 +439,25 @@ Trade simulateTrade(const std::string& ticker,
                     const std::vector<Bar>& bars,
                     size_t entry_idx,
                     const BacktestConfig& cfg,
-                    double iv_entry, double hrv_entry, double rsi_entry)
+                    double iv_entry, double hrv_entry, double rsi_entry,
+                    // Audit §3 H2: walk-forward train-window trades used to read
+                    // bars all the way to bars.size(), so a trade opened near the
+                    // end of the train window could resolve using TEST-window
+                    // price action — the grid search that picks (profit_target,
+                    // stop_loss) off train P&L was therefore partly informed by
+                    // out-of-sample data. max_bar_idx caps how far the exit search
+                    // is allowed to read; SIZE_MAX (default) is the old, unbounded
+                    // behavior used everywhere except the WFO train-window call.
+                    size_t max_bar_idx = static_cast<size_t>(-1))
 {
     const RiskProfile& prof = cfg.profile;
     double spot0 = bars[entry_idx].close;
     double rfr   = cfg.rfr;
 
     EntrySetup es = buildEntrySetup(strat, spot0, iv_entry, rfr, prof);
+    applyEntryCosts(es, strat, cfg);
     if (es.entry_price <= 0.01) {
-        // Spread collapsed or invalid IV — skip
+        // Spread collapsed or invalid IV, or costs consumed the whole credit — skip
         Trade t; t.exit_reason = "INVALID"; return t;
     }
 
@@ -408,13 +475,23 @@ Trade simulateTrade(const std::string& ticker,
 
     double exit_price = es.entry_price;
     size_t exit_idx   = entry_idx;
+    size_t last_in_dte_idx = entry_idx; // last bar seen with elapsed calendar days <= dte
 
-    for (int day = 1; day <= es.dte; ++day) {
-        size_t idx = entry_idx + static_cast<size_t>(day);
-        if (idx >= bars.size()) break;
+    // Bars are TRADING days, but es.dte is CALENDAR days (a real listed
+    // option's expiration is a calendar date, not a bar count) — stepping by
+    // bar index and calling that index "day" understates real elapsed time by
+    // ~7/5x, so theta decay lagged the realized-vol clock it was priced
+    // against (audit §3 C1: ~9.5% structural variance subsidy to long
+    // premium). Use the bars' own dates to measure real elapsed calendar days.
+    long entry_ord = dateOrdinal(bars[entry_idx].date);
+    bool capped = false;
+    for (size_t idx = entry_idx + 1; idx < bars.size() && idx <= max_bar_idx; ++idx) {
+        long elapsed_days = dateOrdinal(bars[idx].date) - entry_ord;
+        if (elapsed_days > es.dte) break; // past the option's real expiration
+        last_in_dte_idx = idx;
 
         double spot   = bars[idx].close;
-        double t_rem  = std::max(0.0, es.expiry_yrs - day / 365.0);
+        double t_rem  = std::max(0.0, es.expiry_yrs - elapsed_days / 365.0);
         double hrv_d  = calcHRV(bars, idx);
         double iv_d   = hrv_d * 1.15;
 
@@ -430,7 +507,14 @@ Trade simulateTrade(const std::string& ticker,
 
         exit_price = cur;
         exit_idx   = idx;
+        capped     = (idx == max_bar_idx);
     }
+    // Loop stopped at the window boundary before a natural PROFIT_TARGET/
+    // STOP_LOSS/expiry — mark-to-market at that bar rather than mislabeling
+    // it "EXPIRY" (it wasn't). Only ever reachable when a caller passes a
+    // real max_bar_idx (the WFO train-window grid search); every other
+    // caller keeps the old unbounded behavior.
+    if (capped && t.exit_reason == "EXPIRY") t.exit_reason = "WINDOW_END";
 
     t.exit_price = exit_price;
     t.exit_date  = bars[exit_idx].date;
@@ -438,13 +522,13 @@ Trade simulateTrade(const std::string& ticker,
     t.pnl        = es.is_long ? (exit_price - es.entry_price) : (es.entry_price - exit_price);
 
     // Counterfactual: value the position at the last reachable bar within its
-    // DTE (the held-to-expiry outcome) regardless of the exit rule that fired,
-    // so an error model can ask "what if the exit had been missed?" honestly
-    // instead of guessing a give-back multiplier.
+    // real (calendar-day) DTE (the held-to-expiry outcome) regardless of the
+    // exit rule that fired, so an error model can ask "what if the exit had
+    // been missed?" honestly instead of guessing a give-back multiplier.
     {
-        size_t exp_idx = entry_idx + static_cast<size_t>(es.dte);
-        if (exp_idx >= bars.size()) exp_idx = bars.size() - 1;
-        double t_rem_exp = std::max(0.0, es.expiry_yrs - static_cast<double>(exp_idx - entry_idx) / 365.0);
+        size_t exp_idx = last_in_dte_idx;
+        long elapsed_exp = dateOrdinal(bars[exp_idx].date) - entry_ord;
+        double t_rem_exp = std::max(0.0, es.expiry_yrs - elapsed_exp / 365.0);
         double hrv_exp   = calcHRV(bars, exp_idx);
         double iv_exp    = hrv_exp * 1.15;
         double val_exp   = valuePosition(strat, bars[exp_idx].close, t_rem_exp, iv_exp, rfr,
@@ -456,8 +540,13 @@ Trade simulateTrade(const std::string& ticker,
     if (es.bias_bullish)      t.bias_right = t.spot_exit > t.spot_entry;
     else if (es.bias_bearish) t.bias_right = t.spot_exit < t.spot_entry;
     else {
-        // Vol play: right if actual move > expected one-SD move
-        double expected_move = hrv_entry * t.spot_entry * std::sqrt(es.dte / 252.0);
+        // Vol play: right if actual move > expected one-SD move. es.expiry_yrs
+        // is already a calendar-year fraction (dte/365) — HRV's sqrt(252)
+        // annualization converts trading-day variance to ANNUAL (calendar)
+        // variance, so scaling by sqrt(expiry_yrs) is the consistent basis
+        // (dte/252 here double-counted the trading/calendar mismatch, same
+        // class of bug as the decay loop above).
+        double expected_move = hrv_entry * t.spot_entry * std::sqrt(es.expiry_yrs);
         t.bias_right = std::abs(t.spot_exit - t.spot_entry) > expected_move;
     }
 
@@ -498,6 +587,7 @@ Trade simulateTradeAdverseSelection(const std::string& ticker,
     double rfr   = cfg.rfr;
 
     EntrySetup es = buildEntrySetup(strat, spot0, iv_entry, rfr, prof);
+    applyEntryCosts(es, strat, cfg);
     if (es.entry_price <= 0.01) {
         Trade t; t.exit_reason = "INVALID"; return t;
     }
@@ -522,11 +612,14 @@ Trade simulateTradeAdverseSelection(const std::string& ticker,
     double exit_price = es.entry_price;
     size_t exit_idx   = entry_idx;
 
-    for (int day = 1; day <= es.dte; ++day) {
-        size_t idx = entry_idx + static_cast<size_t>(day);
-        if (idx >= bars.size()) break;
+    // See simulateTrade()'s comment on entry_ord/elapsed_days — same
+    // trading-day-vs-calendar-day fix, same class of bug (RULE-D6).
+    long entry_ord = dateOrdinal(bars[entry_idx].date);
+    for (size_t idx = entry_idx + 1; idx < bars.size(); ++idx) {
+        long elapsed_days = dateOrdinal(bars[idx].date) - entry_ord;
+        if (elapsed_days > es.dte) break;
 
-        double t_rem  = std::max(0.0, es.expiry_yrs - day / 365.0);
+        double t_rem  = std::max(0.0, es.expiry_yrs - elapsed_days / 365.0);
         double hrv_d  = calcHRV(bars, idx);
         double iv_d   = hrv_d * 1.15;
 
@@ -560,7 +653,7 @@ Trade simulateTradeAdverseSelection(const std::string& ticker,
     if (es.bias_bullish)      t.bias_right = t.spot_exit > t.spot_entry;
     else if (es.bias_bearish) t.bias_right = t.spot_exit < t.spot_entry;
     else {
-        double expected_move = hrv_entry * t.spot_entry * std::sqrt(es.dte / 252.0);
+        double expected_move = hrv_entry * t.spot_entry * std::sqrt(es.expiry_yrs);
         t.bias_right = std::abs(t.spot_exit - t.spot_entry) > expected_move;
     }
 
@@ -622,6 +715,227 @@ BacktestResult runBacktest(const BacktestConfig& cfg) {
     return result;
 }
 
+// ─── Walk-forward optimization ────────────────────────────────────────────────
+//
+// Generates signals+trades over one contiguous bar-index range [start, end)
+// using the given (possibly parameter-overridden) config. Shared by both the
+// train-window grid search and the test-window out-of-sample application
+// below so the scan-and-simulate loop isn't duplicated between them.
+std::vector<Trade> simulateSignalsInRange(const std::vector<Bar>& bars, size_t start, size_t end,
+                                          const BacktestConfig& cfg, const std::string& ticker,
+                                          const std::string& tier,
+                                          // See simulateTrade()'s comment (audit §3 H2). Pass
+                                          // fold.train_end-1 from the WFO train-window grid
+                                          // search; leave at the default everywhere else
+                                          // (including the WFO test/out-of-sample call, which
+                                          // is meant to run a trade to its natural exit).
+                                          size_t max_bar_idx = static_cast<size_t>(-1)) {
+    std::vector<Trade> trades;
+    size_t i = std::max<size_t>(start, 51);
+    for (; i < end && i + 5 < bars.size(); i += static_cast<size_t>(cfg.scan_every_n_days)) {
+        double spot  = bars[i].close;
+        double sma20 = calcSMA(bars, i, 20);
+        double sma50 = calcSMA(bars, i, 50);
+        double rsi   = calcRSI(bars, i);
+        double hrv   = calcHRV(bars, i);
+        double iv    = hrv * 1.15;
+
+        Bias bias        = computeBias(spot, sma20, sma50, rsi);
+        std::string strat = pickStrategy(bias, iv, hrv, cfg.profile, tier);
+
+        Trade t = simulateTrade(ticker, strat, bars, i, cfg, iv, hrv, rsi, max_bar_idx);
+        if (t.exit_reason != "INVALID") trades.push_back(t);
+    }
+    return trades;
+}
+
+struct WalkForwardFoldResult {
+    std::string ticker;
+    int    fold_index    = 0;
+    double chosen_profit  = 0.0;
+    double chosen_stop    = 0.0;
+    int    train_trades    = 0;
+    int    test_trades     = 0;
+    double test_pnl        = 0.0; // per-share; ×100 for dollars, same convention as Trade::pnl
+};
+
+struct WalkForwardReport {
+    std::vector<Trade> oos_trades; // out-of-sample trades ONLY — never train-window trades
+    std::vector<WalkForwardFoldResult> fold_results;
+};
+
+// Runs the walk-forward loop described at the top of this section: for each
+// fold, grid-search (profit_target, stop_loss) on the TRAIN window only (by
+// total train P&L — simple and transparent rather than a fancier objective
+// that would need its own justification), then apply that winning combo to
+// the immediately-following TEST window and keep only the test-window
+// trades. A trade opened near the end of the train or test window is allowed
+// to run to its natural DTE exit even if that reads bars past the window
+// boundary — same as a real position does not stop existing at an arbitrary
+// calendar cutoff; only the PARAMETER CHOICE is constrained to train-window
+// information, not the trade's own lifetime.
+WalkForwardReport runWalkForward(const BacktestConfig& cfg) {
+    std::string tier = "STARTER";
+    if      (cfg.initial_capital >= 75000.0) tier = "FREE_CAPITAL";
+    else if (cfg.initial_capital >= 30000.0) tier = "ADVANCED";
+    else if (cfg.initial_capital >= 5000.0)  tier = "STANDARD";
+
+    WalkForwardReport report;
+
+    for (const auto& ticker : cfg.watchlist) {
+        auto bars = fetchBars(ticker, cfg.range);
+        if (bars.size() < 55) {
+            std::cerr << "  Skipping " << ticker << " — too few bars (" << bars.size() << ")\n";
+            continue;
+        }
+
+        auto folds = generateFolds(bars.size(), cfg.wfo.train_days, cfg.wfo.test_days, cfg.wfo.step_days);
+        if (folds.empty()) {
+            std::cerr << "  Skipping " << ticker << " — not enough history for even one WFO fold "
+                      << "(need " << (cfg.wfo.train_days + cfg.wfo.test_days) << " bars, have "
+                      << bars.size() << ")\n";
+            continue;
+        }
+
+        for (size_t f = 0; f < folds.size(); ++f) {
+            const auto& fold = folds[f];
+
+            // Grid search on the TRAIN window only.
+            double best_profit = cfg.wfo.profit_grid.front();
+            double best_stop   = cfg.wfo.stop_grid.front();
+            double best_total_pnl = -1e18;
+            int    best_train_count = 0;
+
+            for (double p : cfg.wfo.profit_grid) {
+                for (double s : cfg.wfo.stop_grid) {
+                    BacktestConfig trial = cfg;
+                    trial.profit_target_pct = p;
+                    trial.stop_loss_mult    = s;
+                    // Cap at fold.train_end-1 (audit §3 H2): a trade opened near the
+                    // train window's end must not resolve using test-window bars, or
+                    // the grid search that picks (profit_target, stop_loss) from train
+                    // P&L would be partly informed by out-of-sample price action.
+                    auto train_trades = simulateSignalsInRange(bars, fold.train_start, fold.train_end,
+                                                               trial, ticker, tier, fold.train_end - 1);
+                    double total = 0.0;
+                    for (const auto& t : train_trades) total += t.pnl;
+                    if (total > best_total_pnl) {
+                        best_total_pnl  = total;
+                        best_profit      = p;
+                        best_stop        = s;
+                        best_train_count = static_cast<int>(train_trades.size());
+                    }
+                }
+            }
+
+            // Apply the winning train-window combo to the TEST window — this
+            // is the only part of each fold that ends up in the report.
+            BacktestConfig chosen = cfg;
+            chosen.profit_target_pct = best_profit;
+            chosen.stop_loss_mult    = best_stop;
+            auto test_trades = simulateSignalsInRange(bars, fold.test_start, fold.test_end,
+                                                      chosen, ticker, tier);
+
+            double test_pnl = 0.0;
+            for (const auto& t : test_trades) test_pnl += t.pnl;
+
+            report.fold_results.push_back({ticker, static_cast<int>(f), best_profit, best_stop,
+                                           best_train_count, static_cast<int>(test_trades.size()), test_pnl});
+            report.oos_trades.insert(report.oos_trades.end(), test_trades.begin(), test_trades.end());
+        }
+
+        std::cerr << "  " << ticker << ": " << folds.size() << " WFO fold(s)\n";
+    }
+
+    return report;
+}
+
+// ─── Fractional-Kelly equity-curve simulation ─────────────────────────────────
+//
+// Answers "can I backtest different Kelly rules": runs the SAME baseline
+// trade sequence through a single compounding equity curve, sizing each
+// trade via calculateKellyContracts() at a given kelly_fraction, so the
+// sweep_fractions in KellySizingConfig can be compared side by side on
+// ending equity / CAGR / max drawdown — exactly the fractional-Kelly
+// variance/growth trade-off (Half-Kelly vs quarter-Kelly, etc.).
+
+struct KellyEquityResult {
+    double kelly_fraction    = 0.0;
+    double starting_equity    = 0.0;
+    double ending_equity      = 0.0;
+    double cagr               = 0.0;
+    double max_drawdown_pct    = 0.0;
+    int    trades_sized        = 0;
+    int    trades_halted       = 0; // negative-Kelly / sub-1-contract — RULE-005
+};
+
+static long kellyDayNumber(const std::string& date) { return dateOrdinal(date); }
+
+KellyEquityResult simulateKellyEquityCurve(std::vector<Trade> trades, // sorted copy
+                                           const KellySizingConfig& kcfg,
+                                           double starting_equity,
+                                           double kelly_fraction) {
+    std::sort(trades.begin(), trades.end(), [](const Trade& a, const Trade& b) {
+        return a.entry_date < b.entry_date; // "YYYY-MM-DD" sorts lexicographically
+    });
+
+    KellyEquityResult r;
+    r.kelly_fraction  = kelly_fraction;
+    r.starting_equity = starting_equity;
+
+    double equity = starting_equity;
+    double peak = equity, max_dd_pct = 0.0;
+    RollingTradeStats stats(kcfg.rolling_window);
+
+    long first_day = trades.empty() ? 0 : kellyDayNumber(trades.front().entry_date);
+    long last_day  = first_day;
+
+    for (const auto& t : trades) {
+        double win_rate, wlr;
+        if (stats.count() >= kcfg.min_trades_for_stats) {
+            std::tie(win_rate, wlr) = stats.stats();
+            if (wlr <= 0.0) { win_rate = kcfg.seed_win_rate; wlr = kcfg.seed_win_loss_ratio; }
+        } else {
+            win_rate = kcfg.seed_win_rate;
+            wlr      = kcfg.seed_win_loss_ratio;
+        }
+
+        int contracts = calculateKellyContracts(equity, t.entry_price * 100.0,
+                                                 win_rate, wlr, kelly_fraction, kcfg.hard_cap);
+        if (contracts < 0) {
+            ++r.trades_halted;
+        } else {
+            ++r.trades_sized;
+            equity += t.pnl * 100.0 * contracts;
+            peak = std::max(peak, equity);
+            if (peak > 0.0) max_dd_pct = std::max(max_dd_pct, (peak - equity) / peak);
+        }
+
+        // Record the outcome AFTER sizing this trade — stats used to size a
+        // trade must never include that same trade's own result.
+        stats.record(t.pnl);
+        last_day = std::max(last_day, kellyDayNumber(t.exit_date));
+    }
+
+    r.ending_equity   = equity;
+    r.max_drawdown_pct = max_dd_pct;
+    double years = std::max(1.0 / 365.0, static_cast<double>(last_day - first_day) / 365.0);
+    r.cagr = (starting_equity > 0.0 && equity > 0.0)
+                 ? std::pow(equity / starting_equity, 1.0 / years) - 1.0
+                 : -1.0;
+    return r;
+}
+
+std::vector<KellyEquityResult> runKellySweep(const std::vector<Trade>& trades,
+                                             const KellySizingConfig& kcfg,
+                                             double starting_equity) {
+    std::vector<KellyEquityResult> results;
+    results.reserve(kcfg.sweep_fractions.size());
+    for (double frac : kcfg.sweep_fractions)
+        results.push_back(simulateKellyEquityCurve(trades, kcfg, starting_equity, frac));
+    return results;
+}
+
 // ─── Formatted report ─────────────────────────────────────────────────────────
 
 namespace {
@@ -640,6 +954,40 @@ std::string dollar(double v) {
 }
 
 std::string line(char c, int n) { return n > 0 ? std::string(n, c) : ""; }
+
+long approxDayNumber(const std::string& date) { return dateOrdinal(date); }
+
+// Sharpe ratio over the trade P&L series, annualized by the backtest's own
+// trade frequency (n trades / span in years) rather than a fixed 252 — a
+// weekly-scan backtest and a daily-scan backtest do not have the same
+// trades-per-year, and using 252 unconditionally would overstate Sharpe for
+// a low-frequency scan. This is a TRADE-level Sharpe (variance across
+// per-trade P&L), not a daily-return Sharpe — reported as such below.
+double tradeSharpe(const std::vector<Trade>& trades) {
+    size_t n = trades.size();
+    if (n < 2) return 0.0;
+
+    double mean = 0.0;
+    for (const auto& t : trades) mean += t.pnl;
+    mean /= static_cast<double>(n);
+
+    double var = 0.0;
+    for (const auto& t : trades) var += (t.pnl - mean) * (t.pnl - mean);
+    var /= static_cast<double>(n - 1);
+    double stdev = std::sqrt(var);
+    if (stdev < 1e-9) return 0.0;
+
+    long first = approxDayNumber(trades.front().entry_date);
+    long last  = approxDayNumber(trades.back().exit_date);
+    for (const auto& t : trades) {
+        first = std::min(first, approxDayNumber(t.entry_date));
+        last  = std::max(last,  approxDayNumber(t.exit_date));
+    }
+    double span_years = std::max(1.0 / 365.0, static_cast<double>(last - first) / 365.0);
+    double trades_per_year = static_cast<double>(n) / span_years;
+
+    return (mean / stdev) * std::sqrt(trades_per_year);
+}
 
 void printSection(const std::string& title) {
     int pad = 55 - 4 - static_cast<int>(title.size());
@@ -730,6 +1078,8 @@ void printReport(const std::vector<Trade>& trades, const BacktestConfig& cfg) {
               << std::setw(26) << "Avg P&L per trade" << ": $" << dollar(total_pnl * 100.0 / n) << "\n"
               << std::setw(26) << "Total P&L (1 ctr)" << ": $" << dollar(total_pnl * 100.0) << "\n"
               << std::setw(26) << "Max drawdown"      << ": $" << dollar(max_dd) << "\n"
+              << std::setw(26) << "Sharpe (trade-level)" << ": " << std::fixed << std::setprecision(2)
+              << tradeSharpe(trades) << "\n"
               << std::setw(26) << "Exit: profit target" << ": " << exit_profit
               << "  (" << pct(static_cast<double>(exit_profit) / n) << ")\n"
               << std::setw(26) << "Exit: stop loss"   << ": " << exit_loss
@@ -779,7 +1129,11 @@ void printReport(const std::vector<Trade>& trades, const BacktestConfig& cfg) {
     }
 
     printSection("Methodology");
-    std::cout << "  IV proxy   : HRV30 × 1.15 (no historical options chain available)\n"
+    std::cout << "  Sharpe     : TRADE-level (variance across per-trade P&L, annualized by\n"
+              << "               this backtest's own trades/year) — NOT a daily-return Sharpe.\n"
+              << "               Comparable across runs of this backtester only, not to a\n"
+              << "               live daily_ledger Sharpe (see heartbeat/alpha_decay_monitor.py).\n"
+              << "  IV proxy   : HRV30 × 1.15 (no historical options chain available)\n"
               << "  Pricing    : Black-Scholes European, re-priced daily at mark-to-model\n"
               << "  Fill model : NAIVE (this report) — every PROFIT_TARGET/STOP_LOSS touch\n"
               << "               fills at 100%, no slippage/commissions. Rerun with\n"
@@ -885,6 +1239,90 @@ void printErrorInjectionReport(const std::vector<Trade>& trades, const ErrorConf
     std::cout << "\n" << line('=', 62) << "\n\n";
 }
 
+// Compares several fractional-Kelly rules against the SAME baseline trade
+// sequence, each run through its own compounding equity curve — this is the
+// direct answer to "can I backtest different Kelly rules".
+void printKellySweepReport(const std::vector<KellyEquityResult>& sweep, const KellySizingConfig& kcfg) {
+    printSection("Fractional-Kelly Sweep (compounding equity curve per fraction)");
+    if (sweep.empty()) {
+        std::cout << "  No trades to size.\n" << line('=', 62) << "\n\n";
+        return;
+    }
+    std::cout << "  Rolling W/R window: " << kcfg.rolling_window << " trades  |  Hard cap: "
+              << pct(kcfg.hard_cap) << "  |  Seed W/R (cold start): "
+              << pct(kcfg.seed_win_rate) << " / " << kcfg.seed_win_loss_ratio << "\n\n";
+    std::cout << std::left
+              << std::setw(10) << "Fraction" << std::setw(16) << "Ending Equity"
+              << std::setw(10) << "CAGR" << std::setw(10) << "Max DD" << std::setw(8) << "Sized"
+              << "Halted\n";
+    std::cout << line('-', 62) << "\n";
+    for (const auto& r : sweep) {
+        std::ostringstream frac; frac << r.kelly_fraction << "x";
+        std::cout << std::left
+                  << std::setw(10) << frac.str()
+                  << std::setw(16) << ("$" + dollar(r.ending_equity))
+                  << std::setw(10) << pct(r.cagr)
+                  << std::setw(10) << pct(r.max_drawdown_pct)
+                  << std::setw(8)  << r.trades_sized
+                  << r.trades_halted << "\n";
+    }
+    std::cout << "\n  Halted = RULE-005: negative Kelly or sub-1-contract allocation, trade\n"
+              << "  skipped rather than forced. Higher fractions compound faster but with\n"
+              << "  deeper drawdowns — this is the actual variance/growth trade-off, not\n"
+              << "  a fixed multiplier applied after the fact.\n";
+    std::cout << "\n" << line('=', 62) << "\n\n";
+}
+
+// Reports ONLY the out-of-sample (test-window) performance across every WFO
+// fold — this is the honest number. A per-fold table shows which
+// (profit_target, stop_loss) combo won each train window, so a parameter
+// that keeps winning across folds (real signal) is visible from one that
+// flops fold to fold (overfit to that specific train window).
+void printWalkForwardReport(const WalkForwardReport& wfo, const BacktestConfig& cfg) {
+    printSection("Walk-Forward Optimization — Out-of-Sample Only");
+    if (wfo.fold_results.empty()) {
+        std::cout << "  No folds produced — need at least "
+                  << (cfg.wfo.train_days + cfg.wfo.test_days) << " bars of history per ticker.\n"
+                  << line('=', 62) << "\n\n";
+        return;
+    }
+    std::cout << "  Train: " << cfg.wfo.train_days << " bars | Test: " << cfg.wfo.test_days
+              << " bars | Step: " << cfg.wfo.step_days << " bars\n"
+              << "  Profit grid: ";
+    for (double p : cfg.wfo.profit_grid) std::cout << pct(p) << " ";
+    std::cout << " | Stop grid: ";
+    for (double s : cfg.wfo.stop_grid) std::cout << s << "x ";
+    std::cout << "\n\n";
+
+    std::cout << std::left
+              << std::setw(8)  << "Ticker" << std::setw(6) << "Fold" << std::setw(10) << "Profit*"
+              << std::setw(8)  << "Stop*"  << std::setw(8) << "Train"  << std::setw(8) << "Test"
+              << "Test P&L\n";
+    std::cout << line('-', 62) << "\n";
+    for (const auto& r : wfo.fold_results) {
+        std::cout << std::left
+                  << std::setw(8) << r.ticker << std::setw(6) << r.fold_index
+                  << std::setw(10) << pct(r.chosen_profit) << std::setw(8) << r.chosen_stop
+                  << std::setw(8) << r.train_trades << std::setw(8) << r.test_trades
+                  << "$" << dollar(r.test_pnl * 100.0) << "\n";
+    }
+
+    if (wfo.oos_trades.empty()) {
+        std::cout << "\n  No out-of-sample trades were generated by any fold.\n";
+    } else {
+        int n = static_cast<int>(wfo.oos_trades.size());
+        int wins = 0; double total = 0.0;
+        for (const auto& t : wfo.oos_trades) { if (t.pnl > 0.0) ++wins; total += t.pnl; }
+        std::cout << "\n  Aggregate out-of-sample: " << n << " trades | win rate "
+                  << pct(static_cast<double>(wins) / n) << " | total P&L $"
+                  << dollar(total * 100.0) << " | avg P&L $" << dollar(total * 100.0 / n) << "\n"
+                  << "\n  This is the number to trust over the single-run backtest above — every\n"
+                  << "  trade here was generated with parameters chosen from data STRICTLY\n"
+                  << "  before it, never from the window it was then graded on.\n";
+    }
+    std::cout << "\n" << line('=', 62) << "\n\n";
+}
+
 // ─── main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
@@ -901,6 +1339,8 @@ int main(int argc, char* argv[]) {
                 "  profit=0.50                exit at X% of max profit\n"
                 "  stop=2.0                   stop loss at X× debit paid\n"
                 "  capital=35000              starting capital (sets tier gate)\n"
+                "  haircutpct=0.05            bid-ask haircut at entry, fraction of premium (0=frictionless)\n"
+                "  commissionpercontract=0.65 flat $ commission per contract per leg at entry (0=none)\n"
                 "  profile=personal           use aggressive personal profile\n"
                 "  fillmodel=adverse_selection  also model asymmetric fills (see header)\n"
                 "  fillgamma=0.2              touch-fill liquidity scale factor\n"
@@ -911,6 +1351,18 @@ int main(int argc, char* argv[]) {
                 "  erradverserate=0.15        inject adverse-fill (slippage) errors\n"
                 "  errslippct=0.15            adverse-fill haircut, fraction of entry premium\n"
                 "  errseed=<n>                seed the error-injection RNG (deterministic)\n"
+                "  kelly=1                    size trades via fractional Kelly, sweep report\n"
+                "  kellysweep=0.1,0.25,0.5,1.0  fractions to compare (default shown)\n"
+                "  kellywindow=20             trailing closed trades used for causal W/R\n"
+                "  kellycap=0.10              hard cap on Kelly-adjusted risk per trade\n"
+                "  kellyseedwr=0.50           cold-start win rate before window fills\n"
+                "  kellyseedwlr=1.5           cold-start win/loss ratio before window fills\n"
+                "  wfo=1                      run walk-forward optimization instead of a static backtest\n"
+                "  wfotrain=252               train-window size in bars (~1 trading year)\n"
+                "  wfotest=63                 test-window size in bars (~1 quarter)\n"
+                "  wfostep=63                 slide increment between folds, in bars\n"
+                "  wfoprofitgrid=0.3,0.5,0.75   profit-target grid to search per fold\n"
+                "  wfostopgrid=1.5,2.0,3.0      stop-loss-multiple grid to search per fold\n"
                 "\nExample:\n"
                 "  nox_backtest watchlist=AAPL,NVDA range=2y capital=50000\n"
                 "  nox_backtest watchlist=AAPL range=2y fillmodel=adverse_selection\n";
@@ -933,6 +1385,8 @@ int main(int argc, char* argv[]) {
         else if (key == "profit")    { cfg.profit_target_pct    = std::stod(val); }
         else if (key == "stop")      { cfg.stop_loss_mult       = std::stod(val); }
         else if (key == "capital")   { cfg.initial_capital      = std::stod(val); }
+        else if (key == "haircutpct")             { cfg.bid_ask_haircut_pct     = std::stod(val); }
+        else if (key == "commissionpercontract")  { cfg.commission_per_contract = std::stod(val); }
         else if (key == "profile" && val == "personal") {
             cfg.profile = RiskProfile::personal();
         }
@@ -947,6 +1401,46 @@ int main(int argc, char* argv[]) {
         else if (key == "erradverserate"){ cfg.errors.adverse_fill_rate    = std::stod(val); }
         else if (key == "errslippct")    { cfg.errors.adverse_slippage_pct = std::stod(val); }
         else if (key == "errseed")       { cfg.errors.seed = static_cast<std::uint32_t>(std::stoul(val)); }
+        else if (key == "kelly")         { cfg.kelly.enabled = (val == "1" || val == "true"); }
+        else if (key == "kellysweep") {
+            std::vector<double> fractions;
+            std::istringstream ss(val);
+            std::string tok;
+            while (std::getline(ss, tok, ','))
+                if (!tok.empty()) fractions.push_back(std::stod(tok));
+            if (!fractions.empty()) cfg.kelly.sweep_fractions = fractions;
+        }
+        else if (key == "kellywindow")   { cfg.kelly.rolling_window       = std::stoi(val); }
+        else if (key == "kellycap")      { cfg.kelly.hard_cap             = std::stod(val); }
+        else if (key == "kellyseedwr")   { cfg.kelly.seed_win_rate        = std::stod(val); }
+        else if (key == "kellyseedwlr")  { cfg.kelly.seed_win_loss_ratio  = std::stod(val); }
+        else if (key == "wfo")           { cfg.wfo.enabled     = (val == "1" || val == "true"); }
+        else if (key == "wfotrain")      { cfg.wfo.train_days  = std::stoi(val); }
+        else if (key == "wfotest")       { cfg.wfo.test_days   = std::stoi(val); }
+        else if (key == "wfostep")       { cfg.wfo.step_days   = std::stoi(val); }
+        else if (key == "wfoprofitgrid") {
+            std::vector<double> grid;
+            std::istringstream ss(val);
+            std::string tok;
+            while (std::getline(ss, tok, ','))
+                if (!tok.empty()) grid.push_back(std::stod(tok));
+            if (!grid.empty()) cfg.wfo.profit_grid = grid;
+        }
+        else if (key == "wfostopgrid") {
+            std::vector<double> grid;
+            std::istringstream ss(val);
+            std::string tok;
+            while (std::getline(ss, tok, ','))
+                if (!tok.empty()) grid.push_back(std::stod(tok));
+            if (!grid.empty()) cfg.wfo.stop_grid = grid;
+        }
+    }
+
+    if (cfg.wfo.enabled) {
+        std::cerr << "\nFetching historical OHLCV (walk-forward)...\n";
+        auto wfo_report = runWalkForward(cfg);
+        printWalkForwardReport(wfo_report, cfg);
+        return 0;
     }
 
     std::cerr << "\nFetching historical OHLCV...\n";
@@ -964,5 +1458,14 @@ int main(int argc, char* argv[]) {
         std::cout << "  Error-injection resilience test available — rerun with e.g.\n"
                   << "  errghostrate=0.05 errmissedrate=0.10 erradverserate=0.15 to see\n"
                   << "  whether the strategy still profits through operational errors.\n\n";
+
+    if (cfg.kelly.enabled) {
+        auto sweep = runKellySweep(result.baseline, cfg.kelly, cfg.initial_capital);
+        printKellySweepReport(sweep, cfg.kelly);
+    } else {
+        std::cout << "  Fractional-Kelly sizing sweep available — rerun with kelly=1 to\n"
+                  << "  compare " << cfg.kelly.sweep_fractions.size() << " Kelly fractions on a "
+                  << "compounding equity curve.\n\n";
+    }
     return 0;
 }

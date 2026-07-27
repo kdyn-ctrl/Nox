@@ -1,0 +1,1 @@
+{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2025-11-07", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 400, "ticker": "O:NFLX251107P00400000", "underlying_ticker": "NFLX"}], "status": "OK", "request_id": "26736913988454b56ed03c11b4aeb166"}

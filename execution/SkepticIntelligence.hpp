@@ -11,7 +11,7 @@
 // america-data-engine and exposed on /macro/alt and /insider/clusters, but
 // NOTHING in execution consumed them — so the Skeptic "hadn't done anything"
 // beyond the weekend report. This header closes that gap, and adds the new
-// China information-lag feed (/lag/macro) as a first-class conviction input.
+// China information-lag feed (/china/lag) as a first-class conviction input.
 //
 // DESIGN: this file is PURE — no HTTP, no JSON, no I/O — the same testable
 // shape as PortfolioRiskManager.hpp. OptionsSignalGenerator does the network
@@ -51,7 +51,7 @@ struct AltMacroInput {
     bool text_contradicts_physical  = false;        // headline disagreed with the ships
 };
 
-// China information-lag verdict for this ticker (from /lag/macro). `fresh`
+// China information-lag verdict for this ticker (from /china/lag). `fresh`
 // means the driving macro release is still inside the lag window the US
 // session is presumed not to have fully priced yet — the actual edge.
 struct ChinaLagInput {
@@ -86,10 +86,17 @@ struct Knobs {
     // China lag: the information-lag edge. A fresh, unpriced release aligned
     // with the trade is the highest-conviction input here; opposed is the
     // strongest cut (we'd be trading into a move the tape hasn't shown yet).
+    // RULE-D5 (2026-07-17 audit burndown Track 3, H3): WS8's premise —
+    // surprise-vs-consensus direction and "unpriced by the US session" — is
+    // unmeasured (level-vs-50 only, no consensus figure; the WS7 media-lag
+    // proxy only matches BABA). Boost power stays OFF by default until that
+    // premise can be measured; the feed still logs every verdict either way.
     double china_align_boost     = 1.30;
     double china_fresh_extra     = 1.15; // extra factor when the release is still fresh
-    // At/under suppress_threshold by default so a FRESH (hard) opposition
-    // suppresses while a STALE one lands on the same cut but only sizes down.
+    bool   china_boost_enabled   = false;
+    // RULE-D4 (H2): a STALE release must never move sizing at all, boost or
+    // cut — only a `fresh` release (still inside the unpriced lag window) may
+    // touch `mult`. A stale-but-aligned/opposed verdict is logged only.
     double china_oppose_cut      = 0.50;
 
     // Combined clamp + suppression.
@@ -129,6 +136,7 @@ struct Knobs {
         k.altmacro_contradict_cut= envd("SKEPTIC_ALTMACRO_CONTRADICT_CUT",k.altmacro_contradict_cut);
         k.china_align_boost      = envd("SKEPTIC_CHINA_ALIGN_BOOST",      k.china_align_boost);
         k.china_fresh_extra      = envd("SKEPTIC_CHINA_FRESH_EXTRA",      k.china_fresh_extra);
+        k.china_boost_enabled    = envb("SKEPTIC_CHINA_BOOST_ENABLED",    k.china_boost_enabled);
         k.china_oppose_cut       = envd("SKEPTIC_CHINA_OPPOSE_CUT",       k.china_oppose_cut);
         k.size_mult_min          = envd("SKEPTIC_SIZE_MULT_MIN",          k.size_mult_min);
         k.size_mult_max          = envd("SKEPTIC_SIZE_MULT_MAX",          k.size_mult_max);
@@ -141,7 +149,7 @@ struct Knobs {
 struct Decision {
     double      size_mult = 1.0;
     bool        suppress  = false;
-    std::string reason;   // short slug (e.g. "skeptic_boost", "suppressed_skeptic")
+    std::string reason;   // short slug for signal_events (e.g. "skeptic_boost", "suppressed_skeptic")
     std::string detail;   // human-readable breakdown for the log/alert
 };
 
@@ -155,9 +163,9 @@ inline bool opposed(Dir signal, Dir feed) {
 } // namespace detail
 
 // Pure aggregation. `signal_dir` is the trade's directional bias
-// (STRADDLE/STRANGLE are non-directional → pass Neutral, which makes every
-// align/oppose test false so only the neutral-safe insider magnitude can
-// nudge sizing, never suppress).
+// (STRADDLE/STRANGLE/REVERSE_IRON_CONDOR are non-directional → pass Neutral,
+// which makes every align/oppose test false so only the neutral-safe insider
+// magnitude can nudge sizing, never suppress).
 inline Decision decide(Dir signal_dir, const Inputs& in, const Knobs& k) {
     Decision d;
     double mult = 1.0;
@@ -198,20 +206,28 @@ inline Decision decide(Dir signal_dir, const Inputs& in, const Knobs& k) {
     }
 
     // ── China information-lag ────────────────────────────────────────────────
+    // RULE-D4: a STALE release never touches `mult` (boost or cut) — only a
+    // FRESH one may. RULE-D5: the aligned/boost side additionally stays a
+    // logging-only no-op unless SKEPTIC_CHINA_BOOST_ENABLED=true, since WS8's
+    // "unpriced surprise" premise is unmeasured.
     if (in.china.applies && in.china.bias != Dir::Neutral) {
         if (detail::aligned(signal_dir, in.china.bias)) {
-            mult *= k.china_align_boost;
-            if (in.china.fresh) {
-                mult *= k.china_fresh_extra;
+            if (in.china.fresh && k.china_boost_enabled) {
+                mult *= k.china_align_boost * k.china_fresh_extra;
                 detail += "china_lag_aligned_FRESH(" + in.china.release + ")→boost; ";
             } else {
-                detail += "china_lag_aligned(" + in.china.release + ")→boost; ";
+                detail += "china_lag_aligned(" + in.china.release +
+                          (in.china.fresh ? ",FRESH" : ",STALE") +
+                          ")→logged_only(no_size_change); ";
             }
         } else if (detail::opposed(signal_dir, in.china.bias)) {
-            mult *= k.china_oppose_cut;
-            if (in.china.fresh) hard_opposition = true; // fresh unpriced move against us
-            detail += "china_lag_opposed(" + in.china.release +
-                      (in.china.fresh ? ",FRESH" : "") + ")→cut; ";
+            if (in.china.fresh) {
+                mult *= k.china_oppose_cut;
+                hard_opposition = true; // fresh unpriced move against us
+                detail += "china_lag_opposed_FRESH(" + in.china.release + ")→cut; ";
+            } else {
+                detail += "china_lag_opposed_STALE(" + in.china.release + ")→logged_only(no_size_change); ";
+            }
         }
     }
 

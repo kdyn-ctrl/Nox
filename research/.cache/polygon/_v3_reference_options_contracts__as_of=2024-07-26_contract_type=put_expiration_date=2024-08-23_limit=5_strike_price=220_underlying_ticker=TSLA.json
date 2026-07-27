@@ -1,0 +1,1 @@
+{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2024-08-23", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 220, "ticker": "O:TSLA240823P00220000", "underlying_ticker": "TSLA"}], "status": "OK", "request_id": "be26d42a1e3035e5ba6ce2c0731107c3"}

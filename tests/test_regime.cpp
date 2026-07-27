@@ -18,26 +18,33 @@ void assert_regime(Regime actual, Regime expected, const std::string& test_name)
 int main() {
     std::cout << "Running tests for RegimeStateMachine::evaluate()..." << std::endl;
 
+    // Pin the env-sourced thresholds to their live defaults so this test asserts
+    // what actually executes (2nd-pass audit A3: the test had frozen at 35/0.98
+    // while the code moved to 30/0.95, leaving a money-gating module permanently
+    // red and un-covered). unset → RegimeStateMachine::evaluate() uses 30.0/0.95.
+    unsetenv("REGIME_VIX_THRESHOLD");
+    unsetenv("REGIME_SMA_BUFFER_PCT");
+
     RegimeStateMachine rsm;
 
     // Test parameters: vix, spy_price, spy_200_sma
-    // Rules: RISK_OFF if VIX >= 35 OR SPY < SMA*0.98
-    //        RISK_ON if SPY > SMA (and VIX < 35)
-    //        TRANSITION otherwise
+    // Live rules (defaults): RISK_OFF if VIX >= 30 OR SPY < SMA*0.95
+    //                        RISK_ON if SPY > SMA (and VIX < 30)
+    //                        TRANSITION otherwise
 
     // Group 1: RISK_ON (VIX low, SPY above SMA)
     assert_regime(rsm.evaluate(15.0, 450.0, 440.0).current_regime, Regime::RISK_ON, "RISK_ON: Core Case");
     assert_regime(rsm.evaluate(15.0, 440.01, 440.0).current_regime, Regime::RISK_ON, "RISK_ON: Edge - SPY just above SMA");
-    assert_regime(rsm.evaluate(34.99, 450.0, 440.0).current_regime, Regime::RISK_ON, "RISK_ON: Edge - VIX just below threshold");
+    assert_regime(rsm.evaluate(29.99, 450.0, 440.0).current_regime, Regime::RISK_ON, "RISK_ON: Edge - VIX just below threshold");
 
-    // Group 2: RISK_OFF (VIX high OR SPY below SMA buffer)
+    // Group 2: RISK_OFF (VIX high OR SPY below SMA buffer). 440*0.95 = 418.
     assert_regime(rsm.evaluate(35.0, 430.0, 440.0).current_regime, Regime::RISK_OFF, "RISK_OFF: Core Case");
-    assert_regime(rsm.evaluate(15.0, 430.0, 440.0).current_regime, Regime::RISK_OFF, "RISK_OFF: SPY below SMA*0.98");
-    assert_regime(rsm.evaluate(35.0, 450.0, 440.0).current_regime, Regime::RISK_OFF, "RISK_OFF: VIX at threshold");
+    assert_regime(rsm.evaluate(15.0, 415.0, 440.0).current_regime, Regime::RISK_OFF, "RISK_OFF: SPY below SMA*0.95");
+    assert_regime(rsm.evaluate(30.0, 450.0, 440.0).current_regime, Regime::RISK_OFF, "RISK_OFF: VIX at threshold");
 
-    // Group 3: TRANSITION (SPY at or below SMA but above SMA*0.98, VIX low)
+    // Group 3: TRANSITION (SPY at or below SMA but above SMA*0.95, VIX low)
     assert_regime(rsm.evaluate(15.0, 440.0, 440.0).current_regime, Regime::TRANSITION, "TRANSITION: SPY equals SMA");
-    assert_regime(rsm.evaluate(15.0, 439.99, 440.0).current_regime, Regime::TRANSITION, "TRANSITION: SPY between SMA and SMA*0.98");
+    assert_regime(rsm.evaluate(15.0, 439.99, 440.0).current_regime, Regime::TRANSITION, "TRANSITION: SPY between SMA and SMA*0.95");
 
     // Group 4: EXTREME CASES
     assert_regime(rsm.evaluate(0.0, 0.0, 0.0).current_regime, Regime::TRANSITION, "EXTREME: Zero Inputs - price == SMA");

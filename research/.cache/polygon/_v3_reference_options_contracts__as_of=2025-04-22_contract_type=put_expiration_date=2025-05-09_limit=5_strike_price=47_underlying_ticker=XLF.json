@@ -1,0 +1,1 @@
+{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2025-05-09", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 47, "ticker": "O:XLF250509P00047000", "underlying_ticker": "XLF"}], "status": "OK", "request_id": "0ddfe8b499313aef2d3d00d5f9ec29a0"}

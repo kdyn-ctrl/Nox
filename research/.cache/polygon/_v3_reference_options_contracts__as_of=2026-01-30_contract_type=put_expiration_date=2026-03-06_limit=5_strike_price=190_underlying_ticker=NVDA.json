@@ -1,0 +1,1 @@
+{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2026-03-06", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 190, "ticker": "O:NVDA260306P00190000", "underlying_ticker": "NVDA"}], "status": "OK", "request_id": "f0f0992ec5a81e502254fd11ead82c50"}

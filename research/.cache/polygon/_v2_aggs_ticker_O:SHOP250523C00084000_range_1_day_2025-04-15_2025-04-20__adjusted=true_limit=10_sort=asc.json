@@ -1,0 +1,1 @@
+{"ticker": "O:SHOP250523C00084000", "queryCount": 2, "resultsCount": 2, "adjusted": true, "results": [{"v": 7, "vw": 7.9129, "o": 8.14, "c": 7.7, "h": 8.75, "l": 7.7, "t": 1744776000000, "n": 3}, {"v": 5, "vw": 7.96, "o": 7.9, "c": 8.2, "h": 8.2, "l": 7.9, "t": 1744862400000, "n": 3}], "status": "OK", "request_id": "5762ea83b533a52853fd952d7d8242aa", "count": 2}

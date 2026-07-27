@@ -1,0 +1,1 @@
+{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2021-10-15", "primary_exchange": "XASE", "shares_per_contract": 100, "strike_price": 22, "ticker": "O:META211015P00022000", "underlying_ticker": "META"}], "status": "OK", "request_id": "ab380dbb2c95bef90aeea7339f3eac07"}

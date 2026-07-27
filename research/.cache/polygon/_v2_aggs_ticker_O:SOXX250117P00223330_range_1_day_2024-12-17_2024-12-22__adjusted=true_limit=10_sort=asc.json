@@ -1,0 +1,1 @@
+{"ticker": "O:SOXX250117P00223330", "queryCount": 2, "resultsCount": 2, "adjusted": true, "results": [{"v": 10, "vw": 6.52, "o": 5.84, "c": 7.2, "h": 7.2, "l": 5.84, "t": 1734498000000, "n": 2}, {"v": 1, "vw": 11.36, "o": 11.36, "c": 11.36, "h": 11.36, "l": 11.36, "t": 1734670800000, "n": 1}], "status": "OK", "request_id": "4d1a7ce173bbdf87b92fbf97afdf1fac", "count": 2}

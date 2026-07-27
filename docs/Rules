@@ -97,7 +97,7 @@
     1. SEC Radar       — Poll EDGAR every 30 seconds for new 8-K filings matching the
                          active watchlist. On match, route filing text through the Claude
                          AI risk analysis pipeline and push a structured alert to Telegram.
-    2. Daily Scout     — At 11:30 AM ET each trading day, aggregate macro news headlines
+    2. Daily Scout     — At 9:00 AM ET (pre-market) each trading day, aggregate macro news headlines
                          (Alpaca News API) and targeted SEC filings into a Claude-generated
                          daily intelligence report, delivered to the Telegram channel.
     3. Conversational Agent — Maintain a persistent Telegram bot interface that allows

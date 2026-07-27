@@ -1,0 +1,1 @@
+{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2023-11-17", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 77, "ticker": "O:COIN231117P00077000", "underlying_ticker": "COIN"}], "status": "OK", "request_id": "e086e77d560ae33bd0314b4d103d27f4"}

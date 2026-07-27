@@ -15,12 +15,16 @@ struct OptionsSignal {
     std::string underlying;
     std::string strategy;       // LONG_CALL / LONG_PUT / CSP / CC /
                                 // BULL_CALL_SPREAD / BEAR_PUT_SPREAD /
-                                // STRADDLE / STRANGLE /
+                                // STRADDLE / STRANGLE / REVERSE_IRON_CONDOR /
                                 // LEAP_CALL / LEAP_PUT
     std::string expiry_date;    // "YYYY-MM-DD"
-    double strike       = 0.0; // primary leg
+    double strike       = 0.0; // primary leg (long call for REVERSE_IRON_CONDOR)
     double strike2      = 0.0; // second leg (spreads/straddles); 0 = single-leg
+                                // (short call, far OTM, for REVERSE_IRON_CONDOR)
+    double strike3       = 0.0; // 4-leg strategies only (long put, near ATM)
+    double strike4       = 0.0; // 4-leg strategies only (short put, far OTM)
     nox::options::OptionType option_type = nox::options::OptionType::Call;
+    int    contracts    = 0;   // actual sized quantity — 0 means "abort, don't execute"
     double entry_price  = 0.0; // BS theoretical mid
     double max_risk     = 0.0; // max dollar loss (position-sized)
     double max_reward   = 0.0; // max dollar gain
@@ -38,7 +42,7 @@ struct OptionsSignal {
     double allocated_capital = 0.0;
     std::string profile_name; // "PERSONAL" or "BOT" — for Telegram labelling
 
-    // Sector/trend gate (advisory-suppress, mirrors the RISK_OFF regime gate)
+    // Sector/trend gate (advisory-suppress, mirrors the VIX term-structure gate)
     bool sector_conflict = false; // true if bias opposes the ticker's sector-ETF trend
     std::string sector_etf;       // e.g. "XLK" — empty if ticker has no sector mapping
 };
@@ -84,7 +88,6 @@ struct RiskProfile {
 
     // ── Execution config (set per-instance, not preset) ─────────────────────
     bool   auto_execute          = false;
-    int    qty_contracts         = 1;
     double free_capital_amount   = 0.0;
     std::vector<std::string> watchlist;
     int    scan_interval_minutes = 30;

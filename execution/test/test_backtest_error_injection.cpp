@@ -7,7 +7,6 @@
 #include "../BacktestErrorModel.hpp"
 
 #include <cmath>
-#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -16,8 +15,8 @@ using namespace nox::backtest;
 
 static int g_failures = 0;
 #define CHECK(cond, msg) do { \
-    if (!(cond)) { std::cout << "  \xE2\x9C\x97 FAIL: " << (msg) << "\n"; ++g_failures; } \
-    else         { std::cout << "  \xE2\x9C\x93 " << (msg) << "\n"; } \
+    if (!(cond)) { std::cout << "  ✗ FAIL: " << (msg) << "\n"; ++g_failures; } \
+    else         { std::cout << "  ✓ " << (msg) << "\n"; } \
 } while (0)
 
 static bool approx(double a, double b) { return std::abs(a - b) < 1e-6; }
@@ -33,7 +32,7 @@ static std::vector<TradeView> sampleTrades() {
 }
 
 static void test_no_errors_is_identity() {
-    std::cout << "\n[noop] zero rates -> baseline unchanged\n";
+    std::cout << "\n[noop] zero rates → baseline unchanged\n";
     auto trades = sampleTrades();
     ErrorConfig cfg; // all rates 0
     CHECK(!cfg.active(), "a zero-rate config is inactive");
@@ -53,9 +52,9 @@ static void test_missed_exit_uses_expiry_counterfactual() {
     cfg.missed_exit_rate = 1.0; // every early exit is missed
     cfg.seed = 7;
     auto impact = applyErrors(trades, cfg);
-    // Trade 0: winner 0.50 -> held-to-expiry -0.20 (a real reversal).
+    // Trade 0: winner 0.50 → held-to-expiry -0.20 (a real reversal).
     CHECK(approx(impact.injected_pnls[0], -0.20), "missed profit-target rides to a -0.20 expiry");
-    // Trade 2 already EXPIRY -> untouched even at rate 1.0.
+    // Trade 2 already EXPIRY → untouched even at rate 1.0.
     CHECK(approx(impact.injected_pnls[2], 1.20), "an EXPIRY trade is never 'missed'");
     CHECK(impact.missed_exits == 3, "all three early-exit trades are flagged missed");
 }
@@ -88,7 +87,7 @@ static void test_ghost_fill_doubles() {
 }
 
 static void test_determinism_same_seed() {
-    std::cout << "\n[determinism] same seed -> identical injection\n";
+    std::cout << "\n[determinism] same seed → identical injection\n";
     auto trades = sampleTrades();
     ErrorConfig cfg;
     cfg.ghost_fill_rate = 0.5; cfg.missed_exit_rate = 0.5; cfg.adverse_fill_rate = 0.5;
@@ -102,7 +101,7 @@ static void test_determinism_same_seed() {
 }
 
 static void test_different_seed_differs() {
-    std::cout << "\n[determinism] different seed -> (generally) different injection\n";
+    std::cout << "\n[determinism] different seed → (generally) different injection\n";
     auto trades = sampleTrades();
     ErrorConfig cfg;
     cfg.ghost_fill_rate = 0.5; cfg.missed_exit_rate = 0.5; cfg.adverse_fill_rate = 0.5;
@@ -175,7 +174,7 @@ int main() {
     test_env_config();
 
     std::cout << "\n";
-    if (g_failures == 0) { std::cout << "All error-injection tests passed.\n"; return 0; }
-    std::cout << g_failures << " error-injection test(s) failed.\n";
+    if (g_failures == 0) { std::cout << "✅ All error-injection tests passed.\n"; return 0; }
+    std::cout << "❌ " << g_failures << " error-injection test(s) failed.\n";
     return 1;
 }

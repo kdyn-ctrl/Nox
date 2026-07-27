@@ -1,0 +1,1 @@
+{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2022-02-14", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 214, "ticker": "O:IWM220214P00214000", "underlying_ticker": "IWM"}], "status": "OK", "request_id": "ffc43aa9b4db6fc55caf186a0454b05e"}

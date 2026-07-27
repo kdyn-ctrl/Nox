@@ -17,6 +17,22 @@ This document captures the reasoning behind Nox's architecture, what the backtes
 
 ---
 
+## Top 3 Architectural Trade-offs in C++
+
+1. **Concurrency: Mutex-Guarded State vs. Lock-Free Queues**
+   In the `OrderLedger` (which tracks execution state and position updates), I opted for standard `std::mutex` and `std::atomic` flags rather than building custom lock-free data structures.
+   *Trade-off:* We incur slightly higher latency on state updates (microseconds instead of nanoseconds), but vastly improve correctness. In options trading, "ghost fills" (double-entry bugs due to memory ordering issues) are exponentially more expensive than a 1ms delay.
+
+2. **Memory Layout: Pre-allocated Buffers vs. Dynamic Allocation**
+   The execution core relies on standard containers (`std::vector`, `std::unordered_map`) but minimizes dynamic heap allocation during the critical path by sizing upfront where possible. 
+   *Trade-off:* We accept some memory overhead and copy semantics in exchange for deterministic execution times and preventing unexpected GC-like pauses from the OS allocator during market hours.
+
+3. **Math: Precision vs. Performance in the Black-Scholes Engine**
+   The pricing engine uses double-precision floats (`double`) and standard math library functions (like `std::erfc` for the normal CDF) rather than fast-math approximations or lookup tables.
+   *Trade-off:* We sacrifice raw CPU throughput for numerical stability. When calculating Gamma for short-dated options near the money, small floating-point errors compound disastrously; accurate Greeks are non-negotiable.
+
+---
+
 ## Architecture: Dual Profiles + Regime Gating
 
 **Why two profiles?**

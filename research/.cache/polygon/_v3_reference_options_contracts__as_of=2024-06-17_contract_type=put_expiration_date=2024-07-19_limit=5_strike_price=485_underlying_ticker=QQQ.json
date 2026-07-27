@@ -1,0 +1,1 @@
+{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2024-07-19", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 485, "ticker": "O:QQQ240719P00485000", "underlying_ticker": "QQQ"}], "status": "OK", "request_id": "1b04afa713e6d2b7a9ffc6b3a4b7cea9"}

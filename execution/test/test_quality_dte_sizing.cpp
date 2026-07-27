@@ -1,20 +1,14 @@
 // Verifies the quality-driven DTE selection and DTE/quality-tiered sizing
 // added on top of buildContractParams()/assembleSignal(): a low-conviction
 // setup on a theta-sensitive long-premium strategy gets pushed to a longer
-// DTE floor (the AAPL scenario this was built to prevent — a short-DTE OTM
-// debit spread with no momentum behind it), a high-conviction setup is
-// allowed to relax the DTE, CSP/CC are untouched by any of this, and sizing
-// composes a quality multiplier plus a hard short-DTE risk ceiling on top of
-// the existing capital-tier budget.
+// DTE floor (the AAPL scenario this was built to prevent — a 7-DTE OTM debit
+// spread with no momentum behind it), a high-conviction setup is allowed to
+// relax toward the existing global DTE floor, CSP/CC are untouched by any of
+// this, and sizing composes a quality multiplier plus a hard short-DTE risk
+// ceiling on top of the existing capital-tier budget.
 //
-// buildContractParams()/assembleSignal() are private members, reached via a
-// NOX_UNIT_TEST-gated friend struct (see OptionsSignalGenerator.hpp's
-// `#ifdef NOX_UNIT_TEST friend struct NoxUnitTestAccess;` declaration).
-//
-// Note: this codebase's main branch has no MIN_DTE_FLOOR / macro-DTE-override
-// infrastructure (that's private-only), so unlike the original private test
-// this file does not assert a floor beneath the quality-relax path — only
-// the quality-driven behavior actually ported here.
+// These are private members, reached via the same NOX_UNIT_TEST-gated friend
+// pattern used throughout execution/test/ (see test_dte_earnings_fix.cpp).
 
 #include "../httplib.h"
 
@@ -24,7 +18,6 @@
 #include "../OptionsSignalGenerator.hpp"
 
 #include <cassert>
-#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -35,13 +28,14 @@ using nox::options_signal::OptionsSignal;
 using nox::options_signal::UnderlyingData;
 
 struct NoxUnitTestAccess {
-    using ContractParams = OptionsSignalGenerator::ContractParams;
+    using ContractParams  = OptionsSignalGenerator::ContractParams;
 
     static ContractParams buildContractParams(const OptionsSignalGenerator& gen,
                                                const std::string& strategy,
                                                double spot, double atr, double rfr,
-                                               double iv_sigma, double quality_score) {
-        return gen.buildContractParams(strategy, spot, atr, rfr, iv_sigma, quality_score);
+                                               double iv_sigma, double hrv30,
+                                               double quality_score) {
+        return gen.buildContractParams(strategy, spot, atr, rfr, iv_sigma, hrv30, quality_score);
     }
 
     static OptionsSignal assembleSignal(const OptionsSignalGenerator& gen,
@@ -61,8 +55,8 @@ using ContractParams = NoxUnitTestAccess::ContractParams;
 
 static int g_failures = 0;
 #define CHECK(cond, msg) do { \
-    if (!(cond)) { std::cout << "  \xE2\x9C\x97 FAIL: " << (msg) << "\n"; ++g_failures; } \
-    else         { std::cout << "  \xE2\x9C\x93 " << (msg) << "\n"; } \
+    if (!(cond)) { std::cout << "  ✗ FAIL: " << (msg) << "\n"; ++g_failures; } \
+    else         { std::cout << "  ✓ " << (msg) << "\n"; } \
 } while (0)
 
 static RiskProfile makeProfile() {
@@ -77,13 +71,16 @@ static int resolvedDte(const ContractParams& cp) {
 
 static UnderlyingData makeUnderlying() {
     UnderlyingData d;
-    d.price  = 150.0;
-    d.sma20  = 145.0;
-    d.sma50  = 140.0;
-    d.rsi14  = 55.0;
-    d.atr14  = 3.0;
-    d.hrv30  = 0.20;
-    d.valid  = true;
+    d.price     = 150.0;
+    d.sma20     = 145.0;
+    d.sma50     = 140.0;
+    d.rsi14     = 55.0;
+    d.atr14     = 3.0;
+    d.hrv30     = 0.20;
+    d.vol20_avg = 2'000'000.0;
+    d.vol_ratio = 1.1;
+    d.macd_hist = 0.5;
+    d.valid     = true;
     return d;
 }
 
@@ -92,52 +89,62 @@ int main() {
     OptionsSignalGenerator gen("http://127.0.0.1:1", "k", "s", "", "", makeProfile());
 
     // ── 1. Low-quality debit spread gets pushed to the low-quality DTE floor,
-    //      recreating and fixing the AAPL scenario (short-DTE OTM debit spread
-    //      on a weak setup) ──────────────────────────────────────────────────
+    //      recreating and fixing the AAPL scenario (7-DTE OTM debit spread on
+    //      a weak setup) ──────────────────────────────────────────────────
     {
         RiskProfile p = makeProfile();
         p.dte_spread = 7; // mirrors the original AAPL trade's short target
         OptionsSignalGenerator gen_short("http://127.0.0.1:1", "k", "s", "", "", p);
         auto cp = NoxUnitTestAccess::buildContractParams(
-            gen_short, "BULL_CALL_SPREAD", 150.0, 3.0, 0.05, 0.30, /*quality*/0.10);
+            gen_short, "BULL_CALL_SPREAD", 150.0, 3.0, 0.05, 0.30, 0.20, /*quality*/0.10);
         CHECK(resolvedDte(cp) == 21,
               "low-quality BULL_CALL_SPREAD pushed to QUALITY_DTE_LOW_FLOOR_DAYS (21), got " +
               std::to_string(resolvedDte(cp)));
     }
 
-    // ── 2. High-quality relaxes DTE; mid-band leaves the profile default alone ──
+    // ── 2. High-quality relaxes toward (never below) the global floor ─────
     {
         auto cp_high = NoxUnitTestAccess::buildContractParams(
-            gen, "BULL_CALL_SPREAD", 150.0, 3.0, 0.05, 0.30, /*quality*/0.90);
+            gen, "BULL_CALL_SPREAD", 150.0, 3.0, 0.05, 0.30, 0.20, /*quality*/0.90);
         CHECK(resolvedDte(cp_high) == 22,
               "high-quality BULL_CALL_SPREAD relaxes to ~22 DTE (45*(1-0.5)), got " +
               std::to_string(resolvedDte(cp_high)));
 
         auto cp_mid = NoxUnitTestAccess::buildContractParams(
-            gen, "BULL_CALL_SPREAD", 150.0, 3.0, 0.05, 0.30, /*quality*/0.40);
+            gen, "BULL_CALL_SPREAD", 150.0, 3.0, 0.05, 0.30, 0.20, /*quality*/0.40);
         CHECK(resolvedDte(cp_mid) == 45,
               "mid-band quality leaves profile default (45) unchanged, got " +
               std::to_string(resolvedDte(cp_mid)));
     }
 
-    // ── 3. Strategy scoping: CSP/CC never get the low-quality push ────────
+    // ── 3. MIN_DTE_FLOOR always wins, even under aggressive high-quality relax ──
+    {
+        setenv("MIN_DTE_FLOOR", "30", 1);
+        auto cp = NoxUnitTestAccess::buildContractParams(
+            gen, "BULL_CALL_SPREAD", 150.0, 3.0, 0.05, 0.30, 0.20, /*quality*/0.99);
+        unsetenv("MIN_DTE_FLOOR");
+        CHECK(resolvedDte(cp) == 30,
+              "MIN_DTE_FLOOR=30 overrides high-quality relax, got " +
+              std::to_string(resolvedDte(cp)));
+    }
+
+    // ── 4. Strategy scoping: CSP/CC never get the low-quality push ────────
     {
         RiskProfile p = makeProfile();
         p.dte_income = 5;
         OptionsSignalGenerator gen_income("http://127.0.0.1:1", "k", "s", "", "", p);
         auto cp = NoxUnitTestAccess::buildContractParams(
-            gen_income, "CSP", 150.0, 3.0, 0.05, 0.30, /*quality*/0.05);
-        CHECK(resolvedDte(cp) == 5,
-              "CSP with low quality stays at the profile's dte_income (5) — "
-              "quality-driven DTE is scoped to theta-sensitive long strategies only, got " +
-              std::to_string(resolvedDte(cp)));
+            gen_income, "CSP", 150.0, 3.0, 0.05, 0.30, 0.20, /*quality*/0.05);
+        CHECK(resolvedDte(cp) == 7,
+              "CSP with low quality stays at the global MIN_DTE_FLOOR (7), not the "
+              "21-day low-quality floor — got " + std::to_string(resolvedDte(cp)));
     }
 
-    // ── 4. Sizing: quality multiplier scales contracts/max_risk when DTE is
+    // ── 5. Sizing: quality multiplier scales contracts/max_risk when DTE is
     //      long enough that the short-DTE ceiling doesn't apply ────────────
     {
         auto cp = NoxUnitTestAccess::buildContractParams(
-            gen, "LONG_CALL", 150.0, 3.0, 0.05, 0.25, /*quality*/0.50);
+            gen, "LONG_CALL", 150.0, 3.0, 0.05, 0.25, 0.20, /*quality*/0.50);
         CHECK(resolvedDte(cp) > 14, "sizing test fixture uses long enough DTE to skip the ceiling");
 
         UnderlyingData d = makeUnderlying();
@@ -160,14 +167,14 @@ int main() {
         }
     }
 
-    // ── 5. Hard short-DTE ceiling caps risk regardless of tier, with partial
+    // ── 6. Hard short-DTE ceiling caps risk regardless of tier, with partial
     //      quality relax — both must stay within their respective ceilings ──
     {
         RiskProfile p = makeProfile();
         p.dte_spread = 10; // short — triggers SHORT_DTE_THRESHOLD_DAYS (14) ceiling
         OptionsSignalGenerator gen_short("http://127.0.0.1:1", "k", "s", "", "", p);
         auto cp = NoxUnitTestAccess::buildContractParams(
-            gen_short, "BULL_CALL_SPREAD", 150.0, 3.0, 0.05, 0.30, /*quality*/0.40);
+            gen_short, "BULL_CALL_SPREAD", 150.0, 3.0, 0.05, 0.30, 0.20, /*quality*/0.40);
         CHECK(resolvedDte(cp) <= 14, "fixture DTE is at/under the short-DTE threshold");
 
         // Capital large enough relative to per-contract cost that the ceiling
@@ -184,18 +191,18 @@ int main() {
         // Low quality: ceiling stays at the raw SHORT_DTE_RISK_PCT_CEILING (1%),
         // then the low-quality size multiplier (0.60) scales it down further.
         CHECK(sig_low.max_risk <= capital * 0.010 * 0.60 + 1e-6,
-              "low-quality short-DTE trade respects the 1% hard ceiling x 0.60 multiplier, max_risk=" +
+              "low-quality short-DTE trade respects the 1% hard ceiling × 0.60 multiplier, max_risk=" +
               std::to_string(sig_low.max_risk));
         // High quality: ceiling relaxes halfway toward the tier's own pct (2%
         // for ADVANCED) → effective ceiling 1.5%, then the 1.15 size multiplier.
         CHECK(sig_high.max_risk <= capital * 0.015 * 1.15 + 1e-6,
-              "high-quality short-DTE trade respects its relaxed ceiling x 1.15 multiplier, max_risk=" +
+              "high-quality short-DTE trade respects its relaxed ceiling × 1.15 multiplier, max_risk=" +
               std::to_string(sig_high.max_risk));
         CHECK(sig_high.max_risk > sig_low.max_risk,
               "high-quality short-DTE trade gets a larger (but still capped) budget than low-quality");
     }
 
-    // ── 6. Env fail-open: unsetting all new env vars must not crash and must
+    // ── 7. Env fail-open: unsetting all new env vars must not crash and must
     //      fall back to documented defaults ──────────────────────────────
     {
         unsetenv("QUALITY_DTE_HIGH_THRESHOLD");
@@ -208,15 +215,15 @@ int main() {
         unsetenv("SHORT_DTE_RISK_PCT_CEILING");
         unsetenv("SHORT_DTE_QUALITY_CEILING_RELAX");
         auto cp = NoxUnitTestAccess::buildContractParams(
-            gen, "LONG_CALL", 150.0, 3.0, 0.05, 0.25, 0.5);
+            gen, "LONG_CALL", 150.0, 3.0, 0.05, 0.25, 0.20, 0.5);
         CHECK(cp.expiry > 0.0, "fail-open: buildContractParams still produces a valid expiry with no env set");
     }
 
     std::cout << "\n";
     if (g_failures == 0) {
-        std::cout << "All quality DTE/sizing tests passed.\n";
+        std::cout << "✅ All quality DTE/sizing tests passed.\n";
         return 0;
     }
-    std::cout << g_failures << " test(s) FAILED.\n";
+    std::cout << "❌ " << g_failures << " test(s) failed.\n";
     return 1;
 }

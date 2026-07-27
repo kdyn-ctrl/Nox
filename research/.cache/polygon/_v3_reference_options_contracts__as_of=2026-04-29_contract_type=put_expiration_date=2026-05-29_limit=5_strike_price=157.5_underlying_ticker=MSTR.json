@@ -1,0 +1,1 @@
+{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2026-05-29", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 157.5, "ticker": "O:MSTR260529P00157500", "underlying_ticker": "MSTR"}], "status": "OK", "request_id": "2d2a72f747f4b98aba3cdf5f5167aae6"}

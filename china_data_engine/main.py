@@ -99,8 +99,12 @@ def _refresh_cache() -> None:
     if news_cn:
         _CACHE["news_cn"] = news_cn
 
-    _CACHE["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
-    print(f"[INFO] [DATA-ENGINE] Scrape cycle complete. Cache updated at {_CACHE['last_updated']}.", flush=True)
+    if hot_board or pmi or lpr or news_cn:
+        _CACHE["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
+        print(f"[INFO] [DATA-ENGINE] Scrape cycle complete. Cache updated at {_CACHE['last_updated']}.", flush=True)
+    else:
+        print("[WARN] [DATA-ENGINE] Every scraper failed this cycle — last_updated NOT stamped "
+              f"(still {_CACHE['last_updated']}); freshness must reflect the last real success.", flush=True)
 
 
 # ---------------------------------------------------------------------------

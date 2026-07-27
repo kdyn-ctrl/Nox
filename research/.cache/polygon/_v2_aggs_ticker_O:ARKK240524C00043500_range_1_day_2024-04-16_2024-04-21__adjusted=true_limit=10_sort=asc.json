@@ -1,0 +1,1 @@
+{"ticker": "O:ARKK240524C00043500", "queryCount": 2, "resultsCount": 2, "adjusted": true, "results": [{"v": 107, "vw": 2.088, "o": 2.28, "c": 2.06, "h": 2.28, "l": 2.06, "t": 1713326400000, "n": 28}, {"v": 8, "vw": 1.6113, "o": 1.63, "c": 1.48, "h": 1.63, "l": 1.48, "t": 1713499200000, "n": 2}], "status": "OK", "request_id": "a7d4008834672d2ce669672e6aeabe13", "count": 2}

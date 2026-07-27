@@ -1,0 +1,1 @@
+{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2021-09-24", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 1670, "ticker": "O:GOOGL210924P01670000", "underlying_ticker": "GOOGL"}], "status": "OK", "request_id": "84053e4d672cbeadc88842fc20577e39"}

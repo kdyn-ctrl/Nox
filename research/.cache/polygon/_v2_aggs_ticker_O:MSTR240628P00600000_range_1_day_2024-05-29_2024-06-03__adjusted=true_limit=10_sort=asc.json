@@ -1,0 +1,1 @@
+{"ticker": "O:MSTR240628P00600000", "queryCount": 2, "resultsCount": 2, "adjusted": true, "results": [{"v": 6, "vw": 1.91, "o": 1.91, "c": 1.91, "h": 1.91, "l": 1.91, "t": 1717041600000, "n": 1}, {"v": 6, "vw": 1.4, "o": 1.4, "c": 1.4, "h": 1.4, "l": 1.4, "t": 1717128000000, "n": 2}], "status": "OK", "request_id": "84bb8d1a23d8ad8aec7f90957980a62c", "count": 2}

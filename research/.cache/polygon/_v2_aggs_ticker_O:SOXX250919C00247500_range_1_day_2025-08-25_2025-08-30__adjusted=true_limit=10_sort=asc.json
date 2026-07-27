@@ -1,0 +1,1 @@
+{"ticker": "O:SOXX250919C00247500", "queryCount": 2, "resultsCount": 2, "adjusted": true, "results": [{"v": 2, "vw": 8.9, "o": 8.9, "c": 8.9, "h": 8.9, "l": 8.9, "t": 1756353600000, "n": 2}, {"v": 1, "vw": 5.7, "o": 5.7, "c": 5.7, "h": 5.7, "l": 5.7, "t": 1756440000000, "n": 1}], "status": "OK", "request_id": "073fe7677b389ecb49e61e9c108d2906", "count": 2}

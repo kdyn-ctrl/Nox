@@ -18,6 +18,11 @@ from scrapers import fetch_form4_filings
 WINDOW_HOURS = int(os.getenv("INSIDER_CLUSTER_WINDOW_HOURS", "48"))
 MIN_EXECS = int(os.getenv("INSIDER_MIN_EXECS", "2"))
 BYPASS = os.getenv("INSIDER_CLUSTER_BYPASS", "false").lower() in ("true", "1", "yes")
+# RULE-D5/audit §6 H6: a cluster has no recency filter anywhere in the chain —
+# a years-old buy-cluster (as long as its own buys land within WINDOW_HOURS of
+# each other) re-emits every scan and boosts sizing as if it were current
+# conviction. Discard any cluster whose most recent buy is older than this.
+MAX_AGE_DAYS = int(os.getenv("INSIDER_CLUSTER_MAX_AGE_DAYS", "14"))
 
 
 def _parse_date(date_str: str):
@@ -60,6 +65,10 @@ def _find_cluster(buys: List[Dict[str, Any]]) -> Dict[str, Any]:
     Slide a WINDOW_HOURS window over buys (sorted by date) and find the window
     containing the most DISTINCT insiders. Returns the best cluster or {}.
     """
+    if len(buys) < MIN_EXECS:
+        return {}
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=MAX_AGE_DAYS)
+    buys = [b for b in buys if b["date"] >= cutoff]
     if len(buys) < MIN_EXECS:
         return {}
     buys = sorted(buys, key=lambda b: b["date"])

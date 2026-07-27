@@ -2,8 +2,9 @@
 // series, and sectorConflicts()'s truth table (bullish/bearish bias ×
 // sector uptrend/downtrend/neutral/invalid), including its fail-open
 // behavior on an unfetchable snapshot or a neutral bias. No network calls —
-// fetchSectorTrend() itself isn't exercised here: this project tests the
-// pure-math/decision layer, not live HTTP.
+// fetchSectorTrend() itself isn't exercised here (see fetchSpy()'s own tests,
+// or lack thereof, for precedent: this project tests the pure-math/decision
+// layer, not live HTTP).
 
 #include "../httplib.h"
 
@@ -36,8 +37,8 @@ using SectorSnapshot = NoxUnitTestAccess::SectorSnapshot;
 
 static int g_failures = 0;
 #define CHECK(cond, msg) do { \
-    if (!(cond)) { std::cout << "  \xE2\x9C\x97 FAIL: " << (msg) << "\n"; ++g_failures; } \
-    else         { std::cout << "  \xE2\x9C\x93 " << (msg) << "\n"; } \
+    if (!(cond)) { std::cout << "  ✗ FAIL: " << (msg) << "\n"; ++g_failures; } \
+    else         { std::cout << "  ✓ " << (msg) << "\n"; } \
 } while (0)
 
 int main() {
@@ -75,13 +76,13 @@ int main() {
         uptrend.price = 110.0; uptrend.ema_fast = 105.0; uptrend.ema_slow = 100.0; uptrend.valid = true;
 
         CHECK(NoxUnitTestAccess::sectorConflicts(DirectionalBias::Bullish, downtrend) == true,
-              "bullish bias + sector downtrend -> conflict");
+              "bullish bias + sector downtrend → conflict");
         CHECK(NoxUnitTestAccess::sectorConflicts(DirectionalBias::Bullish, uptrend) == false,
-              "bullish bias + sector uptrend -> no conflict");
+              "bullish bias + sector uptrend → no conflict");
         CHECK(NoxUnitTestAccess::sectorConflicts(DirectionalBias::Bearish, uptrend) == true,
-              "bearish bias + sector uptrend -> conflict");
+              "bearish bias + sector uptrend → conflict");
         CHECK(NoxUnitTestAccess::sectorConflicts(DirectionalBias::Bearish, downtrend) == false,
-              "bearish bias + sector downtrend -> no conflict");
+              "bearish bias + sector downtrend → no conflict");
         CHECK(NoxUnitTestAccess::sectorConflicts(DirectionalBias::Neutral, downtrend) == false,
               "neutral bias never conflicts — nothing directional to contradict");
         CHECK(NoxUnitTestAccess::sectorConflicts(DirectionalBias::Neutral, uptrend) == false,
@@ -100,9 +101,9 @@ int main() {
 
     std::cout << "\n";
     if (g_failures == 0) {
-        std::cout << "All sector/trend gate tests passed.\n";
+        std::cout << "✅ All sector/trend gate tests passed.\n";
         return 0;
     }
-    std::cout << g_failures << " test(s) FAILED.\n";
+    std::cout << "❌ " << g_failures << " test(s) failed.\n";
     return 1;
 }

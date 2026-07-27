@@ -3,10 +3,18 @@
 #include "nlohmann/json.hpp"
 #include "../shared/RegimeStateMachine.hpp"
 #include "../shared/TelegramNotifier.hpp"
+#include "../shared/TradingDayUtils.hpp"
 #include "OptionEngine.hpp"
 #include "EquitySignalGenerator.hpp"
 #include "OptionsSignalGenerator.hpp"
 #include "PositionManager.hpp"
+#include "OrderLedger.hpp"
+#include "IvRankStore.hpp"
+#include "AlphaDecayStore.hpp"
+#include "KillSwitchStore.hpp"
+#include "MassiveFuturesClient.hpp"
+#include "FuturesSignalStore.hpp"
+#include "FuturesSignalGenerator.hpp"
 #include <atomic>
 #include <condition_variable>
 #include <csignal>
@@ -158,6 +166,7 @@ private:
     int         cnBoardLotSize;   // CN-RULE-001: configurable via CN_BOARD_LOT_SIZE (default 1)
     std::string cnPositionsPath;  // path for T+1 persistence file
     std::string equityPositionsPath_; // path for equity trailing-stop tracking persistence
+    std::string memory_bank_path;     // path for options position tracking and trade ledger
     RegimeStateMachine regimeMachine;
     std::string last_analyst_report_time;
 
@@ -167,9 +176,31 @@ private:
     // Position Manager (for options)
     std::unique_ptr<PositionManager> positionManager_;
 
+    // Phase 1 ghost-fill infrastructure: the client-order-ID ledger (shared by
+    // both options threads and the equity path) + the reconciliation throttle.
+    std::unique_ptr<nox::execution::OrderLedger> orderLedger_;
+    std::unique_ptr<nox::execution::IvRankStore> ivRankStore_;
+    std::unique_ptr<nox::execution::AlphaDecayStore> alphaDecayStore_;
+    std::shared_ptr<nox::execution::FuturesSignalStore> futuresSignalStore_;
+    std::shared_ptr<nox::options_router::OptionsOrderRouter> optionsOrderRouter_; // for reconciliation lookups
+    static constexpr int RECON_COOLDOWN_SECONDS = 30; // min gap between reconcile polls
+    static constexpr int RECON_GRACE_SECONDS    = 75; // wait before declaring a 404 order 'failed'
+
+    // Global kill switch: persisted halt on ALL new-entry order submission
+    // (equity + options), triggered by /pause (operator, via Telegram ->
+    // monitor.py -> POST /pause) or automatically by check_daily_loss_limit().
+    // Existing positions are never touched — only new entries are blocked.
+    std::unique_ptr<nox::execution::KillSwitchStore> killSwitch_;
+    std::atomic<long> lastKillSwitchCheck_{0};
+    static constexpr int KILL_SWITCH_CHECK_COOLDOWN_SECONDS = 60;
+    // Fake-safe default: -$1500/day. Real value should be tuned to the
+    // account's actual risk tolerance via MAX_DAILY_LOSS_DOLLARS.
+    double maxDailyLossDollars_ = -1500.0;
+
     // Options signal scanner profiles (configured from env vars in the constructor)
     nox::options_signal::RiskProfile optionsBotProfile_;
     nox::options_signal::RiskProfile optionsPersonalProfile_;
+    nox::options_signal::RiskProfile optionsBreakoutProfile_;
 
     // Equity signal scanner config (independent of Skeptic)
     std::vector<std::string> equityWatchlist_;
@@ -177,6 +208,15 @@ private:
     int    equityMaxSignals_          = 2;
     bool   equityScanEnabled_         = true;
     bool   equityBypassHours_         = false;
+
+    // Futures signal scanner config — CLAUDE.md futures phase 1: signals only,
+    // no order routing. Default OFF (unlike equity's default-on) since it
+    // needs a paid Massive Futures API key the user opts into separately.
+    std::vector<std::string> futuresWatchlist_;
+    int    futuresScanIntervalMinutes_ = 60;
+    double futuresAlertThreshold_      = 0.5;
+    bool   futuresScanEnabled_         = false;
+    std::string massiveApiKey_;
 
     // ── Rule-based equity exit config ─────────────────────────────────────────
     // Evaluated by the trailing-stop monitor thread on each 5-min cycle for every
@@ -229,6 +269,17 @@ private:
     std::mutex                 signal_log_mutex_;
     static constexpr std::size_t SIGNAL_LOG_MAX = 50;
 
+    // ── Order idempotency cache (prevent duplicate orders from retried signals) ──
+    // Maps idempotency key (hash of ticker+action+price) to timestamp of last order
+    // placed. If same signal received within IDEMPOTENCY_WINDOW_SECONDS, reject it.
+    struct IdempotencyCacheEntry {
+        std::chrono::system_clock::time_point last_seen;
+        std::string order_id;
+    };
+    std::unordered_map<std::string, IdempotencyCacheEntry> idempotency_cache_;
+    std::mutex idempotency_cache_mutex_;
+    static constexpr int IDEMPOTENCY_WINDOW_SECONDS = 300; // 5 minute window
+
     void record_signal(const TradeSignal& s) {
         auto now    = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
@@ -239,6 +290,53 @@ private:
         signal_log_.push_back({ts.str(), s.ticker, s.action, s.price, s.rsi, s.vix, s.source});
         if (signal_log_.size() > SIGNAL_LOG_MAX)
             signal_log_.pop_front();
+    }
+
+    // Generate idempotency key from signal (ticker+action+price)
+    // Hash prevents duplicate orders within IDEMPOTENCY_WINDOW_SECONDS
+    std::string generate_idempotency_key(const TradeSignal& sig) {
+        std::ostringstream oss;
+        oss << sig.ticker << "|" << sig.action << "|" << std::fixed << std::setprecision(2) << sig.price;
+        std::hash<std::string> hasher;
+        return std::to_string(hasher(oss.str()));
+    }
+
+    // Check if this signal is a duplicate within the idempotency window
+    // Returns pair: (is_duplicate, cached_order_id_if_any)
+    std::pair<bool, std::string> check_idempotency(const TradeSignal& sig) {
+        std::string key = generate_idempotency_key(sig);
+        auto now = std::chrono::system_clock::now();
+
+        std::lock_guard<std::mutex> lock(idempotency_cache_mutex_);
+
+        // Clean old entries
+        auto it = idempotency_cache_.begin();
+        while (it != idempotency_cache_.end()) {
+            auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                now - it->second.last_seen).count();
+            if (age > IDEMPOTENCY_WINDOW_SECONDS) {
+                it = idempotency_cache_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        auto cache_it = idempotency_cache_.find(key);
+        if (cache_it != idempotency_cache_.end()) {
+            auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                now - cache_it->second.last_seen).count();
+            if (age < IDEMPOTENCY_WINDOW_SECONDS) {
+                return {true, cache_it->second.order_id}; // DUPLICATE!
+            }
+        }
+        return {false, ""};
+    }
+
+    // Record this order in the idempotency cache
+    void record_idempotency(const TradeSignal& sig, const std::string& order_id) {
+        std::string key = generate_idempotency_key(sig);
+        std::lock_guard<std::mutex> lock(idempotency_cache_mutex_);
+        idempotency_cache_[key] = {std::chrono::system_clock::now(), order_id};
     }
 
     // ── IBKR execution venue (compiled in only when IBKR_ENABLED is defined) ───
@@ -306,6 +404,60 @@ private:
         gmtime_r(&et_time, &et);
         std::ostringstream oss;
         oss << std::put_time(&et, "%Y-%m-%d");
+        return oss.str();
+    }
+
+    // The call/put + buy/sell layout each routeXXX() in OptionsOrderRouter
+    // submits — kept in one place so the execution recorder (fresh signal) and
+    // the ghost-fill reconciliation path (recovered from the ledger) build the
+    // exact same leg structure a closing order will need to reverse later.
+    // REVERSE_IRON_CONDOR needs strike3/strike4, which the ledger's Order
+    // struct doesn't carry — callers reconstructing from ledger rows only
+    // (not a live OptionsSignal) will get an empty result for it.
+    static std::vector<SpreadLeg> spread_legs_for(const std::string& strategy,
+                                                  double strike, double strike2,
+                                                  double strike3, double strike4) {
+        if (strategy == "BULL_CALL_SPREAD" || strategy == "BEAR_PUT_SPREAD") {
+            std::string t = (strategy == "BULL_CALL_SPREAD") ? "call" : "put";
+            return {{t, strike, "buy"}, {t, strike2, "sell"}};
+        }
+        if (strategy == "STRADDLE") {
+            return {{"call", strike, "buy"}, {"put", strike, "buy"}};
+        }
+        if (strategy == "STRANGLE") {
+            // Short strangle (income thesis, see selectStrategy's prefer_sell
+            // branch) — both legs sold for a credit, mirroring routeStrangle().
+            return {{"call", strike, "sell"}, {"put", strike2, "sell"}};
+        }
+        if (strategy == "REVERSE_IRON_CONDOR" && strike3 != 0.0 && strike4 != 0.0) {
+            return {{"call", strike, "buy"}, {"call", strike2, "sell"},
+                    {"put", strike3, "buy"}, {"put", strike4, "sell"}};
+        }
+        return {};
+    }
+
+    // SpreadPosition::entry_debit uses the same buy(+)/sell(-) sign convention
+    // PositionManager's exit monitor uses for net_value, so pnl = net_value -
+    // entry_debit is correct for both net-debit (spreads/straddle) and
+    // net-credit (short strangle) structures without a separate code path.
+    // `magnitude` is the always-positive premium OptionsSignal reports.
+    static double signed_entry_debit_for(const std::vector<SpreadLeg>& legs, double magnitude) {
+        bool all_sell = !legs.empty() &&
+            std::all_of(legs.begin(), legs.end(),
+                        [](const SpreadLeg& l) { return l.side == "sell"; });
+        return all_sell ? -magnitude : magnitude;
+    }
+
+    // Phase 1 (equity path): a deterministic client_order_id for broker-side
+    // idempotency. Minute-bucketed so a network retry of the same order reproduces
+    // the same id (Alpaca rejects the duplicate) while a legitimate later order
+    // gets a fresh one. `tag` distinguishes entry vs stop vs exit on the same name.
+    static std::string makeEquityClientOid(const std::string& ticker,
+                                           const std::string& tag) {
+        long epoch = static_cast<long>(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+        std::ostringstream oss;
+        oss << "nox-e-" << ticker << "-" << tag << "-" << (epoch / 60);
         return oss.str();
     }
 
@@ -442,6 +594,214 @@ private:
                     std::to_string(adopted) + " open position(s) now tracked.");
     }
 
+    // ── Phase 1, item 2: options order reconciliation ─────────────────────────
+    //
+    // Called at scan-cycle start (and once at startup). For every ledger row still
+    // 'pending'/'unknown', ask the broker "what actually happened to this order?"
+    // by its client_order_id, and bring local truth back in sync — the core
+    // ghost-fill fix. Idempotent (broker-truth-derived, add_position guarded by
+    // has_open_position), so it is safe even if it races or repeats.
+    //
+    // The two options threads share one ledger; the throttle keeps only one poll
+    // running per RECON_COOLDOWN_SECONDS window (efficiency, not correctness).
+    void reconcile_options_orders() {
+        if (!orderLedger_ || !optionsOrderRouter_ || !positionManager_) return;
+        if (!orderLedger_->shouldReconcileNow(RECON_COOLDOWN_SECONDS)) return;
+
+        auto pending = orderLedger_->getUnresolved();
+        if (pending.empty()) return;
+
+        long now = nox::execution::OrderLedger::now_epoch();
+        int resolved_filled = 0, resolved_failed = 0, still_open = 0;
+
+        for (const auto& o : pending) {
+            auto st = optionsOrderRouter_->getOrderByClientId(o.client_oid);
+            long age = now - o.sent_at;
+
+            if (!st.reachable) {
+                // Network/parse error — never self-inflict 'failed'; retry next cycle.
+                still_open++;
+                continue;
+            }
+
+            if (!st.found) {
+                // Broker reached but has no such order.
+                if (age >= RECON_GRACE_SECONDS) {
+                    // The order never landed → free to regenerate (item 6 logging).
+                    orderLedger_->setStatus(o.client_oid, "failed");
+                    resolved_failed++;
+                    Logger::log("WARN", "[RECONCILE] " + o.ticker + " / " + o.strategy +
+                        " (" + o.client_oid + ") never reached broker after " +
+                        std::to_string(age) + "s — marked failed; signal free to regenerate.");
+                    TelegramNotifier::sendMessage(
+                        "🔁 *ORDER NEVER LANDED — " + o.ticker + "*\n"
+                        "────────────────────────\n"
+                        "• *Strategy:* " + o.strategy + "\n"
+                        "• *Client OID:* `" + o.client_oid + "`\n"
+                        "No broker record after " + std::to_string(age) +
+                        "s. Marked failed — the next scan may regenerate it.");
+                } else {
+                    still_open++; // within grace — recheck next cycle
+                }
+                continue;
+            }
+
+            // Broker returned a record — act on its status.
+            const std::string& s = st.status;
+            if (s == "filled") {
+                // Genuinely TERMINAL fill at the broker. Upgrade the ledger and
+                // make sure the position is tracked for exits (double-entry guarded
+                // by has_open_position / has_open_spread_position). Ghost-fill catch.
+                // NOTE (audit §4 H1): only "filled" is terminal here. accepted/new/
+                // pending_new/partially_filled are WORKING states handled below —
+                // treating them as fills booked phantom positions for async-rejected
+                // orders and booked full qty on partials.
+                orderLedger_->setStatus(o.client_oid, "filled", st.broker_order_id);
+                resolved_filled++;
+                bool single_leg = (o.strategy == "LONG_CALL" || o.strategy == "LONG_PUT" ||
+                                   o.strategy == "CSP"       || o.strategy == "CC");
+                if (single_leg && !o.option_type.empty() &&
+                    !positionManager_->has_open_position(o.ticker, o.option_type,
+                                                         o.strike, o.expiration_date)) {
+                    std::string entry_date = get_today_date_string();
+                    positionManager_->add_position(
+                        o.ticker, o.option_type, o.strike,
+                        static_cast<int>(o.qty), o.entry_price, entry_date,
+                        o.profile_type.empty() ? "long" : o.profile_type,
+                        o.expiration_date);
+                    Logger::log("INFO", "[RECONCILE] Recovered ghost fill for " + o.ticker +
+                        " / " + o.strategy + " (" + o.client_oid + ") — position now tracked.");
+                    TelegramNotifier::sendMessage(
+                        "👻 *GHOST FILL RECOVERED — " + o.ticker + "*\n"
+                        "────────────────────────\n"
+                        "• *Strategy:* " + o.strategy + "\n"
+                        "• *Broker Order:* `" + st.broker_order_id + "`\n"
+                        "Order filled at the broker but our confirmation was lost. "
+                        "Now tracked for exit — double-entry prevented.");
+                } else if (!single_leg) {
+                    // Ledger's Order struct carries only strike/strike2, so
+                    // REVERSE_IRON_CONDOR (needs strike3/strike4) can't be fully
+                    // reconstructed here — spread_legs_for() returns empty for it
+                    // and this ghost-fill stays untracked, same as before.
+                    auto legs = spread_legs_for(o.strategy, o.strike, o.strike2, 0.0, 0.0);
+                    if (!legs.empty() &&
+                        !positionManager_->has_open_spread_position(
+                            o.ticker, o.strategy, o.expiration_date)) {
+                        std::string entry_date = get_today_date_string();
+                        positionManager_->add_spread_position(
+                            o.ticker, o.strategy, static_cast<int>(o.qty),
+                            signed_entry_debit_for(legs, o.entry_price),
+                            entry_date, o.expiration_date, legs);
+                        Logger::log("INFO", "[RECONCILE] Recovered multi-leg ghost fill for " +
+                            o.ticker + " / " + o.strategy + " (" + o.client_oid + ") — now tracked.");
+                        TelegramNotifier::sendMessage(
+                            "👻 *GHOST FILL RECOVERED — " + o.ticker + "*\n"
+                            "────────────────────────\n"
+                            "• *Strategy:* " + o.strategy + " (multi-leg)\n"
+                            "• *Broker Order:* `" + st.broker_order_id + "`\n"
+                            "Order filled at the broker but our confirmation was lost. "
+                            "Now tracked for exit.");
+                    }
+                }
+            } else if (s == "partially_filled" || s == "accepted" || s == "new" ||
+                       s == "pending_new"     || s == "pending_replace") {
+                // Working / not-yet-terminal at the broker (audit §4 H1). Not a
+                // fill — leave the ledger 'pending' and recheck next cycle rather
+                // than booking a phantom position. (A partial that never completes
+                // stays untracked here; booking full qty on first partial was the
+                // worse bug this replaces.)
+                still_open++;
+            } else if (s == "canceled" || s == "rejected" || s == "expired") {
+                orderLedger_->setStatus(o.client_oid, "failed", st.broker_order_id);
+                resolved_failed++;
+                Logger::log("INFO", "[RECONCILE] " + o.ticker + " / " + o.strategy +
+                    " (" + o.client_oid + ") broker status=" + s + " — marked failed.");
+                // The execution recorder books a position on the broker's ACCEPT
+                // ack; if that order is later rejected/expired/canceled without
+                // filling, that booked position is a phantom — reverse it so the
+                // exit monitor doesn't trade a position the broker never opened
+                // and the position-exists gate stops blocking regeneration.
+                // Only reverse on a CONFIRMED zero fill; a partial fill is real.
+                if (positionManager_) {
+                    if (st.filled_qty > 0.0) {
+                        Logger::log("WARN", "[RECONCILE] " + o.ticker + " / " + o.strategy +
+                            " status=" + s + " but filled_qty=" + std::to_string(st.filled_qty) +
+                            " — NOT reversing (partial fill is a real position).");
+                        TelegramNotifier::sendMessage(
+                            "⚠️ *PARTIAL FILL THEN " + s + " — MANUAL CHECK — " + o.ticker + "*\n"
+                            "────────────────────────\n"
+                            "• *Strategy:* " + o.strategy + "\n"
+                            "• *Filled qty:* " + std::to_string(st.filled_qty) + "\n"
+                            "The order " + s + " after a partial fill. The booked position was "
+                            "left in place — verify the real fill quantity at the broker.");
+                    } else {
+                        bool single_leg = (o.strategy == "LONG_CALL" || o.strategy == "LONG_PUT" ||
+                                           o.strategy == "CSP"       || o.strategy == "CC");
+                        int removed = single_leg
+                            ? positionManager_->remove_phantom_single_leg(
+                                  o.ticker, o.option_type, o.strike, o.expiration_date)
+                            : positionManager_->remove_phantom_spread(
+                                  o.ticker, o.strategy, o.expiration_date);
+                        if (removed > 0) {
+                            Logger::log("WARN", "[RECONCILE] Reversed " + std::to_string(removed) +
+                                " phantom position(s) for " + o.ticker + " / " + o.strategy +
+                                " (order " + s + " with zero fill).");
+                            TelegramNotifier::sendMessage(
+                                "🧹 *PHANTOM POSITION REVERSED — " + o.ticker + "*\n"
+                                "────────────────────────\n"
+                                "• *Strategy:* " + o.strategy + "\n"
+                                "• *Broker status:* " + s + " (0 filled)\n"
+                                "The order was booked on broker ACCEPT but never filled. "
+                                "The optimistic position has been removed — no double-entry, "
+                                "signal free to regenerate.");
+                        }
+                    }
+                }
+            } else {
+                still_open++; // unknown/transient broker status — recheck next cycle
+            }
+        }
+
+        Logger::log("INFO", "[RECONCILE] Options order reconciliation: " +
+            std::to_string(resolved_filled) + " filled, " +
+            std::to_string(resolved_failed) + " failed, " +
+            std::to_string(still_open) + " still pending.");
+    }
+
+    // Automatic half of the global kill switch: reads today's realized+
+    // unrealized P&L from daily_ledger (Phase 2) and pauses new entries if it
+    // breaches MAX_DAILY_LOSS_DOLLARS (fake-safe default -$1500). Throttled
+    // like reconcile_options_orders() so both options threads sharing this
+    // call site don't hammer sqlite every scan. Never un-pauses on its own —
+    // only /resume (operator judgment) clears a loss-limit halt, since the
+    // fact that P&L ticked back above the threshold intraday doesn't mean the
+    // day's risk event is over.
+    void check_daily_loss_limit() {
+        if (!killSwitch_ || !positionManager_) return;
+        long now = nox::execution::OrderLedger::now_epoch();
+        long last = lastKillSwitchCheck_.load();
+        if (now - last < KILL_SWITCH_CHECK_COOLDOWN_SECONDS) return;
+        lastKillSwitchCheck_.store(now);
+
+        if (killSwitch_->isPaused()) return; // already halted — nothing to do
+
+        double pnl_today = positionManager_->get_total_daily_pnl(get_today_date_string());
+        if (pnl_today > maxDailyLossDollars_) return; // within limit (limit is negative)
+
+        std::string reason = "Daily P&L $" + std::to_string(pnl_today) +
+            " breached limit $" + std::to_string(maxDailyLossDollars_);
+        killSwitch_->pause(reason, "daily_loss_limit");
+        Logger::log("CRITICAL", "[KILL_SWITCH] " + reason + " — all new entries halted.");
+        TelegramNotifier::sendMessage(
+            "🛑 *KILL SWITCH TRIGGERED — DAILY LOSS LIMIT*\n"
+            "────────────────────────\n"
+            "• *Today's P&L:* $" + std::to_string(pnl_today) + "\n"
+            "• *Limit:* $" + std::to_string(maxDailyLossDollars_) + "\n"
+            "⛔ All NEW entries halted (equity + options). Existing positions "
+            "are untouched. Send /resume once you've reviewed what happened."
+        );
+    }
+
     // A live Alpaca position snapshot used for reconciliation and P&L tracking.
     struct AlpacaPositionSnapshot {
         double qty           = 0.0;
@@ -477,6 +837,13 @@ private:
             json positions = json::parse(res->body);
             if (positions.is_array()) {
                 for (const auto& pos : positions) {
+                    // /v2/positions returns BOTH equities and options in one array.
+                    // Options are tracked/closed exclusively through PositionManager +
+                    // OptionsOrderRouter — letting one leak in here means this map's
+                    // consumers (trailing-stop monitor, equity exit rules, the equity
+                    // close path) apply equity semantics (market sell qty, stop-loss %)
+                    // to an option contract, which the broker rejects every cycle.
+                    if (pos.value("asset_class", "") != "us_equity") continue;
                     std::string ticker = pos.value("symbol", "");
                     if (ticker.empty()) continue;
                     AlpacaPositionSnapshot s;
@@ -638,6 +1005,17 @@ private:
                             // Still open — refresh last-seen values for future P&L estimate.
                             kv.second.last_price = it->second.current_price;
                             kv.second.last_pnl   = it->second.unrealized_pl;
+                            // Phase 2, item B: persist the live unrealized snapshot —
+                            // this loop is the only place equity marks are already
+                            // fetched every 5 minutes, so it's the natural point to
+                            // make that P&L queryable instead of log-only.
+                            if (positionManager_) {
+                                positionManager_->upsert_unrealized(
+                                    get_today_date_string(), kv.first, "equity", "",
+                                    static_cast<double>(kv.second.quantity),
+                                    kv.second.entry_price, it->second.current_price,
+                                    it->second.unrealized_pl);
+                            }
                         }
                     }
                     // Erase closed entries now, while we still hold the lock.
@@ -669,6 +1047,8 @@ private:
                             ticker, "SELL", "equity",
                             static_cast<double>(info.quantity), info.last_price,
                             50.0, 0.0, info.last_pnl, "trailing_stop_close");
+                        positionManager_->add_realized(
+                            get_today_date_string(), ticker, "equity", "", info.last_pnl);
                     }
 
                     // CN-RULE-002: a trailing-stop close also lifts the T+1 record.
@@ -786,6 +1166,36 @@ private:
             return (mid > 0.0) ? (ask - bid) / mid : -1.0;
         } catch (...) {
             return -1.0;
+        }
+    }
+
+    // Broker-truth check: does the account already hold shares of this ticker?
+    // Same pattern as OptionsOrderRouter::hasOpenOptionPosition — the idempotency
+    // cache (main.cpp check_idempotency) is keyed on price-to-2-decimals with a
+    // 5-minute window, so a webhook signal that re-fires ~30 min apart at a
+    // slightly different price sails right through it. This is the real gate;
+    // `reachable=false` tells the caller to fall back to the ledger instead of
+    // assuming "no position."
+    bool hasOpenEquityPosition(const std::string& ticker, bool& reachable) const {
+        reachable = false;
+        try {
+            httplib::Client cli(alpacaBaseUrl);
+            cli.set_connection_timeout(std::chrono::seconds(5));
+            cli.set_read_timeout(std::chrono::seconds(10));
+            httplib::Headers headers = {
+                {"APCA-API-KEY-ID",     apiKey},
+                {"APCA-API-SECRET-KEY", apiSec}
+            };
+            auto res = cli.Get(("/v2/positions/" + ticker).c_str(), headers);
+            if (!res) return false;
+            if (res->status == 404) { reachable = true; return false; } // confirmed flat
+            if (res->status != 200) return false;                       // other error → unreachable
+            reachable = true;
+            json body = json::parse(res->body);
+            return body.value("qty", 0.0) != 0.0;
+        } catch (...) {
+            reachable = false;
+            return false;
         }
     }
 
@@ -909,7 +1319,8 @@ private:
                     {"qty", sell_qty},
                     {"side", "sell"},
                     {"type", "market"},
-                    {"time_in_force", "day"}
+                    {"time_in_force", "day"},
+                    {"client_order_id", makeEquityClientOid(ticker, "sell")}
                 };
                 auto res = alpaca_cli.Post("/v2/orders", headers, order_payload.dump(), "application/json");
                 if (res && res->status == 200) {
@@ -926,6 +1337,8 @@ private:
                         ticker, "SELL", "equity",
                         static_cast<double>(sell_qty), exit_price, rsi, 0.0, partial_pnl,
                         reason + " mode=" + equitySellQtyMode_ + " order_id=" + response_data.value("id", "N/A"));
+                    positionManager_->add_realized(
+                        get_today_date_string(), ticker, "equity", "", partial_pnl);
                 }
                 std::ostringstream pnl_ss;
                 pnl_ss << std::showpos << std::fixed << std::setprecision(2) << partial_pnl;
@@ -1071,6 +1484,20 @@ private:
 
         // --- BUY ROUTING: Open new position with trailing stop ---
         if (sig.action == "BUY") {
+            // Global kill switch — checked before any other gate. Blocks NEW
+            // entries only; an operator /pause or an automatic daily-loss-limit
+            // breach must never leave an order in flight, but existing
+            // positions are left alone (see check_daily_loss_limit()).
+            if (killSwitch_ && killSwitch_->isPaused()) {
+                auto ks = killSwitch_->get();
+                Logger::log("WARN", "[KILL_SWITCH] Equity BUY blocked for " + sig.ticker +
+                            " — trading paused (" + ks.triggered_by + "): " + ks.reason);
+                if (orderLedger_) orderLedger_->logSignalEvent(sig.ticker, "EQUITY_BUY",
+                    sig.ticker + "|EQUITY_BUY|" + get_today_date_string(), -1.0,
+                    "suppressed_kill_switch", ks.reason);
+                return;
+            }
+
             // RSI floor/ceiling gate — block trades that violate backtest rules
             if (sig.rsi < 30.0) {
                 Logger::log("WARN", "RSI gate blocked BUY for " + sig.ticker + " — RSI below floor at " + std::to_string(sig.rsi));
@@ -1267,6 +1694,76 @@ private:
                 return;
             }
 #endif
+            // Position-exists gate: ask the broker first (authoritative — reflects
+            // manual closes too), falling back to the day-scoped ledger signature
+            // only if the broker is unreachable. Fails closed, not open — the
+            // price-keyed idempotency cache above this block does NOT catch a
+            // signal re-firing 30 minutes apart at a different price, which is
+            // exactly how AAPL got repeatedly bought into every scan cycle.
+            {
+                bool eq_reachable = false;
+                bool eq_has_position = hasOpenEquityPosition(sig.ticker, eq_reachable);
+                std::string eq_signature = sig.ticker + "|EQUITY_BUY|" + get_today_date_string();
+                if (eq_reachable && eq_has_position) {
+                    Logger::log("WARN", "[EXECUTION] Equity BUY blocked for " + sig.ticker +
+                                " — broker already holds a position.");
+                    if (orderLedger_) orderLedger_->logSignalEvent(sig.ticker, "EQUITY_BUY",
+                        eq_signature, -1.0, "gate_blocked_position_exists",
+                        "broker already holds shares of this ticker");
+                    return;
+                }
+                if (!eq_reachable && orderLedger_ && orderLedger_->hasRecentActive(eq_signature, 86400)) {
+                    Logger::log("WARN", "[EXECUTION] Equity BUY blocked for " + sig.ticker +
+                                " — broker unreachable, ledger shows a same-day buy already on file.");
+                    orderLedger_->logSignalEvent(sig.ticker, "EQUITY_BUY",
+                        eq_signature, -1.0, "gate_blocked_position_exists",
+                        "same-day buy already on file (ledger fallback, broker unreachable)");
+                    return;
+                }
+            }
+
+            // Phase 4, item 2: portfolio circuit breaker — equity notional cap.
+            // Alert + block new buys only; unlike the options side, an existing
+            // equity position is never auto-cut here (equity delta is trivially
+            // 1/share — there's no Greeks-breach concept to justify a forced
+            // exit, only a notional one, and this project treats forced exits as
+            // an options-specific, Greeks-driven exception to the signal-driven
+            // philosophy, not a general one).
+            if (positionManager_) {
+                std::string eq_signature = sig.ticker + "|EQUITY_BUY|" + get_today_date_string();
+                double existing_equity_notional = 0.0;
+                {
+                    std::lock_guard<std::mutex> lock(equity_positions_mutex_);
+                    for (const auto& [ticker, p] : equity_positions_) {
+                        double mark = (p.last_price > 0.0) ? p.last_price : p.entry_price;
+                        existing_equity_notional += std::abs(mark * p.quantity);
+                    }
+                }
+                double max_equity_notional = positionManager_->get_risk_targets().max_equity_notional;
+                if (existing_equity_notional + notional_value > max_equity_notional) {
+                    Logger::log("WARN", "[EXECUTION] Equity BUY blocked for " + sig.ticker +
+                                " — portfolio equity notional cap: existing $" +
+                                std::to_string(existing_equity_notional) + " + new $" +
+                                std::to_string(notional_value) + " > target $" +
+                                std::to_string(max_equity_notional));
+                    if (orderLedger_) orderLedger_->logSignalEvent(sig.ticker, "EQUITY_BUY",
+                        eq_signature, -1.0, "suppressed_risk_cap",
+                        "equity notional cap breached ($" + std::to_string(existing_equity_notional) +
+                        " existing + $" + std::to_string(notional_value) + " new > $" +
+                        std::to_string(max_equity_notional) + " target)");
+                    TelegramNotifier::sendMessage(
+                        "🛑 *PORTFOLIO RISK — EQUITY NOTIONAL CAP*\n"
+                        "────────────────────────\n"
+                        "• *Ticker:* " + sig.ticker + "\n"
+                        "• *Existing Equity Notional:* $" + std::to_string(existing_equity_notional) + "\n"
+                        "• *New Order Notional:* $" + std::to_string(notional_value) + "\n"
+                        "• *Target:* $" + std::to_string(max_equity_notional) + "\n"
+                        "⛔ New equity entry paused — existing positions left untouched."
+                    );
+                    return;
+                }
+            }
+
             try {
                 httplib::Client alpaca_cli(alpacaBaseUrl);
                 // RULE-008: Strict timeout handling
@@ -1279,13 +1776,31 @@ private:
                     {"Content-Type",        "application/json"}
                 };
 
+                std::string eq_client_oid = makeEquityClientOid(sig.ticker, "buy");
                 json order_payload = {
                     {"symbol", sig.ticker},
                     {"qty", qty},
                     {"side", "buy"},
                     {"type", "market"},
-                    {"time_in_force", "day"}
+                    {"time_in_force", "day"},
+                    {"client_order_id", eq_client_oid}
                 };
+
+                // Ledger the equity entry (pending) before the POST fires so a
+                // crash/timeout leaves a record the reconciler could resolve.
+                if (orderLedger_) {
+                    nox::execution::OrderLedger::Order o;
+                    o.client_oid  = eq_client_oid;
+                    o.ticker      = sig.ticker;
+                    o.strategy    = "EQUITY_BUY";
+                    o.signature   = sig.ticker + "|EQUITY_BUY|" + get_today_date_string();
+                    o.side        = "buy";
+                    o.asset_class = "equity";
+                    o.status      = "pending";
+                    o.qty         = static_cast<double>(qty);
+                    o.entry_price = sig.price;
+                    orderLedger_->insertPending(o);
+                }
 
                 std::cout << "[EXECUTION] Routing BUY order to Alpaca: " << qty << " shares of " << sig.ticker << "..." << std::endl;
                 auto res = alpaca_cli.Post("/v2/orders", headers, order_payload.dump(), "application/json");
@@ -1294,6 +1809,12 @@ private:
                     json response_data = json::parse(res->body);
                     std::string order_id = response_data.value("id", "UNKNOWN");
                     std::cout << " [BUY ORDER EXECUTED] Alpaca Order ID: " << order_id << std::endl;
+
+                    if (orderLedger_)
+                        orderLedger_->setStatus(eq_client_oid, "filled", order_id);
+
+                    // CRITICAL: Record this order in idempotency cache to prevent duplicates
+                    record_idempotency(sig, order_id);
 
                     // Ledger: record the equity entry (single source of truth for reports).
                     if (positionManager_) {
@@ -1341,7 +1862,8 @@ private:
                             {"side", "sell"},
                             {"type", "trailing_stop"},
                             {"time_in_force", "gtc"},
-                            {"trail_price", trail_offset_str}
+                            {"trail_price", trail_offset_str},
+                            {"client_order_id", makeEquityClientOid(sig.ticker, "stop")}
                         };
 
                         std::cout << "[EXECUTION] Placing trailing stop for " << sig.ticker
@@ -1547,8 +2069,6 @@ public:
                 envInt("OPTIONS_BOT_SCAN_INTERVAL_MINUTES", 30);
             optionsBotProfile_.auto_execute =
                 envBool("OPTIONS_BOT_AUTO_EXECUTE");
-            optionsBotProfile_.qty_contracts =
-                envInt("OPTIONS_BOT_QTY_CONTRACTS", 1);
             optionsBotProfile_.free_capital_amount =
                 envDbl("OPTIONS_BOT_FREE_CAPITAL_AMOUNT", 0.0);
             optionsBotProfile_.max_signals_per_scan =
@@ -1561,12 +2081,26 @@ public:
             optionsPersonalProfile_.scan_interval_minutes =
                 envInt("OPTIONS_PERSONAL_SCAN_INTERVAL_MINUTES", 30);
             optionsPersonalProfile_.auto_execute = false; // personal signals are advisory only
-            optionsPersonalProfile_.qty_contracts =
-                envInt("OPTIONS_PERSONAL_QTY_CONTRACTS", 1);
             optionsPersonalProfile_.free_capital_amount =
                 envDbl("OPTIONS_PERSONAL_FREE_CAPITAL_AMOUNT", 0.0);
             optionsPersonalProfile_.max_signals_per_scan =
                 envInt("OPTIONS_PERSONAL_MAX_SIGNALS", 2);
+
+            // ── BREAKOUT profile — LEAP advisory signals on strong trend breakouts ──
+            // Always advisory (auto_execute forced false below regardless of the
+            // factory default) — this scans for 6-month directional conviction
+            // plays, not something to auto-fire real orders on.
+            optionsBreakoutProfile_ = nox::options_signal::RiskProfile::breakout();
+            optionsBreakoutProfile_.watchlist = parseWatchlist(
+                envStr("OPTIONS_BREAKOUT_WATCHLIST",
+                       "SPY,QQQ,IWM,AAPL,MSFT,NVDA,AMD,TSLA,AMZN,META,GOOGL,NFLX,COIN,PLTR,MSTR,SHOP,ARKK,SOXX,GLD,XLF"));
+            optionsBreakoutProfile_.scan_interval_minutes =
+                envInt("OPTIONS_BREAKOUT_SCAN_INTERVAL_MINUTES", 30);
+            optionsBreakoutProfile_.auto_execute = false; // breakout signals are advisory only
+            optionsBreakoutProfile_.free_capital_amount =
+                envDbl("OPTIONS_BREAKOUT_FREE_CAPITAL_AMOUNT", 0.0);
+            optionsBreakoutProfile_.max_signals_per_scan =
+                envInt("OPTIONS_BREAKOUT_MAX_SIGNALS", 2);
 
             // ── Equity signal scanner (independent of Skeptic) ─────────────────
             equityScanEnabled_ = envBool("EQUITY_SCAN_ENABLED") ||
@@ -1584,6 +2118,13 @@ public:
             equityScanIntervalMinutes_ = envInt("EQUITY_SCAN_INTERVAL_MINUTES", 30);
             equityMaxSignals_          = envInt("EQUITY_SCAN_MAX_SIGNALS", 2);
             equityBypassHours_         = envBool("EQUITY_SCAN_BYPASS_HOURS");
+
+            // ── Futures signal scanner (signals only — see CLAUDE.md) ──────────
+            futuresScanEnabled_ = envBool("FUTURES_SCAN_ENABLED"); // default off
+            futuresWatchlist_ = parseWatchlist(envStr("FUTURES_WATCHLIST", "CL"));
+            futuresScanIntervalMinutes_ = envInt("FUTURES_SCAN_INTERVAL_MINUTES", 60);
+            futuresAlertThreshold_      = envDbl("FUTURES_ALERT_THRESHOLD", 0.5);
+            massiveApiKey_ = envStr("MASSIVE_API_KEY", "");
 
             // Rule-based equity exits (defaults on; per-rule tunable via .env).
             {
@@ -1663,6 +2204,10 @@ public:
                 + (optionsPersonalProfile_.free_capital_amount > 0.0
                     ? " | FreeCapital=$" + std::to_string(optionsPersonalProfile_.free_capital_amount)
                     : ""));
+            Logger::log("INFO", "[OPTIONS_SIGNAL] BREAKOUT profile: always advisory (LEAP)"
+                + std::string(" | Watchlist=")
+                + std::to_string(optionsBreakoutProfile_.watchlist.size()) + " tickers"
+                + " | Interval=" + std::to_string(optionsBreakoutProfile_.scan_interval_minutes) + "min");
         }
 
         // Initialize and start the Position Manager
@@ -1670,15 +2215,86 @@ public:
             auto order_router = std::make_shared<nox::options_router::OptionsOrderRouter>(
                 alpacaBaseUrl, apiKey, apiSec
             );
+            optionsOrderRouter_ = order_router; // keep a handle for reconciliation lookups
             // MEMORY_BANK_PATH must point to the volume-mounted data directory so the
             // options position DB survives container restarts. Default: /app/data.
             const char* mb_env = std::getenv("MEMORY_BANK_PATH");
-            std::string memory_bank_path = (mb_env && std::string(mb_env) != "")
+            memory_bank_path = (mb_env && std::string(mb_env) != "")
                 ? std::string(mb_env)
                 : "/app/data/memory_bank.db";
             positionManager_ = std::make_unique<PositionManager>(memory_bank_path, *order_router);
             positionManager_->start_monitoring();
             Logger::log("INFO", "[POS_MANAGER] Position Manager initialized and monitoring thread started.");
+
+            // Phase 1: the order ledger shares the same DB file (WAL makes the
+            // second handle safe). Constructed after PositionManager so the file
+            // already exists; failure here must not disable trading.
+            try {
+                orderLedger_ = std::make_unique<nox::execution::OrderLedger>(memory_bank_path);
+                Logger::log("INFO", "[ORDER_LEDGER] Client-order-ID ledger initialized.");
+                // Startup reconciliation — resolve any orders left pending/unknown
+                // by a crash or restart against broker truth before scanning resumes.
+                reconcile_options_orders();
+            } catch (const std::exception& e) {
+                Logger::log("WARN", "[ORDER_LEDGER] Failed to initialize order ledger: " +
+                    std::string(e.what()) + ". Ghost-fill protection degraded.");
+            }
+
+            // Phase 2, item C: true 52-week historical IV Rank, read from the same
+            // `historical_volatility` table the Python heartbeat collects (and the
+            // Polygon backfill script seeds). Failure here just means every
+            // generator keeps using the same-snapshot proxy — never disables trading.
+            try {
+                ivRankStore_ = std::make_unique<nox::execution::IvRankStore>(memory_bank_path);
+                Logger::log("INFO", "[IV_RANK] Historical IV rank store initialized.");
+            } catch (const std::exception& e) {
+                Logger::log("WARN", "[IV_RANK] Failed to initialize IV rank store: " +
+                    std::string(e.what()) + ". Falling back to same-snapshot IV rank proxy.");
+            }
+
+            // Phase 3: alpha-decay tier-down. heartbeat/alpha_decay_monitor.py owns
+            // the rolling-Sharpe-vs-baseline math and writes the multiplier here;
+            // failure to open the store just means sizing stays at 1.0 — never
+            // disables trading.
+            try {
+                alphaDecayStore_ = std::make_unique<nox::execution::AlphaDecayStore>(memory_bank_path);
+                Logger::log("INFO", "[ALPHA_DECAY] Alpha decay store initialized.");
+            } catch (const std::exception& e) {
+                Logger::log("WARN", "[ALPHA_DECAY] Failed to initialize alpha decay store: " +
+                    std::string(e.what()) + ". Position sizing unaffected (multiplier=1.0).");
+            }
+
+            // Global kill switch — persisted so a restart during a pause never
+            // silently resumes trading. Failure to open the store just means
+            // isPaused() always fails open (never blocks trading on its own) —
+            // it never disables trading by itself, matching every other
+            // optional-store init in this constructor.
+            try {
+                killSwitch_ = std::make_unique<nox::execution::KillSwitchStore>(memory_bank_path);
+                auto ks = killSwitch_->get();
+                Logger::log("INFO", std::string("[KILL_SWITCH] Store initialized. State: ") +
+                    (ks.paused ? ("PAUSED (" + ks.triggered_by + "): " + ks.reason) : "active"));
+            } catch (const std::exception& e) {
+                Logger::log("WARN", "[KILL_SWITCH] Failed to initialize kill switch store: " +
+                    std::string(e.what()) + ". /pause and the daily-loss-limit halt are unavailable.");
+            }
+            if (const char* v = std::getenv("MAX_DAILY_LOSS_DOLLARS")) {
+                try { maxDailyLossDollars_ = -std::abs(std::stod(v)); } catch (...) {}
+            }
+
+            // Futures signal audit trail (signal-only — see CLAUDE.md). Failure
+            // here just disables the futures scan thread further below; it
+            // never touches options/equity trading.
+            if (futuresScanEnabled_) {
+                try {
+                    futuresSignalStore_ = std::make_shared<nox::execution::FuturesSignalStore>(memory_bank_path);
+                    Logger::log("INFO", "[FUTURES_SCAN] Futures signal store initialized.");
+                } catch (const std::exception& e) {
+                    Logger::log("WARN", "[FUTURES_SCAN] Failed to initialize futures signal store: " +
+                        std::string(e.what()) + ". Futures scan thread will not start.");
+                    futuresScanEnabled_ = false;
+                }
+            }
         } catch (const std::exception& e) {
             Logger::log("WARN", "[POS_MANAGER] Failed to initialize Position Manager: " +
                 std::string(e.what()) + ". Options position tracking disabled; signal processing continues.");
@@ -1747,6 +2363,59 @@ public:
             res.set_content(health_response.dump(), "application/json");
         });
 
+        // Global kill switch — heartbeat/monitor.py's /pause and /resume Telegram
+        // commands POST here. Body is optional JSON {"reason": "..."}; falls back
+        // to a generic operator-halt reason if omitted/unparseable.
+        svr.Post("/pause", [this](const httplib::Request& req, httplib::Response& res) {
+            if (!killSwitch_) {
+                res.status = 503;
+                res.set_content(json{{"error", "kill switch store unavailable"}}.dump(), "application/json");
+                return;
+            }
+            std::string reason = "Operator-triggered halt via /pause";
+            try {
+                auto body = json::parse(req.body);
+                if (body.contains("reason") && body["reason"].is_string() && !body["reason"].get<std::string>().empty())
+                    reason = body["reason"].get<std::string>();
+            } catch (...) {}
+            killSwitch_->pause(reason, "operator");
+            Logger::log("WARN", "[KILL_SWITCH] Operator paused trading: " + reason);
+            TelegramNotifier::sendMessage(
+                "🛑 *TRADING PAUSED (operator)*\n"
+                "────────────────────────\n"
+                "• *Reason:* " + reason + "\n"
+                "⛔ All new entries halted. Existing positions are untouched. Send /resume to clear."
+            );
+            res.set_content(json{{"status", "paused"}, {"reason", reason}}.dump(), "application/json");
+        });
+
+        svr.Post("/resume", [this](const httplib::Request&, httplib::Response& res) {
+            if (!killSwitch_) {
+                res.status = 503;
+                res.set_content(json{{"error", "kill switch store unavailable"}}.dump(), "application/json");
+                return;
+            }
+            killSwitch_->resume();
+            Logger::log("INFO", "[KILL_SWITCH] Operator resumed trading.");
+            TelegramNotifier::sendMessage("✅ *TRADING RESUMED*\nNew entries are no longer blocked.");
+            res.set_content(json{{"status", "active"}}.dump(), "application/json");
+        });
+
+        svr.Get("/kill-switch-status", [this](const httplib::Request&, httplib::Response& res) {
+            if (!killSwitch_) {
+                res.set_content(json{{"paused", false}, {"available", false}}.dump(), "application/json");
+                return;
+            }
+            auto ks = killSwitch_->get();
+            res.set_content(json{
+                {"paused",       ks.paused},
+                {"reason",       ks.reason},
+                {"triggered_by", ks.triggered_by},
+                {"triggered_at", ks.triggered_at},
+                {"available",    true}
+            }.dump(), "application/json");
+        });
+
         svr.Get("/last-report", [this](const httplib::Request &, httplib::Response &res) {
             json response = {
                 {"last_analyst_report", last_analyst_report_time.empty() ? "Never" : last_analyst_report_time}
@@ -1797,6 +2466,144 @@ public:
                 {"positions",      positions}
             };
             res.set_content(response.dump(), "application/json");
+        });
+
+        svr.Get("/daily-options-accuracy", [this](const httplib::Request&, httplib::Response& res) {
+            if (!positionManager_) {
+                res.status = 500;
+                res.set_content(json{{"error", "PositionManager not initialized"}}.dump(), "application/json");
+                return;
+            }
+
+            try {
+                std::string today = get_today_date_string();
+                std::vector<json> trades;
+                int wins = 0, losses = 0, breakeven = 0;
+                double total_win = 0.0, total_loss = 0.0;
+                double cumulative_pnl = 0.0;
+
+                sqlite3* db = nullptr;
+                if (sqlite3_open(memory_bank_path.c_str(), &db) != SQLITE_OK) {
+                    res.status = 500;
+                    res.set_content(json{{"error", "Cannot open database"}}.dump(), "application/json");
+                    return;
+                }
+
+                sqlite3_busy_timeout(db, 5000);
+
+                const char* sql = R"(
+                    SELECT id, timestamp, ticker, action, price, pnl, detail
+                    FROM trade_history
+                    WHERE asset_class = 'option'
+                    AND DATE(timestamp) = DATE(?)
+                    ORDER BY timestamp ASC
+                )";
+
+                sqlite3_stmt* stmt = nullptr;
+                if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+                    sqlite3_close(db);
+                    res.status = 500;
+                    res.set_content(json{{"error", "Query failed"}}.dump(), "application/json");
+                    return;
+                }
+
+                sqlite3_bind_text(stmt, 1, today.c_str(), -1, SQLITE_TRANSIENT);
+
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    double pnl = sqlite3_column_double(stmt, 5);
+                    std::string action = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+                    std::string detail_str = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+
+                    // Parse detail for OPEN: "STRATEGY_TYPE"
+                    // Parse detail for CLOSE: "call|put $STRIKE | exit_reason"
+                    std::string option_type = "unknown";
+                    double strike = 0.0;
+                    std::string exit_reason = "";
+
+                    if (action == "CLOSE") {
+                        // Format: "call 100 | 50% Profit Rule (Long)"
+                        size_t pipe_pos = detail_str.find('|');
+                        if (pipe_pos != std::string::npos) {
+                            std::string type_strike = detail_str.substr(0, pipe_pos);
+                            exit_reason = detail_str.substr(pipe_pos + 2); // skip "| "
+
+                            // Parse "call 100" or "put 105.5"
+                            size_t space_pos = type_strike.find(' ');
+                            if (space_pos != std::string::npos) {
+                                option_type = type_strike.substr(0, space_pos);
+                                try {
+                                    strike = std::stod(type_strike.substr(space_pos + 1));
+                                } catch (...) {}
+                            }
+                        }
+                    } else if (action == "OPEN") {
+                        // detail_str contains strategy name (e.g., "LONG_CALL" or "CSP (multi-leg: ...)")
+                        option_type = detail_str;
+                    }
+
+                    json trade;
+                    trade["id"] = sqlite3_column_int(stmt, 0);
+                    trade["timestamp"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                    trade["ticker"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+                    trade["action"] = action;
+                    trade["price"] = sqlite3_column_double(stmt, 4);
+                    trade["pnl"] = pnl;
+                    trade["option_type"] = option_type;
+                    if (strike > 0.0) {
+                        trade["strike"] = strike;
+                    }
+                    if (action == "CLOSE") {
+                        trade["exit_reason"] = exit_reason;
+                    }
+                    trade["raw_detail"] = detail_str;
+
+                    if (action == "CLOSE") {
+                        cumulative_pnl += pnl;
+                        if (pnl > 0.01) {
+                            wins++;
+                            total_win += pnl;
+                        } else if (pnl < -0.01) {
+                            losses++;
+                            total_loss += pnl;
+                        } else {
+                            breakeven++;
+                        }
+                    }
+
+                    trades.push_back(trade);
+                }
+
+                sqlite3_finalize(stmt);
+                sqlite3_close(db);
+
+                int total_trades = wins + losses + breakeven;
+                double win_rate = (total_trades > 0) ? (100.0 * wins / total_trades) : 0.0;
+                double avg_win = (wins > 0) ? (total_win / wins) : 0.0;
+                double avg_loss = (losses > 0) ? (total_loss / losses) : 0.0;
+                double profit_factor = (std::abs(total_loss) > 0.01) ? (total_win / std::abs(total_loss)) : 0.0;
+
+                json response = {
+                    {"date", today},
+                    {"summary", {
+                        {"total_trades", total_trades},
+                        {"wins", wins},
+                        {"losses", losses},
+                        {"breakeven", breakeven},
+                        {"win_rate_pct", win_rate},
+                        {"avg_win_usd", avg_win},
+                        {"avg_loss_usd", avg_loss},
+                        {"profit_factor", profit_factor},
+                        {"cumulative_pnl_usd", cumulative_pnl}
+                    }},
+                    {"trades", trades}
+                };
+
+                res.set_content(response.dump(), "application/json");
+
+            } catch (const std::exception& e) {
+                res.status = 500;
+                res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+            }
         });
 
         svr.Post("/options/price", [](const httplib::Request& req, httplib::Response& res) {
@@ -1945,6 +2752,28 @@ public:
                         return;
                     }
 
+                    // ─── CRITICAL: Idempotency Check (prevent duplicate orders) ────────
+                    auto [is_dup, cached_order_id] = check_idempotency(signal);
+                    if (is_dup) {
+                        Logger::log("CRITICAL",
+                            "[IDEMPOTENCY] DUPLICATE SIGNAL DETECTED AND BLOCKED: " + signal.action + " " +
+                            signal.ticker + " @ $" + std::to_string(signal.price) +
+                            ". Previously placed order: " + (cached_order_id.empty() ? "UNKNOWN" : cached_order_id));
+                        TelegramNotifier::sendMessage(
+                            "🚫 *DUPLICATE ORDER BLOCKED*\n"
+                            "────────────────────────\n"
+                            "A duplicate signal was received within 5 minutes.\n"
+                            "• *Action:* " + signal.action + "\n"
+                            "• *Ticker:* " + signal.ticker + "\n"
+                            "• *Price:* $" + std::to_string(signal.price) + "\n"
+                            "• *Previous Order ID:* " + (cached_order_id.empty() ? "N/A" : cached_order_id) + "\n"
+                            "⚠️ *Second order was NOT placed* — webhook caller should verify first attempt succeeded."
+                        );
+                        success_count++;
+                        return;
+                    }
+                    // ──────────────────────────────────────────────────────────────
+
                     process(signal);
                     success_count++;
                 };
@@ -1988,13 +2817,38 @@ public:
         // ── Options signal scanner — two threads, one per profile ──────────────
         // Threads are stored and joined on shutdown so SIGTERM drains cleanly
         // rather than terminating mid-scan or mid-order.
-        auto launchOptionsThread = [this](nox::options_signal::RiskProfile profile) {
-            option_threads_.emplace_back([this, profile]() {
+        auto launchOptionsThread = [this](nox::options_signal::RiskProfile profile, int stagger_seconds) {
+            option_threads_.emplace_back([this, profile, stagger_seconds]() {
                 std::string tg_token = std::getenv("TELEGRAM_BOT_TOKEN") ? std::getenv("TELEGRAM_BOT_TOKEN") : "";
                 std::string tg_chat  = std::getenv("TELEGRAM_CHAT_ID")   ? std::getenv("TELEGRAM_CHAT_ID")   : "";
 
                 nox::options_signal::OptionsSignalGenerator generator(
                     alpacaBaseUrl, apiKey, apiSec, tg_token, tg_chat, profile);
+
+                // Phase 2, item C: all three profiles (bot/personal/breakout) get the
+                // true historical IV rank, not just the auto-executing one — it feeds
+                // scoring/thresholds for advisory alerts too.
+                if (ivRankStore_) generator.set_iv_rank_store(ivRankStore_.get());
+                if (alphaDecayStore_) generator.set_alpha_decay_store(alphaDecayStore_.get());
+
+#ifdef IBKR_ENABLED
+                // Phase 3: IBKR combo/BAG order routing. Options auto-execute
+                // still requires the Alpaca-shaped OptionsSignal → contract
+                // translation; only the FINAL broker call moves to IBKR.
+                if (execution_venue_ == "ibkr" && ibkr_conn_ && ibkr_wrapper_) {
+                    generator.set_order_execution_override(
+                        [this](const nox::options_signal::OptionsSignal& s, int qty,
+                               const std::string& /*client_oid*/) -> nox::options_router::OrderResult {
+                            nox::ibkr::IBKROrderRouter ibkr_router(*ibkr_conn_, *ibkr_wrapper_);
+                            auto r = ibkr_router.route(s, qty);
+                            using D = nox::options_router::OrderDisposition;
+                            D disp = r.disposition == nox::ibkr::IBKROrderDisposition::Accepted ? D::Accepted
+                                    : r.disposition == nox::ibkr::IBKROrderDisposition::Timeout  ? D::Timeout
+                                                                                                  : D::Rejected;
+                            return {r.success, r.order_id, r.message, disp};
+                        });
+                }
+#endif
 
                 // Persist every auto-executed option so the exit monitor can manage
                 // it (50%/stop/21-DTE) and it lands in the trade ledger for reports.
@@ -2008,21 +2862,280 @@ public:
                         std::string opt_type = (s.option_type == nox::options::OptionType::Call)
                                                    ? "call" : "put";
                         std::string entry_date = get_today_date_string();
-                        // Only single-leg strategies map to the monitor's exit rules.
-                        // Multi-leg (spreads/straddles) are logged but not auto-exited.
                         if (single_leg) {
                             positionManager_->add_position(
                                 s.underlying, opt_type, s.strike, qty, s.entry_price,
                                 entry_date, profile_type, s.expiry_date);
+                        } else {
+                            auto legs = spread_legs_for(s.strategy, s.strike, s.strike2,
+                                                        s.strike3, s.strike4);
+                            if (!legs.empty()) {
+                                positionManager_->add_spread_position(
+                                    s.underlying, s.strategy, qty,
+                                    signed_entry_debit_for(legs, s.entry_price),
+                                    entry_date, s.expiry_date, legs);
+                            }
                         }
                         positionManager_->record_trade(
                             s.underlying, "OPEN", "option",
                             static_cast<double>(qty), s.entry_price, s.rsi, 0.0, 0.0,
-                            s.strategy + (single_leg ? "" : " (multi-leg: exit not auto-managed)"));
+                            s.strategy + (single_leg ? "" : " (multi-leg)"));
                     });
 
+                // ── Phase 1 pre-order gate (items 3 & 4) ──────────────────────
+                // Runs BEFORE the order fires: position-exists check, then the 60s
+                // duplicate blocker, then writes the 'pending' ledger row. Both
+                // options threads share orderLedger_ + positionManager_.
+                using OG = nox::options_signal::OptionsSignalGenerator::OrderGate;
+                generator.set_pre_order_hook(
+                    [this](const nox::options_signal::OptionsSignal& s, int qty,
+                           const std::string& client_oid, const std::string& signature) -> OG {
+                        // Ledger down → fail CLOSED, not open. A missing OrderLedger
+                        // disables kill switch + risk cap + dedup + position-exists all
+                        // at once; letting orders through here defeats every one of them.
+                        if (!orderLedger_) return OG::BlockedError;
+                        const bool single_leg = (s.strategy == "LONG_CALL" || s.strategy == "LONG_PUT" ||
+                                                 s.strategy == "CSP"       || s.strategy == "CC");
+
+                        // Global kill switch — checked first, before the risk cap.
+                        // Blocks NEW entries only; closePositionImpl/closeSpreadPosition
+                        // never go through this hook, so closing an existing position
+                        // during a halt is still possible.
+                        if (killSwitch_ && killSwitch_->isPaused()) {
+                            auto ks = killSwitch_->get();
+                            orderLedger_->logSignalEvent(s.underlying, s.strategy, signature, -1.0,
+                                "suppressed_kill_switch", ks.reason);
+                            return OG::BlockedKillSwitch;
+                        }
+
+                        // Phase 4, item 2: portfolio circuit breaker. Reflects the
+                        // breach found at the end of the most recently completed
+                        // monitor cycle (up to 5 min stale) — blocks NEW entries only;
+                        // it never touches an already-open position (that's handled
+                        // separately inside monitor_positions(), which force-closes
+                        // only the specific position responsible for the breach).
+                        if (positionManager_) {
+                            auto breach = positionManager_->get_last_risk_breach();
+                            if (breach.breached) {
+                                orderLedger_->logSignalEvent(s.underlying, s.strategy, signature, -1.0,
+                                    "suppressed_risk_cap", breach.reason);
+                                return OG::BlockedRiskCap;
+                            }
+                        }
+
+                        // Position-exists: ask the broker first — it's the only source
+                        // that reflects a manual close/open and the only one that knows
+                        // about multi-leg spreads at all (they never populate
+                        // open_positions; single-leg only). Fall back to sqlite only if
+                        // the broker call fails, rather than failing open — failing open
+                        // here is exactly how the AAPL double-buy incident happened
+                        // (a signal that keeps re-firing every scan with nothing to
+                        // stop it once the 60s window has passed).
+                        nox::options_router::OptionsOrderRouter router(alpacaBaseUrl, apiKey, apiSec);
+                        bool broker_reachable = false;
+                        bool broker_has_position = router.hasOpenOptionPosition(s.underlying, broker_reachable);
+
+                        if (broker_reachable && broker_has_position) {
+                            orderLedger_->logSignalEvent(s.underlying, s.strategy, signature, -1.0,
+                                "gate_blocked_position_exists",
+                                "broker already holds an open option position on this underlying");
+                            return OG::BlockedPositionExists;
+                        }
+                        if (!broker_reachable) {
+                            if (single_leg && positionManager_) {
+                                std::string opt_type = (s.option_type == nox::options::OptionType::Call)
+                                                           ? "call" : "put";
+                                if (positionManager_->has_open_position(s.underlying, opt_type,
+                                                                        s.strike, s.expiry_date)) {
+                                    orderLedger_->logSignalEvent(s.underlying, s.strategy, signature, -1.0,
+                                        "gate_blocked_position_exists",
+                                        "position already open for this contract (sqlite fallback, broker unreachable)");
+                                    return OG::BlockedPositionExists;
+                                }
+                            } else if (!single_leg &&
+                                       orderLedger_->hasOpenMultiLegPosition(s.underlying, get_today_date_string())) {
+                                orderLedger_->logSignalEvent(s.underlying, s.strategy, signature, -1.0,
+                                    "gate_blocked_position_exists",
+                                    "unexpired filled spread on file for this ticker (sqlite fallback, broker unreachable)");
+                                return OG::BlockedPositionExists;
+                            }
+                        }
+
+                        // 60s duplicate blocker (keyed on signature; catches an
+                        // immediate retry before the position check above would see it,
+                        // e.g. a network retry before the first fill posts to the broker).
+                        if (orderLedger_->hasRecentActive(signature, 60)) {
+                            orderLedger_->logSignalEvent(s.underlying, s.strategy, signature, -1.0,
+                                "gate_blocked_duplicate",
+                                "duplicate within 60s (network retry, not a new signal)");
+                            return OG::BlockedDuplicate;
+                        }
+
+                        // Write the pending row BEFORE the HTTP call fires.
+                        const bool is_short = (s.strategy == "CSP" || s.strategy == "CC");
+                        nox::execution::OrderLedger::Order o;
+                        o.client_oid      = client_oid;
+                        o.ticker          = s.underlying;
+                        o.strategy        = s.strategy;
+                        o.signature       = signature;
+                        o.side            = is_short ? "sell" : "buy";
+                        o.option_type     = single_leg
+                            ? ((s.option_type == nox::options::OptionType::Call) ? "call" : "put")
+                            : "";
+                        o.profile_type    = is_short ? "short_premium" : "long";
+                        o.expiration_date = s.expiry_date;
+                        o.status          = "pending";
+                        o.strike          = s.strike;
+                        o.strike2         = s.strike2;
+                        o.qty             = static_cast<double>(qty);
+                        o.entry_price     = s.entry_price;
+                        orderLedger_->insertPending(o);
+                        orderLedger_->logSignalEvent(s.underlying, s.strategy, signature, -1.0,
+                            "submitted", "order POST about to fire (client_oid=" + client_oid + ")");
+                        return OG::Allow;
+                    });
+
+                // Phase 2, item A: persist the gate/cap suppression trail run_scan()
+                // logs before a candidate ever reaches the pre-order hook above —
+                // together they let a query by signature answer "did this signal
+                // regenerate because conditions still hold, or stay silent for a
+                // documented reason?" (CLAUDE.md's signal-regeneration audit).
+                generator.set_signal_event_hook(
+                    [this](const std::string& ticker, const std::string& strategy,
+                           const std::string& signature, double quality_score,
+                           const std::string& outcome, const std::string& reason) {
+                        if (orderLedger_)
+                            orderLedger_->logSignalEvent(ticker, strategy, signature,
+                                                         quality_score, outcome, reason);
+                    });
+
+                // Engine-wide prediction-quality logging: WS1/Skeptic (WS2/WS3/WS8)
+                // compute a direction+confidence per ticker but had nowhere to
+                // persist it before now — heartbeat/prediction_outcome_resolver.py
+                // reads predictions_log and rolls it into weekly/monthly per-source
+                // quality scores. Additive only; never affects sizing/gating.
+                generator.set_prediction_log_hook(
+                    [this](const std::string& source_type, const std::string& ticker,
+                           const std::string& direction, double confidence,
+                           const std::string& detail) {
+                        if (orderLedger_)
+                            orderLedger_->logPrediction(source_type, 0, ticker, direction,
+                                                        confidence, detail);
+                    });
+
+                // Full-detail signal store: every generated candidate (submitted,
+                // gate-suppressed, earnings/DTE/liquidity-skipped) with its full
+                // contract/regime context — not just the suppressions above — so
+                // past signals are queryable for analysis (execution/OrderLedger.hpp's
+                // options_signals table).
+                generator.set_generated_signal_hook(
+                    [this](const nox::options_signal::OptionsSignalGenerator::GeneratedSignalInfo& info) {
+                        if (!orderLedger_) return;
+                        nox::execution::OrderLedger::GeneratedSignal gs;
+                        gs.ticker              = info.ticker;
+                        gs.strategy            = info.strategy;
+                        gs.signature           = info.signature;
+                        gs.direction           = info.direction;
+                        gs.strike              = info.strike;
+                        gs.strike2             = info.strike2;
+                        gs.strike3             = info.strike3;
+                        gs.strike4             = info.strike4;
+                        gs.expiration_date     = info.expiration_date;
+                        gs.dte                 = info.dte;
+                        gs.macro_override_used = info.macro_override_used;
+                        gs.iv_rank             = info.iv_rank;
+                        gs.hrv30               = info.hrv30;
+                        gs.quality_score       = info.quality_score;
+                        gs.regime              = info.regime;
+                        gs.vix_term_label      = info.vix_term_label;
+                        gs.earnings_checked    = info.earnings_checked;
+                        gs.outcome             = info.outcome;
+                        gs.reason              = info.reason;
+                        orderLedger_->logGeneratedSignal(gs);
+                    });
+
+                // Post-earnings drift research (passive — never gates or sizes a
+                // trade): when a ticker is skipped for a confirmed earnings date,
+                // record the pre-earnings price/technicals; separately, resolve
+                // T+1/T+5 realized move once enough calendar time has passed.
+                // Read the accumulated earnings_drift_observations table after a
+                // few months to see if there's a real pattern before ever acting
+                // on it live.
+                generator.set_earnings_drift_hook(
+                    [this](const nox::options_signal::OptionsSignalGenerator::EarningsDriftInfo& info) {
+                        if (!orderLedger_) return;
+                        nox::execution::OrderLedger::EarningsDriftObservation o;
+                        o.ticker        = info.ticker;
+                        o.earnings_date = info.earnings_date;
+                        o.pre_price     = info.price;
+                        o.pre_rsi       = info.rsi;
+                        o.pre_sma20     = info.sma20;
+                        o.pre_sma50     = info.sma50;
+                        o.pre_atr       = info.atr;
+                        o.direction     = info.direction;
+                        orderLedger_->recordEarningsDriftObservation(o);
+                    });
+                generator.set_earnings_drift_pending_query(
+                    [this]() -> std::vector<nox::options_signal::OptionsSignalGenerator::EarningsDriftPendingItem> {
+                        std::vector<nox::options_signal::OptionsSignalGenerator::EarningsDriftPendingItem> out;
+                        if (!orderLedger_) return out;
+                        for (const auto& row : orderLedger_->getPendingEarningsDrift()) {
+                            out.push_back({row.id, row.ticker, row.pre_price, row.day_offset});
+                        }
+                        return out;
+                    });
+                generator.set_earnings_drift_resolve_hook(
+                    [this](long id, int day_offset, double price, double move_pct) {
+                        if (!orderLedger_) return;
+                        if (day_offset == 1)      orderLedger_->resolveEarningsDriftT1(id, price, move_pct);
+                        else if (day_offset == 5) orderLedger_->resolveEarningsDriftT5(id, price, move_pct);
+                    });
+
+                // ── Phase 1 post-order hook (items 1 & 2) ─────────────────────
+                // Records the router's disposition. 'unknown' (timeout/parse) means
+                // reconciliation — not a guess — resolves the true outcome.
+                generator.set_post_order_hook(
+                    [this](const std::string& client_oid, const std::string& ledger_status,
+                           const std::string& broker_order_id) {
+                        if (orderLedger_)
+                            orderLedger_->setStatus(client_oid, ledger_status, broker_order_id);
+                    });
+
+                // Stagger this profile's first scan so the three option threads
+                // (bot/personal/breakout) don't all fire their per-ticker Alpaca
+                // calls in the same instant every interval. They share a boot-time
+                // reference and an identical scan_interval_minutes, so without this
+                // they're structurally synchronized: 3 threads x ~2.5 req/sec each
+                // (400ms/ticker) overlapping already exceeds Alpaca's documented
+                // ~200 req/min ceiling, with no retry/backoff on this side to absorb
+                // a resulting 429. Interruptible so shutdown doesn't hang.
+                if (stagger_seconds > 0) {
+                    std::unique_lock<std::mutex> lk(stop_mutex_);
+                    stop_cv_.wait_for(lk, std::chrono::seconds(stagger_seconds),
+                                       [this] { return !running_.load(); });
+                }
+
                 while (running_.load()) {
+                    if (!nox::is_trading_day()) {
+                        Logger::log("INFO", "[OPTIONS_SIGNAL][" + profile.name +
+                                    "] Non-trading day — skipping scan.");
+                        // Sleep until next interval (interruptible on shutdown)
+                        std::unique_lock<std::mutex> lk(stop_mutex_);
+                        stop_cv_.wait_for(lk,
+                            std::chrono::minutes(profile.scan_interval_minutes),
+                            [this] { return !running_.load(); });
+                        continue;
+                    }
+
                     try {
+                        // Phase 1: reconcile pending/unknown orders against broker
+                        // truth BEFORE evaluating new signals (throttled + idempotent,
+                        // so the two options threads don't double-poll).
+                        reconcile_options_orders();
+                        // Global kill switch, automatic half: same throttle pattern,
+                        // same two-thread-shared call site.
+                        check_daily_loss_limit();
+
                         double equity = fetch_account_equity();
                         if (equity > 0.0) {
                             generator.run_scan(equity);
@@ -2045,8 +3158,15 @@ public:
             });
         };
 
-        launchOptionsThread(optionsBotProfile_);
-        launchOptionsThread(optionsPersonalProfile_);
+        // Spread the three profiles' scans across the interval instead of all
+        // firing at boot (see the stagger comment inside launchOptionsThread).
+        int optionsStaggerSeconds = 300;
+        if (const char* v = std::getenv("OPTIONS_THREAD_STAGGER_SECONDS")) {
+            try { optionsStaggerSeconds = std::max(0, std::stoi(std::string(v))); } catch (...) {}
+        }
+        launchOptionsThread(optionsBotProfile_, 0);
+        launchOptionsThread(optionsPersonalProfile_, optionsStaggerSeconds);
+        launchOptionsThread(optionsBreakoutProfile_, 2 * optionsStaggerSeconds);
 
         // ── Equity signal scanner thread ──────────────────────────────────────
         if (equityScanEnabled_) {
@@ -2067,6 +3187,16 @@ public:
                 lk.unlock();
 
                 while (running_.load()) {
+                    if (!nox::is_trading_day()) {
+                        Logger::log("INFO", "[EQUITY_SCAN] Non-trading day — skipping scan.");
+                        // Sleep until next interval (interruptible on shutdown)
+                        std::unique_lock<std::mutex> slk(stop_mutex_);
+                        stop_cv_.wait_for(slk,
+                            std::chrono::minutes(equityScanIntervalMinutes_),
+                            [this] { return !running_.load(); });
+                        continue;
+                    }
+
                     try {
                         scanner.run_scan();
                     } catch (const std::exception& e) {
@@ -2078,6 +3208,43 @@ public:
                         [this] { return !running_.load(); });
                 }
                 Logger::log("INFO", "[EQUITY_SCAN] Thread exiting.");
+            });
+        }
+        // ────────────────────────────────────────────────────────────────────
+
+        // ── Futures signal scanner thread (signals only, no order routing) ────
+        if (futuresScanEnabled_ && futuresSignalStore_) {
+            option_threads_.emplace_back([this]() {
+                std::string tg_token = std::getenv("TELEGRAM_BOT_TOKEN") ? std::getenv("TELEGRAM_BOT_TOKEN") : "";
+                std::string tg_chat  = std::getenv("TELEGRAM_CHAT_ID")   ? std::getenv("TELEGRAM_CHAT_ID")   : "";
+
+                auto massiveClient = std::make_shared<nox::execution::MassiveFuturesClient>(massiveApiKey_);
+                nox::futures_signal::FuturesSignalGenerator generator(
+                    secret, tg_token, tg_chat,
+                    futuresWatchlist_, futuresAlertThreshold_,
+                    massiveClient, futuresSignalStore_);
+
+                while (running_.load()) {
+                    if (!nox::is_trading_day()) {
+                        Logger::log("INFO", "[FUTURES_SCAN] Non-trading day — skipping scan.");
+                        std::unique_lock<std::mutex> slk(stop_mutex_);
+                        stop_cv_.wait_for(slk,
+                            std::chrono::minutes(futuresScanIntervalMinutes_),
+                            [this] { return !running_.load(); });
+                        continue;
+                    }
+
+                    try {
+                        generator.run_scan();
+                    } catch (const std::exception& e) {
+                        Logger::log("WARN", "[FUTURES_SCAN] Scan exception: " + std::string(e.what()));
+                    }
+                    std::unique_lock<std::mutex> slk(stop_mutex_);
+                    stop_cv_.wait_for(slk,
+                        std::chrono::minutes(futuresScanIntervalMinutes_),
+                        [this] { return !running_.load(); });
+                }
+                Logger::log("INFO", "[FUTURES_SCAN] Thread exiting.");
             });
         }
         // ────────────────────────────────────────────────────────────────────

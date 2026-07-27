@@ -1,0 +1,1 @@
+{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2022-08-26", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 45, "ticker": "O:ARKK220826P00045000", "underlying_ticker": "ARKK"}], "status": "OK", "request_id": "626dbd47087bdcdc4f7806a6f71279a5"}

@@ -23,6 +23,7 @@
 // market depth. Callers must not silently pretend this is real option
 // liquidity; see backtest_main.cpp's Methodology section for the disclosure.
 
+#include <algorithm>
 #include <cstdlib>
 #include <random>
 #include <string>
@@ -122,7 +123,19 @@ inline double profitTargetLevel(double entry_price, double profit_target_pct, bo
 
 inline double stopLossLevel(double entry_price, double stop_loss_mult, bool is_long) {
     double loss = entry_price * stop_loss_mult;
-    return is_long ? (entry_price - loss) : (entry_price + loss);
+    if (is_long) {
+        // A long option's value floors at 0 (worthless) — it can never lose
+        // MORE than 100% of the premium paid, so a stop_loss_mult >= 1.0
+        // asked for a level below zero, which is mathematically unreachable
+        // (audit §3 C2). Clamp the loss distance to the entry price itself;
+        // the stop then fires only once the position is fully wiped out,
+        // which real time decay/expiry can actually reach.
+        loss = std::min(loss, entry_price);
+        return entry_price - loss;
+    }
+    // A short's risk is uncapped (naked premium sold can cost many multiples
+    // of the credit collected to close) — no clamp needed here.
+    return entry_price + loss;
 }
 
 // The option's modeled VALUE rises for a profit target on a long (bought

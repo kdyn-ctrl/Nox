@@ -4,6 +4,7 @@
 #include <string>
 #include <cmath>
 #include <map>
+#include <cstdlib>
 
 // 1. Strictly define the possible market states
 enum class Regime {
@@ -137,10 +138,20 @@ public:
 
 
     // The main function your Analyst Agent calls every morning.
-    // Defaults below are illustrative placeholders — production thresholds are
-    // derived from private walk-forward validation, not committed to source.
+    // Thresholds are env-sourced (RULE-D11) with live defaults 30.0 / 0.95 — and
+    // these defaults ARE what executes (both callers, main.cpp + the options
+    // generator, use this 3-arg overload). Documented honestly here rather than
+    // the prior comment's false "derived from private walk-forward, not in source"
+    // claim (2nd-pass audit A3): no such off-source values are injected anywhere.
     AllocationStrategy evaluate(double current_vix, double spy_price, double spy_200_sma) {
-        return evaluate(current_vix, spy_price, spy_200_sma, 30.0, 0.95);
+        double vix_thr = 30.0, sma_buf = 0.95;
+        if (const char* v = std::getenv("REGIME_VIX_THRESHOLD")) {
+            try { vix_thr = std::stod(v); } catch (...) {}
+        }
+        if (const char* v = std::getenv("REGIME_SMA_BUFFER_PCT")) {
+            try { sma_buf = std::stod(v); } catch (...) {}
+        }
+        return evaluate(current_vix, spy_price, spy_200_sma, vix_thr, sma_buf);
     }
 
     // Overloaded evaluate function for the backtester to use configurable parameters.

@@ -1,5 +1,10 @@
 # Nox — Quantitative Trading Engine
 
+[![Language](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
+[![Docker](https://img.shields.io/badge/Docker-Enabled-blue.svg)](https://www.docker.com/)
+[![Status](https://img.shields.io/badge/Status-Paper--Trading-green.svg)](#license--status)
+
 A production-grade C++ options and equity trading system with Black-Scholes pricing, regime-based strategy selection, and live Alpaca execution.
 
 **Status:** Paper trading / Educational. Not for live capital without extensive validation.
@@ -36,7 +41,7 @@ Quick links:
 - **Multi-source Data:** Alpaca, NewsAPI, Polygon, SEC EDGAR, AkShare (CN), East Money (CN)
 - **Execution:** Alpaca REST + WebSocket, rule-based order routing, position tracking
 - **Regime Classifier:** VIX/SMA-based market regime (RISK_ON / TRANSITION / RISK_OFF)
-- **Backtester:** Historical validation with walk-forward analysis
+- **Backtester:** Walk-forward research harness (model-vs-model Black-Scholes pricing on historical OHLCV — a directional-signal research tool, **not** a go-live P&L estimator; see note below)
 - **Monitoring:** Telegram alerts, EOD/EOW reports, health checks
 
 ---
@@ -135,6 +140,17 @@ cd execution && ./build.sh
 
 See [docs/testing/](docs/testing/) for detailed guides.
 
+### A note on backtest results
+
+The backtester replays the live signal-generation logic on historical OHLCV and
+re-prices options with a Black-Scholes model (IV proxied from realized
+volatility). It does **not** use real historical option chains, real bid/ask
+spreads, or event-volatility dynamics. Optional cost knobs (`haircutpct`,
+`commissionpercontract`) can degrade fills toward realism, but the fill price
+still starts from a model mid, not a quoted market. Treat every backtest number
+as **directional-signal research**, not a live-P&L forecast — a strategy that
+looks profitable here has cleared a necessary bar, not a sufficient one.
+
 ---
 
 ## License & Status
@@ -145,4 +161,4 @@ For questions, see [docs/reference/DOCUMENTATION_OVERVIEW.md](docs/reference/DOC
 
 ---
 
-**Last updated:** July 2, 2026
+**Last updated:** July 26, 2026

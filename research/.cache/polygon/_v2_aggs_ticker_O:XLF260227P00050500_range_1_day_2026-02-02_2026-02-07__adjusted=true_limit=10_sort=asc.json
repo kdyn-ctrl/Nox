@@ -1,0 +1,1 @@
+{"ticker": "O:XLF260227P00050500", "queryCount": 2, "resultsCount": 2, "adjusted": true, "results": [{"v": 29, "vw": 0.2793, "o": 0.18, "c": 0.3, "h": 0.3, "l": 0.18, "t": 1770094800000, "n": 3}, {"v": 5, "vw": 0.36, "o": 0.36, "c": 0.36, "h": 0.36, "l": 0.36, "t": 1770267600000, "n": 1}], "status": "OK", "request_id": "eda44866425e395a328f3dd60979dd48", "count": 2}

@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 import json as _json
 import requests
 import xml.etree.ElementTree as ET
@@ -191,9 +192,89 @@ except EnvironmentError as e:
     sys.exit(1)
 
 
-def fetch_alpaca_news() -> Optional[List[Dict[str, Any]]]:
+ALPACA_BROKER_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+
+
+def fetch_tradable_universe() -> List[str]:
     """
-    Fetches the latest financial news from Alpaca's API.
+    Every active, tradable US-equity symbol Alpaca knows about (~6000-8000
+    tickers) — the broad universe for the market-wide fundamentals-risk
+    screen (see main.py's _build_fundamentals_universe). Filters out
+    warrants/units/preferred shares (anything with non-alpha characters or
+    >5 chars), same filter as heartbeat/monitor.py's fetch_market_universe().
+
+    Fails open to [] on any error — a dead Alpaca feed degrades the
+    fundamentals scan to its WATCHLIST fallback, never crashes it.
+    """
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    params = {"status": "active", "asset_class": "us_equity", "tradable": "true"}
+    resp = fetch_with_retry(
+        f"{ALPACA_BROKER_URL}/v2/assets", source="Alpaca asset list",
+        headers=headers, params=params, timeout=HTTP_TIMEOUT,
+    )
+    if resp is None or resp.status_code != 200:
+        print("[WARN] [SCRAPER] Alpaca asset list fetch failed.", flush=True)
+        return []
+    try:
+        assets = resp.json()
+        tickers = [
+            a["symbol"] for a in assets
+            if a.get("symbol", "").isalpha() and len(a["symbol"]) <= 5
+        ]
+        print(f"[INFO] [SCRAPER] Alpaca tradable universe: {len(tickers)} tickers.", flush=True)
+        return tickers
+    except Exception as e:
+        print(f"[WARN] [SCRAPER] Alpaca asset list parse failed: {e}", flush=True)
+        return []
+
+
+def fetch_price_snapshots(tickers: List[str]) -> Dict[str, float]:
+    """
+    Batch last-trade price for many tickers via Alpaca's snapshots endpoint,
+    chunked at 300 symbols/request (URL length limit — same chunking as
+    heartbeat/monitor.py's fetch_batch_snapshots). Used only to price-filter
+    the broad universe before the expensive per-ticker SEC fetch, so this
+    returns just {ticker: price} rather than the fuller snapshot heartbeat's
+    momentum scanner needs.
+    """
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    prices: Dict[str, float] = {}
+    CHUNK = 300
+    for i in range(0, len(tickers), CHUNK):
+        chunk = tickers[i:i + CHUNK]
+        resp = fetch_with_retry(
+            "https://data.alpaca.markets/v2/stocks/snapshots",
+            source=f"Alpaca snapshots chunk {i // CHUNK}",
+            headers=headers, params={"symbols": ",".join(chunk), "feed": "iex"},
+            timeout=HTTP_TIMEOUT,
+        )
+        if resp is None or resp.status_code != 200:
+            continue
+        try:
+            for ticker, snap in resp.json().items():
+                latest = snap.get("latestTrade") or {}
+                daily = snap.get("dailyBar") or {}
+                price = latest.get("p") or daily.get("c")
+                if price:
+                    prices[ticker] = price
+        except Exception as e:
+            print(f"[WARN] [SCRAPER] Alpaca snapshots chunk {i // CHUNK} parse failed: {e}", flush=True)
+        time.sleep(0.5)  # respect rate limits between chunks
+    return prices
+
+
+def fetch_alpaca_news(ticker: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+    """
+    Fetches the latest financial news from Alpaca's API. Pass `ticker` to
+    scope results to one symbol (Alpaca's news endpoint natively supports a
+    `symbols` filter) — used by the per-ticker digest endpoint; omitted for
+    the existing global top-N headline feed.
 
     Returns None if the fetch failed after retries (distinct from a
     successful fetch that legitimately found zero articles, which returns
@@ -208,6 +289,8 @@ def fetch_alpaca_news() -> Optional[List[Dict[str, Any]]]:
         "limit": 10,
         "sort": "desc",
     }
+    if ticker:
+        params["symbols"] = ticker.upper()
     response = fetch_with_retry(url, source="Alpaca news", headers=headers, params=params, timeout=HTTP_TIMEOUT)
     if response is None:
         return None
@@ -239,11 +322,15 @@ def fetch_alpaca_news() -> Optional[List[Dict[str, Any]]]:
         return None
 
 
-def fetch_newsapi_news() -> Optional[List[Dict[str, Any]]]:
+def fetch_newsapi_news(ticker: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
     """
     Fetches news from NewsAPI (free tier: 100 req/day, includes global + tech +
     finance). Filters for market-relevant keywords to avoid pure noise.
     Backup source used by fetch_news_with_fallback() when Alpaca fails.
+
+    Pass `ticker` to scope the query to one symbol instead of the global
+    keyword filter — NewsAPI has no dedicated ticker field, so this is a
+    plain keyword search on the ticker string, best-effort by nature.
 
     Returns [] if the key is unset (source not configured — not a failure) or
     a legitimate empty result set. Returns None if the HTTP call itself failed
@@ -254,8 +341,11 @@ def fetch_newsapi_news() -> Optional[List[Dict[str, Any]]]:
         return []
 
     url = "https://newsapi.org/v2/everything"
-    # Market-relevant keywords: earnings, inflation, Fed, tech, energy, geopolitics
-    q = "(earnings OR inflation OR \"federal reserve\" OR fed OR nvda OR tsla OR aapl OR msft OR tech OR tariff OR sanctions OR oil OR energy) AND (market OR stock OR trading OR business)"
+    if ticker:
+        q = ticker.upper()
+    else:
+        # Market-relevant keywords: earnings, inflation, Fed, tech, energy, geopolitics
+        q = "(earnings OR inflation OR \"federal reserve\" OR fed OR nvda OR tsla OR aapl OR msft OR tech OR tariff OR sanctions OR oil OR energy) AND (market OR stock OR trading OR business)"
     params = {
         "q": q,
         "sortBy": "publishedAt",
@@ -293,10 +383,13 @@ def fetch_newsapi_news() -> Optional[List[Dict[str, Any]]]:
         return None
 
 
-def fetch_polygon_news() -> Optional[List[Dict[str, Any]]]:
+def fetch_polygon_news(ticker: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
     """
     Fetches news from Polygon.io free tier. Second backup source used by
     fetch_news_with_fallback() when both Alpaca and NewsAPI fail.
+
+    Pass `ticker` to scope results to one symbol — Polygon's reference/news
+    endpoint natively supports a `ticker` filter.
 
     Returns [] if the key is unset or a legitimate empty result set. Returns
     None if the HTTP call itself failed after retries.
@@ -311,6 +404,8 @@ def fetch_polygon_news() -> Optional[List[Dict[str, Any]]]:
         "sort": "-published_utc",
         "apiKey": api_key,
     }
+    if ticker:
+        params["ticker"] = ticker.upper()
     response = fetch_with_retry(url, source="Polygon news", params=params, timeout=HTTP_TIMEOUT)
     if response is None:
         return None
@@ -349,11 +444,17 @@ _RSS_FEEDS = [
 ]
 
 
-def fetch_rss_news() -> Optional[List[Dict[str, Any]]]:
+def fetch_rss_news(ticker: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
     """
     Fetches news from free RSS feeds (Reuters, CNBC, DW News). Provides
     geopolitical + earnings + market news without an API key. Last-resort
     fallback source in fetch_news_with_fallback().
+
+    Pass `ticker` to keep only items whose headline mentions it — RSS feeds
+    have no native ticker filter, so this is a weak substring match, same
+    "transparent about what it can't do well" spirit as the rest of this
+    per-ticker path (Alpaca/Polygon's native filters are much stronger;
+    this is deliberately the last resort, not the primary mechanism).
 
     Returns [] if every feed came back empty; returns None only if every
     single feed request failed outright (all sources down).
@@ -394,6 +495,10 @@ def fetch_rss_news() -> Optional[List[Dict[str, Any]]]:
     if not any_success:
         return None
 
+    if ticker:
+        needle = ticker.upper()
+        result = [item for item in result if needle in (item.get("headline") or "").upper()]
+
     score_news_batch(result)
     if result:
         print(f"[INFO] [SCRAPER] RSS feeds fetched ({len(result)} articles, sentiment scored).", flush=True)
@@ -422,12 +527,15 @@ def deduplicate_news(news_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return deduped
 
 
-def fetch_news_with_fallback() -> Optional[List[Dict[str, Any]]]:
+def fetch_news_with_fallback(ticker: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
     """
     Orchestrates multi-source news fetching with fallback logic.
     Tries sources in order: Alpaca (primary) -> NewsAPI -> Polygon -> RSS
     (last resort). Deduplicates, filters by topic, and scores all results
     uniformly.
+
+    Pass `ticker` to scope every source to one symbol instead of the global
+    feed — used by the per-ticker digest endpoint.
 
     Returns None only if ALL sources failed outright (network/API failures
     across the board) — distinct from a successful run that legitimately
@@ -437,7 +545,7 @@ def fetch_news_with_fallback() -> Optional[List[Dict[str, Any]]]:
     all_news: List[Dict[str, Any]] = []
     any_source_reachable = False
 
-    news = fetch_alpaca_news()
+    news = fetch_alpaca_news(ticker=ticker)
     if news is not None:
         any_source_reachable = True
     if news:
@@ -446,14 +554,14 @@ def fetch_news_with_fallback() -> Optional[List[Dict[str, Any]]]:
     else:
         print("[WARN] [SCRAPER] Primary (Alpaca) failed or empty, trying backups...", flush=True)
 
-        newsapi_items = fetch_newsapi_news()
+        newsapi_items = fetch_newsapi_news(ticker=ticker)
         if newsapi_items is not None:
             any_source_reachable = True
         if newsapi_items:
             all_news.extend(newsapi_items)
             print(f"[INFO] [SCRAPER] Secondary (NewsAPI) succeeded: {len(newsapi_items)} items", flush=True)
 
-        polygon_items = fetch_polygon_news()
+        polygon_items = fetch_polygon_news(ticker=ticker)
         if polygon_items is not None:
             any_source_reachable = True
         if polygon_items:
@@ -461,7 +569,7 @@ def fetch_news_with_fallback() -> Optional[List[Dict[str, Any]]]:
             print(f"[INFO] [SCRAPER] Secondary (Polygon) succeeded: {len(polygon_items)} items", flush=True)
 
         if not all_news:
-            rss_items = fetch_rss_news()
+            rss_items = fetch_rss_news(ticker=ticker)
             if rss_items is not None:
                 any_source_reachable = True
             if rss_items:
@@ -486,69 +594,126 @@ def fetch_news_with_fallback() -> Optional[List[Dict[str, Any]]]:
     return filtered
 
 
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+
+
 def fetch_earnings_calendar(tickers: List[str]) -> Dict[str, Optional[List[Dict[str, Any]]]]:
     """
-    Queries Alpaca's corporate actions endpoint for scheduled earnings announcements.
-    Returns a dict mapping each ticker to a list of earnings dates within the next 30 days.
+    Queries Finnhub's free /calendar/earnings endpoint for scheduled earnings
+    announcements over the next 30 days. Returns a dict mapping each ticker
+    to a list of earnings dates.
 
     Format: {
-        "AAPL": [{"date": "2026-07-15", "eps": 1.23, "eps_estimate": 1.20}, ...],
-        "TSLA": [{"date": "2026-07-20"}, ...],
+        "AAPL": [{"date": "2026-07-30", "description": "Q3 2026 earnings (amc)"}, ...],
+        "TSLA": [],
         ...
     }
-    A ticker maps to None (not []) if its fetch failed after retries, so a
-    real "no earnings scheduled" is never confused with "the API call failed".
+    A ticker maps to None (not []) only if the whole-market fetch itself
+    failed after retries, so a real "no earnings scheduled" is never confused
+    with "the API call failed".
+
+    2026-07-19: this used to call Alpaca's /v2/corporate-actions with
+    types=earnings — confirmed live that Alpaca's real endpoint
+    (data.alpaca.markets/v1/corporate-actions) 400s with "invalid ca type:
+    earnings" (its supported types are splits/dividends/mergers/spin-offs/
+    etc., never earnings), and the URL this code actually called
+    (api.alpaca.markets/v2/corporate-actions) 404s outright — Alpaca has
+    never supported earnings-date data at all, so this function had never
+    returned a real earnings date in production for any ticker. Finnhub's
+    free tier does carry real earnings dates (confirmed live) and its
+    /calendar/earnings endpoint returns the WHOLE MARKET for a date range in
+    one call, so this is now one request total instead of one per ticker —
+    filtered down to `tickers` client-side.
+
+    2026-07-22: confirmed live against the real key that a single 30-day-wide
+    call silently truncates at exactly 1500 events (Finnhub free-tier response
+    cap) — a 14-day window already hits 1500, and the events that survive the
+    cap are NOT the nearest-term ones (a live 30-day call returned only
+    August dates for our watchlist, dropping GOOGL's SAME-DAY and LMT's
+    NEXT-DAY earnings entirely). That silently broke both the Scout report's
+    "reports TODAY/in N days" section AND the C++ options engine's pre/post-
+    earnings buffer gates (OptionsSignalGenerator.hpp's hasEarningsWithin5Days/
+    hasRecentEarnings both read this same cache) — a real-money-adjacent
+    correctness bug, not just a cosmetic report gap. Fixed by chunking the
+    30-day window into 10-day slices (confirmed live at ~1361 events, safely
+    under the 1500 cap) and merging results, so no sub-window can silently
+    drop near-term dates the way one wide call did.
 
     RULE-008: Enforces (5, 10) timeout tuple on all HTTP calls.
     """
-    url = "https://api.alpaca.markets/v2/corporate-actions"
-    headers = {
-        "APCA-API-KEY-ID": ALPACA_KEY,
-        "APCA-API-SECRET-KEY": ALPACA_SECRET,
-    }
+    if not FINNHUB_API_KEY:
+        print("[WARN] [SCRAPER] FINNHUB_API_KEY not set — earnings calendar unavailable.", flush=True)
+        return {t: None for t in tickers}
 
-    result: Dict[str, Optional[List[Dict[str, Any]]]] = {}
-
-    # Compute the 30-day forward window from today (UTC)
     now_utc = datetime.now(tz=timezone.utc)
-    start_date = now_utc.date().isoformat()
-    end_date = (now_utc + timedelta(days=30)).date().isoformat()
+    total_days = 30
+    # 2026-07-22: 10-day chunks (~1361 events off-peak) still hit the 1500 cap
+    # during a dense reporting week live (2026-08-02..2026-08-12: 1500,
+    # confirmed truncated) — even a 5-day window got as high as 1462 events
+    # in the same peak week. Single-day counts topped out at ~453 in that
+    # same week, so 3-day chunks (10 calls/refresh, once per 24h — trivial
+    # against Finnhub's free-tier rate limit) leave real margin instead of
+    # chasing the cap with a slightly smaller number.
+    chunk_days = 3
+    ticker_set = set(tickers)
+    result: Dict[str, Optional[List[Dict[str, Any]]]] = {t: [] for t in tickers}
+    first_chunk_failed = False
 
-    for ticker in tickers:
-        params = {
-            "symbols": ticker,
-            "types": "earnings",
-            "start": start_date,
-            "end": end_date,
-        }
+    for offset in range(0, total_days, chunk_days):
+        start_date = (now_utc + timedelta(days=offset)).date().isoformat()
+        end_date = (now_utc + timedelta(days=min(offset + chunk_days, total_days))).date().isoformat()
+
         response = fetch_with_retry(
-            url, source=f"Alpaca earnings:{ticker}", headers=headers, params=params, timeout=HTTP_TIMEOUT
+            "https://finnhub.io/api/v1/calendar/earnings",
+            source="Finnhub earnings calendar",
+            params={"from": start_date, "to": end_date, "token": FINNHUB_API_KEY},
+            timeout=HTTP_TIMEOUT,
         )
-        if response is None:
-            result[ticker] = None
+        if response is None or response.status_code != 200:
+            print(f"[WARN] [SCRAPER] Finnhub earnings calendar fetch failed for "
+                  f"{start_date}..{end_date} (status={response.status_code if response else 'N/A'}).",
+                  flush=True)
+            if offset == 0:
+                # The near-term chunk is the one Scout's "reports TODAY/in Nd"
+                # section and the options engine's 5-day pre/post-earnings
+                # gates actually depend on — treat its failure as a full
+                # fetch failure (None for every ticker) rather than silently
+                # rendering "no earnings" from an empty-but-not-None result.
+                # A later, longer-horizon chunk failing is lower-stakes
+                # (informational only) and just logs above.
+                first_chunk_failed = True
             continue
+
         try:
-            response.raise_for_status()
-            data = response.json()
-            events = data.get("corporate_actions", [])
+            events = response.json().get("earningsCalendar", [])
+        except Exception as e:
+            print(f"[WARN] [SCRAPER] Finnhub earnings calendar parse failed for "
+                  f"{start_date}..{end_date}: {e}", flush=True)
+            if offset == 0:
+                first_chunk_failed = True
+            continue
 
-            earnings_list = []
-            for event in events:
-                # Each event has: id, symbol, date, type, description, etc.
-                if event.get("type") == "earnings":
-                    earnings_list.append({
-                        "date": event.get("date"),
-                        "description": event.get("description"),
-                    })
+        if len(events) >= 1500:
+            print(f"[WARN] [SCRAPER] Finnhub earnings calendar chunk {start_date}..{end_date} "
+                  f"hit {len(events)} events — may still be truncated; consider a smaller chunk_days.",
+                  flush=True)
+        for event in events:
+            symbol = event.get("symbol")
+            date = event.get("date")
+            if symbol not in ticker_set or not date:
+                continue
+            hour = event.get("hour") or ""
+            description = f"Q{event.get('quarter', '?')} {event.get('year', '?')} earnings"
+            if hour:
+                description += f" ({hour})"
+            result[symbol].append({"date": date, "description": description})
 
-            result[ticker] = earnings_list
-            if earnings_list:
-                print(f"[INFO] [SCRAPER] Earnings found for {ticker}: {len(earnings_list)} event(s).",
-                      flush=True)
+    if first_chunk_failed:
+        return {t: None for t in tickers}
 
-        except requests.RequestException as e:
-            print(f"[WARN] [SCRAPER] Could not fetch earnings for {ticker}: {e}", flush=True)
-            result[ticker] = None
+    for ticker, earnings_list in result.items():
+        if earnings_list:
+            print(f"[INFO] [SCRAPER] Earnings found for {ticker}: {len(earnings_list)} event(s).", flush=True)
 
     return result
 

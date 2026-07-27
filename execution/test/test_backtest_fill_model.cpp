@@ -4,7 +4,6 @@
 
 #include "../BacktestFillModel.hpp"
 
-#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <random>
@@ -14,8 +13,8 @@ using namespace nox::backtest;
 
 static int g_failures = 0;
 #define CHECK(cond, msg) do { \
-    if (!(cond)) { std::cout << "  \xE2\x9C\x97 FAIL: " << (msg) << "\n"; ++g_failures; } \
-    else         { std::cout << "  \xE2\x9C\x93 " << (msg) << "\n"; } \
+    if (!(cond)) { std::cout << "  ✗ FAIL: " << (msg) << "\n"; ++g_failures; } \
+    else         { std::cout << "  ✓ " << (msg) << "\n"; } \
 } while (0)
 
 int main() {
@@ -131,7 +130,12 @@ int main() {
     std::cout << "\n[level/approach formulas — long]\n";
     {
         CHECK(profitTargetLevel(10.0, 0.5, true) == 15.0, "long profit target: entry + entry*pct");
-        CHECK(stopLossLevel(10.0, 2.0, true) == -10.0, "long stop loss: entry - entry*mult");
+        // A long's value floors at 0 — a mult >= 1.0 (100%+ loss) clamps to
+        // the entry price itself (fully worthless), never goes negative
+        // (audit §3 C2 — this used to assert -10.0, a mathematically
+        // unreachable option price).
+        CHECK(stopLossLevel(10.0, 2.0, true) == 0.0, "long stop loss >=100%: clamped to 0 (worthless), not negative");
+        CHECK(stopLossLevel(10.0, 0.5, true) == 5.0, "long stop loss <100%: entry - entry*mult, unclamped");
         CHECK(approachedFromAboveForTarget(true) == false, "long target approached from below");
         CHECK(approachedFromAboveForStop(true) == true, "long stop approached from above");
     }

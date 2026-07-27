@@ -1,0 +1,1 @@
+{"ticker": "O:NFLX250221P00300000", "queryCount": 2, "resultsCount": 2, "adjusted": true, "results": [{"v": 6, "vw": 0.03, "o": 0.03, "c": 0.03, "h": 0.03, "l": 0.03, "t": 1737435600000, "n": 2}, {"v": 36, "vw": 0.01, "o": 0.01, "c": 0.01, "h": 0.01, "l": 0.01, "t": 1737522000000, "n": 11}], "status": "OK", "request_id": "3541670873cff691e3025022df6ef9e5", "count": 2}

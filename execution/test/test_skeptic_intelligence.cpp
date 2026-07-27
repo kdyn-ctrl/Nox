@@ -1,13 +1,12 @@
 // test_skeptic_intelligence.cpp — the decision layer that wires WS2 (alt-macro),
 // WS3 (insider clusters) and the new China information-lag feed into sizing/
 // gating. SkepticIntelligence.hpp is pure aggregation math (no HTTP/JSON/I/O),
-// so these tests build Inputs directly. The live network fetch+parse lives in
+// so these tests build Inputs directly — the same testable shape as
+// test_portfolio_risk_manager.cpp. The live network fetch+parse lives in
 // OptionsSignalGenerator; only the decision is exercised here.
 
 #include "../SkepticIntelligence.hpp"
 
-#include <cmath>
-#include <cstdlib>
 #include <iostream>
 #include <string>
 
@@ -15,8 +14,8 @@ using namespace nox::skeptic;
 
 static int g_failures = 0;
 #define CHECK(cond, msg) do { \
-    if (!(cond)) { std::cout << "  \xE2\x9C\x97 FAIL: " << (msg) << "\n"; ++g_failures; } \
-    else         { std::cout << "  \xE2\x9C\x93 " << (msg) << "\n"; } \
+    if (!(cond)) { std::cout << "  ✗ FAIL: " << (msg) << "\n"; ++g_failures; } \
+    else         { std::cout << "  ✓ " << (msg) << "\n"; } \
 } while (0)
 
 static Knobs baseKnobs() {
@@ -30,6 +29,7 @@ static Knobs baseKnobs() {
     k.altmacro_contradict_cut = 0.45;
     k.china_align_boost       = 1.30;
     k.china_fresh_extra       = 1.15;
+    k.china_boost_enabled     = true; // boost tests below opt in explicitly; default-off is tested separately
     k.china_oppose_cut        = 0.50;
     k.size_mult_min           = 0.40;
     k.size_mult_max           = 1.60;
@@ -41,7 +41,7 @@ static Knobs baseKnobs() {
 static bool approx(double a, double b) { return std::abs(a - b) < 1e-6; }
 
 static void test_no_signals_is_noop() {
-    std::cout << "\n[empty] no skeptic inputs -> 1.0x, no suppress\n";
+    std::cout << "\n[empty] no skeptic inputs → 1.0x, no suppress\n";
     auto d = decide(Dir::Bullish, Inputs{}, baseKnobs());
     CHECK(approx(d.size_mult, 1.0), "empty inputs leave sizing unchanged");
     CHECK(!d.suppress, "empty inputs never suppress");
@@ -49,7 +49,7 @@ static void test_no_signals_is_noop() {
 }
 
 static void test_insider_boosts_aligned_bull() {
-    std::cout << "\n[insider] cluster buy + bullish trade -> boost\n";
+    std::cout << "\n[insider] cluster buy + bullish trade → boost\n";
     Inputs in; in.insider = {true, 3};
     auto d = decide(Dir::Bullish, in, baseKnobs());
     CHECK(approx(d.size_mult, 1.25), "3-insider cluster boosts a bullish trade 1.25x");
@@ -57,7 +57,7 @@ static void test_insider_boosts_aligned_bull() {
 }
 
 static void test_insider_cuts_opposed_bear() {
-    std::cout << "\n[insider] cluster buy vs a bearish trade -> cut\n";
+    std::cout << "\n[insider] cluster buy vs a bearish trade → cut\n";
     Inputs in; in.insider = {true, 3};
     auto d = decide(Dir::Bearish, in, baseKnobs());
     CHECK(approx(d.size_mult, 0.75), "insiders buying while short cuts sizing 0.75x");
@@ -65,14 +65,14 @@ static void test_insider_cuts_opposed_bear() {
 }
 
 static void test_insider_below_min_execs_ignored() {
-    std::cout << "\n[insider] single insider (< min_execs) -> ignored\n";
+    std::cout << "\n[insider] single insider (< min_execs) → ignored\n";
     Inputs in; in.insider = {true, 1};
     auto d = decide(Dir::Bullish, in, baseKnobs());
     CHECK(approx(d.size_mult, 1.0), "a lone insider below min_execs does not move sizing");
 }
 
 static void test_insider_neutral_trade_no_change() {
-    std::cout << "\n[insider] cluster buy on a NEUTRAL (vol) trade -> no size change\n";
+    std::cout << "\n[insider] cluster buy on a NEUTRAL (vol) trade → no size change\n";
     Inputs in; in.insider = {true, 4};
     auto d = decide(Dir::Neutral, in, baseKnobs());
     CHECK(approx(d.size_mult, 1.0), "directional insider info can't size a straddle");
@@ -82,14 +82,14 @@ static void test_altmacro_aligned_and_opposed() {
     std::cout << "\n[altmacro] aligned boosts; opposed cuts\n";
     Inputs a; a.alt_macro = {true, Dir::Bullish, 0.6, false};
     CHECK(approx(decide(Dir::Bullish, a, baseKnobs()).size_mult, 1.15),
-          "physical supply bullish + bullish trade -> 1.15x");
+          "physical supply bullish + bullish trade → 1.15x");
     Inputs b; b.alt_macro = {true, Dir::Bearish, 0.6, false};
     CHECK(approx(decide(Dir::Bullish, b, baseKnobs()).size_mult, 0.60),
-          "physical supply bearish + bullish trade -> 0.60x cut");
+          "physical supply bearish + bullish trade → 0.60x cut");
 }
 
 static void test_altmacro_contradiction_hard_cut_and_suppress() {
-    std::cout << "\n[altmacro] text-contradicts-physical, opposed -> hard cut + suppress\n";
+    std::cout << "\n[altmacro] text-contradicts-physical, opposed → hard cut + suppress\n";
     Inputs in; in.alt_macro = {true, Dir::Bearish, 0.8, true};
     auto d = decide(Dir::Bullish, in, baseKnobs());
     CHECK(approx(d.size_mult, 0.45), "contradiction-opposed applies the 0.45x hard cut");
@@ -98,28 +98,45 @@ static void test_altmacro_contradiction_hard_cut_and_suppress() {
 }
 
 static void test_china_fresh_aligned_stacks() {
-    std::cout << "\n[china] fresh aligned release stacks align x fresh, then clamps\n";
+    std::cout << "\n[china] fresh aligned release stacks align×fresh, then clamps\n";
     Inputs in; in.china = {true, Dir::Bullish, 0.7, true, "caixin_pmi"};
     auto d = decide(Dir::Bullish, in, baseKnobs());
     // 1.30 * 1.15 = 1.495, under the 1.60 ceiling
-    CHECK(approx(d.size_mult, 1.495), "fresh aligned china lag = align x fresh = 1.495x");
+    CHECK(approx(d.size_mult, 1.495), "fresh aligned china lag = align×fresh = 1.495x");
     CHECK(d.reason == "skeptic_boost", "reported as a boost");
 }
 
 static void test_china_fresh_opposed_suppresses() {
-    std::cout << "\n[china] fresh opposed release -> hard opposition, suppress\n";
+    std::cout << "\n[china] fresh opposed release → hard opposition, suppress\n";
     Inputs in; in.china = {true, Dir::Bearish, 0.7, true, "caixin_pmi"};
     auto d = decide(Dir::Bullish, in, baseKnobs());
     CHECK(approx(d.size_mult, 0.50), "opposed china lag cuts to 0.50x");
-    CHECK(d.suppress, "a FRESH opposed release is hard opposition -> suppress");
+    CHECK(d.suppress, "a FRESH opposed release is hard opposition → suppress");
 }
 
-static void test_china_stale_opposed_cuts_no_suppress() {
-    std::cout << "\n[china] stale opposed release -> cut but NOT suppress\n";
+static void test_china_stale_opposed_never_cuts() {
+    std::cout << "\n[china] stale opposed release → logged only, no size change, no suppress\n";
     Inputs in; in.china = {true, Dir::Bearish, 0.7, false, "caixin_pmi"};
     auto d = decide(Dir::Bullish, in, baseKnobs());
-    CHECK(approx(d.size_mult, 0.50), "stale opposed china lag still cuts to 0.50x");
-    CHECK(!d.suppress, "a STALE (already-priced) opposed release only sizes down");
+    CHECK(approx(d.size_mult, 1.0), "RULE-D4: a STALE release must never move sizing, cut included");
+    CHECK(!d.suppress, "a STALE opposed release never suppresses either");
+}
+
+static void test_china_boost_disabled_by_default() {
+    std::cout << "\n[china] boost side is logging-only unless china_boost_enabled is set (RULE-D5)\n";
+    Knobs k = baseKnobs();
+    k.china_boost_enabled = false;
+    Inputs in; in.china = {true, Dir::Bullish, 0.7, true, "caixin_pmi"};
+    auto d = decide(Dir::Bullish, in, k);
+    CHECK(approx(d.size_mult, 1.0), "a fresh aligned release does not boost when china_boost_enabled=false");
+    CHECK(d.reason == "skeptic_neutral", "disabled boost still reports neutral, not skeptic_boost");
+}
+
+static void test_china_stale_aligned_never_boosts_even_if_enabled() {
+    std::cout << "\n[china] stale aligned release never boosts, even with china_boost_enabled=true\n";
+    Inputs in; in.china = {true, Dir::Bullish, 0.7, false, "caixin_pmi"};
+    auto d = decide(Dir::Bullish, in, baseKnobs()); // baseKnobs has china_boost_enabled=true
+    CHECK(approx(d.size_mult, 1.0), "RULE-D4: STALE aligned release does not boost even when the feature is enabled");
 }
 
 static void test_clamp_ceiling() {
@@ -129,7 +146,7 @@ static void test_clamp_ceiling() {
     in.alt_macro = {true, Dir::Bullish, 0.9, false};
     in.china = {true, Dir::Bullish, 0.9, true, "caixin_pmi"};
     auto d = decide(Dir::Bullish, in, baseKnobs());
-    // raw = 1.25*1.15*1.30*1.15 = 2.15 -> clamped to 1.60
+    // raw = 1.25*1.15*1.30*1.15 = 2.15 → clamped to 1.60
     CHECK(approx(d.size_mult, 1.60), "combined boost clamps at size_mult_max");
     CHECK(!d.suppress, "an all-aligned setup never suppresses");
 }
@@ -140,7 +157,7 @@ static void test_suppress_disabled_only_cuts() {
     k.suppress_enabled = false;
     Inputs in; in.china = {true, Dir::Bearish, 0.7, true, "caixin_pmi"};
     auto d = decide(Dir::Bullish, in, k);
-    CHECK(!d.suppress, "suppression disabled -> never suppress");
+    CHECK(!d.suppress, "suppression disabled → never suppress");
     CHECK(approx(d.size_mult, 0.50), "but the size cut still applies");
 }
 
@@ -152,6 +169,11 @@ static void test_env_override() {
     unsetenv("SKEPTIC_INSIDER_BOOST");
     Knobs k2 = Knobs::fromEnv();
     CHECK(approx(k2.insider_boost, 1.25), "falls back to the fake-safe default when unset");
+    CHECK(!k2.china_boost_enabled, "SKEPTIC_CHINA_BOOST_ENABLED defaults false (RULE-D5, unmeasured premise)");
+    setenv("SKEPTIC_CHINA_BOOST_ENABLED", "true", 1);
+    Knobs k3 = Knobs::fromEnv();
+    CHECK(k3.china_boost_enabled, "SKEPTIC_CHINA_BOOST_ENABLED=true is honored once the premise can be measured");
+    unsetenv("SKEPTIC_CHINA_BOOST_ENABLED");
 }
 
 int main() {
@@ -165,13 +187,15 @@ int main() {
     test_altmacro_contradiction_hard_cut_and_suppress();
     test_china_fresh_aligned_stacks();
     test_china_fresh_opposed_suppresses();
-    test_china_stale_opposed_cuts_no_suppress();
+    test_china_stale_opposed_never_cuts();
+    test_china_boost_disabled_by_default();
+    test_china_stale_aligned_never_boosts_even_if_enabled();
     test_clamp_ceiling();
     test_suppress_disabled_only_cuts();
     test_env_override();
 
     std::cout << "\n";
-    if (g_failures == 0) { std::cout << "All SkepticIntelligence tests passed.\n"; return 0; }
-    std::cout << g_failures << " SkepticIntelligence test(s) failed.\n";
+    if (g_failures == 0) { std::cout << "✅ All SkepticIntelligence tests passed.\n"; return 0; }
+    std::cout << "❌ " << g_failures << " SkepticIntelligence test(s) failed.\n";
     return 1;
 }
