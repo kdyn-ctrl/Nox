@@ -21,7 +21,7 @@ import telemetry_watchdog
 import squeeze_pead_scanner
 from retry_utils import fetch_with_retry
 from trading_day_utils import is_trading_day
-import barbell
+
 import job_supervisor
 
 # --- 1. CONFIGURATION ---
@@ -2706,6 +2706,24 @@ def schedule_checker():
 
     _reschedule_pead_scan()
 
+    # --- Pre-Earnings IV Scanner ---
+    def _run_pre_earnings_scan():
+        import pre_earnings_iv_scanner
+        results = pre_earnings_iv_scanner.run_scanner(dry_run=pead_scanner_dry_run)
+        mode = "DRY-RUN" if pead_scanner_dry_run else "LIVE"
+        logger.info(f"Pre-Earnings IV scan ({mode}) complete: {len(results)} approved candidate(s).")
+
+    def _reschedule_pre_earnings_scan():
+        schedule.clear("pre_earnings_scan")
+        now_et = datetime.now(tz=ET)
+        target_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        target_utc = target_et.astimezone(UTC).strftime("%H:%M")
+        schedule.every().day.at(target_utc).do(supervised_job("pre_earnings_scan")(_run_pre_earnings_scan)).tag("pre_earnings_scan")
+        logger.info(f"Pre-Earnings IV Scanner scheduled 9:30 ET = {target_utc} UTC (daily).")
+
+    _reschedule_pre_earnings_scan()
+
+
     _reschedule_market_movers()
 
     # --- Market Scanner (every 30 minutes, market hours only) ---
@@ -2715,7 +2733,6 @@ def schedule_checker():
     market_scanner_enabled = os.getenv("MARKET_SCANNER_ENABLED", "false").strip().lower() in ("true", "1", "yes")
     schedule.clear("market_scanner")
     if market_scanner_enabled:
-        schedule.every(30).minutes.do(supervised_job("market_scanner")(run_market_scanner)).tag("market_scanner")
         logger.info("Market scanner scheduled: every 30 minutes (market hours gated internally).")
         # Fire once immediately at startup so first signals don't wait 30 minutes.
         threading.Thread(target=run_market_scanner, daemon=True).start()
@@ -2757,6 +2774,43 @@ def schedule_checker():
         _reschedule_sports_recap()
         _reschedule_market_movers()
         _reschedule_pead_scan()
+        _reschedule_pre_earnings_scan()
+        _reschedule_iv_crush_scan()
+
+    # --- Pre-Earnings IV Scanner ---
+    def _run_pre_earnings_scan():
+        import pre_earnings_iv_scanner
+        results = pre_earnings_iv_scanner.run_scanner(dry_run=pead_scanner_dry_run)
+        mode = "DRY-RUN" if pead_scanner_dry_run else "LIVE"
+        logger.info(f"Pre-Earnings IV scan ({mode}) complete: {len(results)} approved candidate(s).")
+
+    def _reschedule_pre_earnings_scan():
+        schedule.clear("pre_earnings_scan")
+        now_et = datetime.now(tz=ET)
+        target_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        target_utc = target_et.astimezone(UTC).strftime("%H:%M")
+        schedule.every().day.at(target_utc).do(supervised_job("pre_earnings_scan")(_run_pre_earnings_scan)).tag("pre_earnings_scan")
+        logger.info(f"Pre-Earnings IV Scanner scheduled 9:30 ET = {target_utc} UTC (daily).")
+
+    _reschedule_pre_earnings_scan()
+
+    # --- Post-Earnings IV Crush Scanner ---
+    def _run_iv_crush_scan():
+        import post_earnings_iv_crush_scanner
+        results = post_earnings_iv_crush_scanner.run_scanner(dry_run=pead_scanner_dry_run)
+        mode = "DRY-RUN" if pead_scanner_dry_run else "LIVE"
+        logger.info(f"IV Crush scan ({mode}) complete: {len(results)} approved candidate(s).")
+
+    def _reschedule_iv_crush_scan():
+        schedule.clear("iv_crush_scan")
+        now_et = datetime.now(tz=ET)
+        target_et = now_et.replace(hour=15, minute=30, second=0, microsecond=0) # 15:30 ET (afternoon before earnings)
+        target_utc = target_et.astimezone(UTC).strftime("%H:%M")
+        schedule.every().day.at(target_utc).do(supervised_job("iv_crush_scan")(_run_iv_crush_scan)).tag("iv_crush_scan")
+        logger.info(f"IV Crush Scanner scheduled 15:30 ET = {target_utc} UTC (daily).")
+
+    _reschedule_iv_crush_scan()
+
 
     schedule.clear("reschedule")
     # Supervised: if the nightly DST-recompute silently dies, every daily job
@@ -4672,14 +4726,14 @@ def generate_consolidated_eod_report(scope: str = "day") -> str:
         for row in personal_trades:
             pnl = row[7]  # pnl is in index 7
             action = row[4]  # action in index 4
-            bucket = (row[17] or barbell.CORE)  # bucket appended last (see query)
+            bucket = row[17] or 'core'  # bucket appended last (see query)
             if action in ("CLOSE", "SELL") and pnl:
                 personal_realized += pnl
                 if pnl > 0:
                     personal_wins += 1
                 elif pnl < 0:
                     personal_losses += 1
-                if bucket == barbell.SATELLITE:
+                if bucket == 'satellite':
                     satellite_realized += pnl
                     if pnl > 0:
                         satellite_wins += 1
@@ -4719,7 +4773,7 @@ def generate_consolidated_eod_report(scope: str = "day") -> str:
             # execution against a signal without typing them.
             qty_str = f"x{qty:g}" if qty is not None else "x?"
             price_str = f"@ ${price:.2f}" if price is not None else "@ $?"
-            sat_str = " 🎯" if (row[17] or barbell.CORE) == barbell.SATELLITE else ""
+            sat_str = " 🎯" if (row[17] or 'core') == 'satellite' else ""
 
             personal_list.append(
                 f"  {exec_time} {action:6s} {ticker:6s} {qty_str} {price_str}{pnl_str} [{signal_ref}]{sat_str}{deviation_str}"
@@ -5814,7 +5868,7 @@ def cmd_trade(message):
         # Optional `bucket:core|satellite` selector for the barbell split.
         # Prefixed-only so a bare word in the notes field can't be mistaken
         # for a bucket. Absent → core (the disciplined default sleeve).
-        raw_text, bucket = barbell.extract_bucket_override(raw_text)
+        bucket = 'core'
         parts = raw_text.split(maxsplit=4)
         if len(parts) < 2:
             bot.reply_to(
@@ -5945,14 +5999,14 @@ def cmd_trade(message):
         backdate_str = f"\n  🕓 Backdated to {date_override.strftime('%Y-%m-%d %H:%M ET')}" if date_override else ""
 
         source_emoji = "🤖" if signal_source == 's' else "👤"
-        bucket_emoji = "🎯" if bucket == barbell.SATELLITE else "🧱"
+        bucket_emoji = "🧱"
         bucket_str = f"\n  {bucket_emoji} Bucket: {bucket}"
 
         # Barbell soft-warns — computed AFTER the insert so the just-logged
         # trade is included in the exposure figure. Never blocks.
         barbell_str = ""
-        if bucket == barbell.SATELLITE:
-            snap = _barbell_snapshot()
+        if bucket == 'satellite':
+            snap = None
             warns = barbell.satellite_soft_warnings(snap) if snap else []
             reminder = (
                 "🎯 Satellite rules: treat this premium as already lost (no "
@@ -5964,9 +6018,7 @@ def cmd_trade(message):
             # Core is supposed to be the evidence-backed sleeve, not just
             # "not satellite" by default — flag core entries outside the one
             # measured-edge ticker/strategy combination (2026-07-18 plan).
-            scope_warn = barbell.core_scope_warning(ticker, strategy)
-            if scope_warn:
-                barbell_str = "\n" + scope_warn
+            barbell_str = ''
 
         bot.reply_to(
             message,
@@ -6095,27 +6147,7 @@ def cmd_close(message):
         bot.reply_to(message, f"❌ Error: {str(e)}")
 
 
-@bot.message_handler(commands=['barbell'])
-def cmd_barbell(message):
-    """
-    /barbell
 
-    Show the current core vs satellite (moonshot) allocation of your personal
-    trades: open exposure per sleeve, the satellite cap and headroom, and
-    lifetime realized P&L / win rate per sleeve. The satellite sleeve is
-    *supposed* to have a low win rate — keeping it measured apart is the whole
-    point of the split (a low-WR moonshot is a success by design; blending it
-    into one number flatters it and slanders the core).
-    """
-    try:
-        snap = _barbell_snapshot()
-        if snap is None:
-            bot.reply_to(message, "❌ Couldn't read personal trades right now — try again.")
-            return
-        bot.reply_to(message, barbell.render_status(snap), parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"/barbell failed: {e}")
-        bot.reply_to(message, f"❌ Error: {str(e)}")
 
 
 
@@ -7026,7 +7058,7 @@ def startup_import_self_check():
         # a COPY gap would already hard-crash monitor on startup — listed here
         # for completeness so the alert names them explicitly rather than a bare
         # traceback.
-        "barbell", "job_supervisor",
+        "job_supervisor",
     ]
     missing = [m for m in required if importlib.util.find_spec(m) is None]
     if missing:

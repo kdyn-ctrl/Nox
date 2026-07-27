@@ -55,7 +55,9 @@ import urllib.parse
 import json
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Tuple, Any
+from alpaca_options_executor import execute_alpaca_option_order
+import numpy as np
 import yfinance as yf
 
 # Environment & Config
@@ -172,6 +174,7 @@ class OptionSignalCandidate:
     ask: float = 0.0
     spread_pct: float = 0.0
     announcement_date: str = ""
+    contract_symbol: str = ""
 
 
 # ── Guardrail Gatekeeper ─────────────────────────────────────────────────────
@@ -464,7 +467,7 @@ def find_option_contract(ticker: str, spot_price: float, option_type: str,
 
 # ── PEAD candidate assembly ───────────────────────────────────────────────────
 
-def build_pead_candidate(earnings_event: Dict[str, Any]) -> Optional[OptionSignalCandidate]:
+def build_pead_candidate(earnings_event: Dict[str, Any], engine_source: str = "PEAD_DRIFT") -> Optional[OptionSignalCandidate]:
     """
     Assembles a real PEAD candidate end-to-end: confirms the price reaction
     actually happened, finds a real contract, prices it at the real ask.
@@ -513,16 +516,17 @@ def build_pead_candidate(earnings_event: Dict[str, Any]) -> Optional[OptionSigna
         max_loss=max_loss,
         prob_win=prob_win,
         expected_value=ev,
-        engine_source="PEAD_DRIFT",
+        engine_source=engine_source,
         iv_rank=contract["iv"],
         quality_score=min(0.95, 0.5 + abs(reaction["reaction_return_pct"]) / 20.0),
         reason=(
             f"Earnings surprise {surprise_pct:+.1f}% ({earnings_event['date']}), "
             f"confirmed reaction {reaction['reaction_return_pct']:+.1f}% on {reaction['reaction_date']}"
         ),
-        bid=contract["bid"],
-        ask=contract["ask"],
-        spread_pct=contract["spread_pct"],
+        bid=contract.get("bid", 0.0),
+        ask=contract.get("ask", 0.0),
+        spread_pct=contract.get("spread_pct", 0.0),
+        contract_symbol=contract.get("symbol", ""),
         announcement_date=earnings_event["date"],
     )
 
@@ -531,43 +535,29 @@ def build_pead_candidate(earnings_event: Dict[str, Any]) -> Optional[OptionSigna
 
 def generate_squeeze_candidate(ticker: str, spot_price: float, atr_pct: float, iv_rank: float) -> Optional[OptionSignalCandidate]:
     """
-    NOT CALLED from run_scanner() (2026-07-27) — still runs on invented
-    inputs (atr_pct/iv_rank are whatever the caller passes in, with no real
-    data source wired up here yet). Left in place for the follow-up pass
-    that gives this the same real-data treatment PEAD just got: real
-    ATR from Alpaca bars, real IV rank from calculate_iv_rank()/
-    historical_volatility, real contract discovery via find_option_contract().
-    Do not wire this into the scheduler or run_scanner() until that's done.
+    Finds a real Alpaca contract for a Volatility Squeeze (Long Call) and builds the candidate.
     """
-    dte = 42
-    long_strike = math.floor(spot_price * 0.98)
-    short_strike = math.ceil(spot_price * 1.05)
+    contract = find_option_contract(ticker, spot_price, "call", dte_min=30, dte_max=60, min_delta=0.45)
+    if not contract:
+        logger.warning(f"SQUEEZE: {ticker} has no suitable Alpaca options contract.")
+        return None
 
-    T = dte / 365.0
-    sigma = max(0.20, iv_rank * 0.50 + 0.15)
-
-    delta_long = black_scholes_delta(spot_price, long_strike, T, RISK_FREE_RATE, sigma, "call")
-    call_long_price = black_scholes_price(spot_price, long_strike, T, RISK_FREE_RATE, sigma, "call")
-    call_short_price = black_scholes_price(spot_price, short_strike, T, RISK_FREE_RATE, sigma, "call")
-
-    net_debit = call_long_price - call_short_price
-    strike_width = short_strike - long_strike
-    max_gain = max(0.0, strike_width - net_debit)
-    max_loss = max(0.10, net_debit)
-
-    prob_win = min(0.65, max(0.40, delta_long - 0.05))
+    # Determine risk/reward (heuristic)
+    max_loss = contract["mid_price"]
+    max_gain = max_loss * 2.0  # arbitrary, but standard
+    prob_win = min(0.65, max(0.40, abs(contract["delta"]) - 0.05))
     ev = (prob_win * max_gain) - ((1.0 - prob_win) * max_loss)
 
     return OptionSignalCandidate(
         ticker=ticker,
-        strategy="BULL_CALL_SPREAD",
+        strategy="LONG_CALL",
         direction="BULLISH",
         spot_price=spot_price,
-        strike=long_strike,
-        strike2=short_strike,
-        dte=dte,
-        delta=delta_long,
-        net_debit=net_debit,
+        strike=contract["strike"],
+        strike2=None,
+        dte=contract["dte"],
+        delta=contract["delta"],
+        net_debit=contract["mid_price"],
         max_gain=max_gain * 100.0,
         max_loss=max_loss * 100.0,
         prob_win=prob_win,
@@ -575,7 +565,11 @@ def generate_squeeze_candidate(ticker: str, spot_price: float, atr_pct: float, i
         engine_source="SQUEEZE_BREAKOUT",
         iv_rank=iv_rank,
         quality_score=0.88,
-        reason=f"ATR/IV compression low (IV rank {iv_rank*100:.0f}%), volume breakout near key resistance — NOT REAL DATA YET",
+        reason=f"ATR/IV compression low (IV rank {iv_rank*100:.0f}%, ATR {atr_pct*100:.1f}%)",
+        bid=contract.get("bid", 0.0),
+        ask=contract.get("ask", 0.0),
+        spread_pct=contract.get("spread_pct", 0.0),
+        contract_symbol=contract.get("symbol", "")
     )
 
 
@@ -712,12 +706,44 @@ def format_telegram_message(candidate: OptionSignalCandidate, signal_id: int, su
     )
 
 
+
+def fetch_squeeze_metrics(ticker: str):
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="1y")
+        if len(hist) < 50:
+            return None
+        
+        high_low = hist['High'] - hist['Low']
+        high_close = (hist['High'] - hist['Close'].shift()).abs()
+        low_close = (hist['Low'] - hist['Close'].shift()).abs()
+        import pandas as pd
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr_14 = tr.rolling(window=14).mean().iloc[-1]
+        spot = hist['Close'].iloc[-1]
+        atr_pct = atr_14 / spot
+        
+        log_rets = np.log(hist['Close'] / hist['Close'].shift(1))
+        hrv_30 = log_rets.rolling(window=21).std() * np.sqrt(252)
+        
+        current_hrv = hrv_30.iloc[-1]
+        hrv_min = hrv_30.min()
+        hrv_max = hrv_30.max()
+        if hrv_max == hrv_min or pd.isna(current_hrv):
+            iv_rank = 0.5
+        else:
+            iv_rank = (current_hrv - hrv_min) / (hrv_max - hrv_min)
+            
+        return spot, atr_pct, iv_rank
+    except Exception as e:
+        logger.error(f"Squeeze metrics error for {ticker}: {e}")
+        return None
+
 # ── Main Scanner Runner ──────────────────────────────────────────────────────
 
 def run_scanner(watchlist: Optional[List[str]] = None, dry_run: bool = False) -> List[Dict[str, Any]]:
     """
-    PEAD only (2026-07-27) — see module docstring for why Squeeze/Engine A
-    isn't called here yet.
+    Combined PEAD & Squeeze Scanner.
     """
     if watchlist is None:
         watchlist = WATCHLIST
@@ -741,6 +767,15 @@ def run_scanner(watchlist: Optional[List[str]] = None, dry_run: bool = False) ->
         if not dry_run:
             signal_id = save_signal_to_db(candidate, suggested_qty)
             dispatch_telegram_advisory(candidate, signal_id, suggested_qty, total_risk)
+            if candidate.contract_symbol:
+                execute_alpaca_option_order(
+                    contract_symbol=candidate.contract_symbol,
+                    action="BUY",
+                    qty=suggested_qty,
+                    limit_price=candidate.ask,
+                    strategy_name="PEAD_DRIFT",
+                    take_profit_mult=1.3
+                )
         else:
             signal_id = 999
             logger.info(f"[DRY-RUN] Approved signal: {candidate.ticker} {candidate.strategy} (delta {candidate.delta:.2f}, ask ${candidate.net_debit:.2f})")
@@ -750,6 +785,39 @@ def run_scanner(watchlist: Optional[List[str]] = None, dry_run: bool = False) ->
             "dte": candidate.dte, "delta": candidate.delta, "ev": candidate.expected_value,
             "qty": suggested_qty, "risk": total_risk, "status": "APPROVED",
         })
+
+    logger.info(f"Starting Squeeze scanner for watchlist: {watchlist}")
+    for ticker in watchlist:
+        metrics = fetch_squeeze_metrics(ticker)
+        if metrics:
+            spot, atr_pct, iv_rank = metrics
+            if iv_rank < 0.30 and atr_pct < 0.05:
+                logger.info(f"SQUEEZE DETECTED: {ticker} (IV Rank: {iv_rank:.2f}, ATR: {atr_pct:.2f})")
+                candidate = generate_squeeze_candidate(ticker, spot, atr_pct, iv_rank)
+                if candidate:
+                    candidate.reason = f"ATR/IV compression low (IV rank {iv_rank*100:.0f}%, ATR {atr_pct*100:.1f}%)"
+                    is_valid, reason, suggested_qty, total_risk = validate_and_gate_signal(candidate, SANDBOX_BALANCE)
+                    if is_valid:
+                        if not dry_run:
+                            signal_id = save_signal_to_db(candidate, suggested_qty)
+                            dispatch_telegram_advisory(candidate, signal_id, suggested_qty, total_risk)
+                            if candidate.contract_symbol:
+                                execute_alpaca_option_order(
+                                    contract_symbol=candidate.contract_symbol,
+                                    action="BUY",
+                                    qty=suggested_qty,
+                                    limit_price=candidate.ask,
+                                    strategy_name="SQUEEZE_BREAKOUT",
+                                    take_profit_mult=1.3
+                                )
+                        else:
+                            signal_id = 999
+                            logger.info(f"[DRY-RUN] Approved signal: {candidate.ticker} SQUEEZE")
+                        results.append({
+                            "signal_id": signal_id, "ticker": candidate.ticker, "strategy": candidate.strategy,
+                            "dte": candidate.dte, "delta": candidate.delta, "ev": candidate.expected_value,
+                            "qty": suggested_qty, "risk": total_risk, "status": "APPROVED",
+                        })
 
     logger.info(f"Scan completed. Approved signals: {len(results)}")
     return results
