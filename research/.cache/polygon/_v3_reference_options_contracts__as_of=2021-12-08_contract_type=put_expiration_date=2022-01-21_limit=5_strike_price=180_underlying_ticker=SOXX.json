@@ -1,1 +1,0 @@
-{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2022-01-21", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 180, "ticker": "O:SOXX220121P00180000", "underlying_ticker": "SOXX"}], "status": "OK", "request_id": "1ebe41e6bb33af58fbb399f65f2fb2f6"}

@@ -1,1 +1,0 @@
-{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2023-03-31", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 43, "ticker": "O:SHOP230331P00043000", "underlying_ticker": "SHOP"}], "status": "OK", "request_id": "1482024c54e70fd9bdcfe6b96e20458f"}

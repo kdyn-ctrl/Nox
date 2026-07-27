@@ -1,1 +1,0 @@
-{"ticker": "O:QQQ220810P00276000", "queryCount": 2, "resultsCount": 2, "adjusted": true, "results": [{"v": 5, "vw": 3.366, "o": 2.77, "c": 4.26, "h": 4.26, "l": 2.77, "t": 1658116800000, "n": 2}, {"v": 24, "vw": 3.1975, "o": 3.34, "c": 2.43, "h": 3.34, "l": 2.4, "t": 1658203200000, "n": 7}], "status": "OK", "request_id": "963a01106da484675dd1ffb51cdb7545", "count": 2}

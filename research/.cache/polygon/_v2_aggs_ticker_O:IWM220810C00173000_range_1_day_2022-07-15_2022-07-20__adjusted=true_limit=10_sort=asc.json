@@ -1,1 +1,0 @@
-{"ticker": "O:IWM220810C00173000", "queryCount": 2, "resultsCount": 2, "adjusted": true, "results": [{"v": 17, "vw": 6.2506, "o": 6.49, "c": 5.13, "h": 6.59, "l": 5.13, "t": 1658116800000, "n": 8}, {"v": 2, "vw": 9.235, "o": 8.8, "c": 9.67, "h": 9.67, "l": 8.8, "t": 1658289600000, "n": 2}], "status": "OK", "request_id": "1d88b392f230cfd8b44bb85be4fb46ca", "count": 2}

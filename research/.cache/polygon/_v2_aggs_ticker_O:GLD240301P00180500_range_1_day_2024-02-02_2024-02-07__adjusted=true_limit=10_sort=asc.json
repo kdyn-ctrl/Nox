@@ -1,1 +1,0 @@
-{"ticker": "O:GLD240301P00180500", "queryCount": 2, "resultsCount": 2, "adjusted": true, "results": [{"v": 90, "vw": 0.1977, "o": 0.2, "c": 0.18, "h": 0.21, "l": 0.17, "t": 1706850000000, "n": 8}, {"v": 72, "vw": 0.12, "o": 0.12, "c": 0.12, "h": 0.12, "l": 0.12, "t": 1707282000000, "n": 2}], "status": "OK", "request_id": "84f6eb01cafe204537d9eb90e3490dcb", "count": 2}

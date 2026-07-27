@@ -1,1 +1,0 @@
-{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2025-04-04", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 102, "ticker": "O:SHOP250404P00102000", "underlying_ticker": "SHOP"}], "status": "OK", "request_id": "df1be34a51a71bf397c7c3615f78dd17"}

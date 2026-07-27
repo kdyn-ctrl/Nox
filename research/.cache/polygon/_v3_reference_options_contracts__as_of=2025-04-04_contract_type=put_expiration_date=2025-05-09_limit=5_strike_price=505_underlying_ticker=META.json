@@ -1,1 +1,0 @@
-{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2025-05-09", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 505, "ticker": "O:META250509P00505000", "underlying_ticker": "META"}], "status": "OK", "request_id": "e904e212970eb9ec5af0094bb756cc88"}

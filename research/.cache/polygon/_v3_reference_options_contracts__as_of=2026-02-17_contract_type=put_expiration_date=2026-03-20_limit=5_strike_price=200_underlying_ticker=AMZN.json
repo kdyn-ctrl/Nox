@@ -1,1 +1,0 @@
-{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2026-03-20", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 200, "ticker": "O:AMZN260320P00200000", "underlying_ticker": "AMZN"}], "status": "OK", "request_id": "f2c0f744391d06cbed62c995fa6b7344"}

@@ -1,1 +1,0 @@
-{"ticker": "O:COIN221007P00083000", "queryCount": 2, "resultsCount": 2, "adjusted": true, "results": [{"v": 33, "vw": 8.8576, "o": 9.05, "c": 9.3, "h": 9.3, "l": 8.2, "t": 1662955200000, "n": 7}, {"v": 13, "vw": 12.1231, "o": 11.8, "c": 12.15, "h": 12.15, "l": 11.8, "t": 1663041600000, "n": 2}], "status": "OK", "request_id": "71571d1e31897bf3a193a87d2e330c5c", "count": 2}

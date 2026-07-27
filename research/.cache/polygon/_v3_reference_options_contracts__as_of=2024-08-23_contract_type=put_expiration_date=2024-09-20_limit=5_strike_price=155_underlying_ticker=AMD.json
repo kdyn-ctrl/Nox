@@ -1,1 +1,0 @@
-{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2024-09-20", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 155, "ticker": "O:AMD240920P00155000", "underlying_ticker": "AMD"}], "status": "OK", "request_id": "fff47075e31969d18d0b9326a6e148e2"}

@@ -9,3 +9,19 @@
 execution/IBKRClient.cpp
 execution/IBKRClient.hpp
 execution/IBKR_MIGRATION.md
+
+# Sports predictions/betting — undecided public-facing exposure as of
+# 2026-07-12 (real Telegram bot, real odds-provider account, sports betting
+# carries different reputational/legal considerations than trading infra).
+# Kept private by default; revisit deliberately, don't let it sync by omission.
+sports_predictions/
+world_events/
+
+# Full private codebase reference — documents the confidential edge (Skeptic
+# workstreams, premium-selling research findings, IBKR path, sports/world-events
+# pilots). The path-substring guard won't catch its *contents*, so it is
+# denylisted explicitly. The public-facing overview lives in README.md + docs/.
+CODEBASE.md
+docs_private/
+memory_bank.db
+research/.cache/

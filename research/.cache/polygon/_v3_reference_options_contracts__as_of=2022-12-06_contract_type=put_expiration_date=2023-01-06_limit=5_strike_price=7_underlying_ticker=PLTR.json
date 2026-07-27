@@ -1,1 +1,0 @@
-{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2023-01-06", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 7, "ticker": "O:PLTR230106P00007000", "underlying_ticker": "PLTR"}], "status": "OK", "request_id": "bfb0dfdf5fe9f2cc6567ead2652328c0"}

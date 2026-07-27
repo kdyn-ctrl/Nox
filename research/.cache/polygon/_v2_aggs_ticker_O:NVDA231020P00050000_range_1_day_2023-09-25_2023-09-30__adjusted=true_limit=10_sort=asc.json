@@ -1,1 +1,0 @@
-{"ticker": "O:NVDA231020P00050000", "queryCount": 2, "resultsCount": 2, "adjusted": true, "results": [{"v": 4, "vw": 0.01, "o": 0.01, "c": 0.01, "h": 0.01, "l": 0.01, "t": 1695700800000, "n": 3}, {"v": 40, "vw": 0.0105, "o": 0.01, "c": 0.01, "h": 0.03, "l": 0.01, "t": 1695960000000, "n": 10}], "status": "OK", "request_id": "5e45a9f4612d1bad6c28737b5b1eba09", "count": 2}

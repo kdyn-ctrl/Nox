@@ -1,1 +1,0 @@
-{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2024-05-31", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 212.5, "ticker": "O:GLD240531P00212500", "underlying_ticker": "GLD"}], "status": "OK", "request_id": "9c7264c21ecbceb5c57fc6ccfcfa6927"}

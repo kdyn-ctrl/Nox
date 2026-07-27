@@ -1,1 +1,0 @@
-{"results": [{"cfi": "OPASPS", "contract_type": "put", "exercise_style": "american", "expiration_date": "2026-01-23", "primary_exchange": "BATO", "shares_per_contract": 100, "strike_price": 690, "ticker": "O:SPY260123P00690000", "underlying_ticker": "SPY"}], "status": "OK", "request_id": "29f0c62d52a7eff28b307bca3021a435"}
