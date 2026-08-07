@@ -6,6 +6,7 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 
+import pandas as pd
 import yfinance as yf
 from trading_day_utils import is_trading_day
 
@@ -24,32 +25,66 @@ logger = logging.getLogger("pre_earnings_iv_scanner")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 
 # The ultra-liquid names where this strategy actually works
 ULTRA_LIQUID_TICKERS = ["AAPL", "NVDA", "TSLA", "AMD", "AMZN", "META", "MSFT", "GOOGL"]
 TARGET_ENTRY_DAYS_BEFORE = 18
 
-def fetch_future_earnings(watchlist: List[str], lookahead_days: int = 40) -> List[Dict[str, Any]]:
-    if not FINNHUB_API_KEY:
-        logger.warning("Pre-Earnings IV Scanner: FINNHUB_API_KEY not set — skipping earnings scan")
-        return []
-
+def _fetch_future_earnings_yf(watchlist: List[str], lookahead_days: int = 40) -> Dict[str, Dict[str, Any]]:
+    """Cross-verify future earnings dates using yfinance consensus calendar."""
+    results = {}
     today = datetime.now(timezone.utc).date()
     end_date = today + timedelta(days=lookahead_days)
-    
-    url = "https://finnhub.io/api/v1/calendar/earnings"
-    params = {"from": today.isoformat(), "to": end_date.isoformat(), "token": FINNHUB_API_KEY}
-    
-    data = _http_get_json(url, params=params)
-    if not data or "earningsCalendar" not in data:
-        return []
+    for ticker in watchlist:
+        try:
+            t = yf.Ticker(ticker)
+            ed = t.get_earnings_dates(limit=4)
+            if ed is None or ed.empty:
+                continue
+            for idx, row in ed.iterrows():
+                event_date = idx.date()
+                if today <= event_date <= end_date:
+                    results[ticker] = {
+                        "symbol": ticker,
+                        "date": event_date.strftime("%Y-%m-%d"),
+                        "hour": "amc" if idx.hour >= 12 else "bmo",
+                        "epsEstimate": float(row["EPS Estimate"]) if pd.notna(row.get("EPS Estimate")) else None,
+                    }
+        except Exception as e:
+            logger.debug(f"yfinance future earnings lookup failed for {ticker}: {e}")
+    return results
 
-    events = []
-    for item in data["earningsCalendar"]:
-        t = item.get("symbol")
-        if t in watchlist:
-            events.append(item)
-    return events
+
+def fetch_future_earnings(watchlist: List[str], lookahead_days: int = 40) -> List[Dict[str, Any]]:
+    """Fetch future earnings dates cross-validated between Finnhub and yfinance calendars."""
+    events_map = {}
+    today = datetime.now(timezone.utc).date()
+    end_date = today + timedelta(days=lookahead_days)
+
+    if FINNHUB_API_KEY:
+        url = "https://finnhub.io/api/v1/calendar/earnings"
+        params = {"from": today.isoformat(), "to": end_date.isoformat(), "token": FINNHUB_API_KEY}
+        data = _http_get_json(url, params=params)
+        if data and "earningsCalendar" in data:
+            for item in data["earningsCalendar"]:
+                t = item.get("symbol")
+                if t in watchlist:
+                    events_map[t] = item
+
+    # Cross-verify and fill missing/discrepant events using yfinance
+    yf_events = _fetch_future_earnings_yf(watchlist, lookahead_days=lookahead_days)
+    for ticker, yf_item in yf_events.items():
+        if ticker not in events_map:
+            logger.info(f"Pre-Earnings IV: Added missing earnings event for {ticker} on {yf_item['date']} via yfinance cross-check.")
+            events_map[ticker] = yf_item
+        else:
+            fh_date = events_map[ticker].get("date")
+            if fh_date != yf_item["date"]:
+                logger.info(f"Pre-Earnings IV: Date discrepancy for {ticker} (Finnhub={fh_date}, yfinance={yf_item['date']}). Correcting to yfinance.")
+                events_map[ticker]["date"] = yf_item["date"]
+
+    return list(events_map.values())
 
 
 def count_trading_days_between(start_date, end_date) -> int:
@@ -65,6 +100,9 @@ def count_trading_days_between(start_date, end_date) -> int:
 
 def dispatch_pre_earnings_telegram(candidate: OptionSignalCandidate, signal_id: int) -> bool:
     """Custom format emphasizing the strict +30% TP and -3 Day exit rule."""
+    if not is_signal_dispatch_allowed(is_open_execution=True):
+        logger.info(f"[TELEGRAM_DISPATCH] Pre-Earnings signal s:{signal_id} saved, but Telegram alert suppressed (outside market/pre-open dispatch hours).")
+        return True
     
     msg_text = (
         f"📡 <b>PRE-EARNINGS IV EXPANSION</b> (<code>s:{signal_id}</code>)\n"

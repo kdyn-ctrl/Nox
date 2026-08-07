@@ -56,9 +56,11 @@ import json
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple, Any
-from alpaca_options_executor import execute_alpaca_option_order
 import numpy as np
+import pandas as pd
 import yfinance as yf
+
+from trading_day_utils import is_signal_dispatch_allowed
 
 # Environment & Config
 DB_PATH = os.getenv("MEMORY_BANK_PATH", "/app/data/memory_bank.db")
@@ -89,6 +91,7 @@ PEAD_DTE_MIN = int(os.getenv("PEAD_DTE_MIN", "30"))
 PEAD_DTE_MAX = int(os.getenv("PEAD_DTE_MAX", "60"))
 PEAD_MAX_SPREAD_PCT = float(os.getenv("PEAD_MAX_SPREAD_PCT", "12.0"))
 PEAD_MIN_DELTA = float(os.getenv("PEAD_MIN_DELTA", "0.60"))
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("squeeze_pead_scanner")
@@ -236,10 +239,39 @@ def _http_get_json(url: str, headers: Optional[dict] = None, params: Optional[di
         return None
 
 
+def _cross_check_yf_earnings_surprise(symbol: str, date_str: str) -> Optional[Dict[str, float]]:
+    """Cross-verify earnings surprise using yfinance's consensus earnings calendar to catch
+    Finnhub reporting anomalies (e.g. AMZN Q2 GAAP non-operating gain discrepancies)."""
+    try:
+        t = yf.Ticker(symbol)
+        ed = t.get_earnings_dates(limit=8)
+        if ed is None or ed.empty:
+            return None
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        for idx, row in ed.iterrows():
+            row_date = idx.date()
+            if abs((row_date - target_date).days) <= 1:
+                act = row.get("Reported EPS")
+                est = row.get("EPS Estimate")
+                surp = row.get("Surprise(%)")
+                if pd.notna(act) and pd.notna(est) and float(est) != 0.0:
+                    act_val = float(act)
+                    est_val = float(est)
+                    calc_surp = ((act_val - est_val) / abs(est_val)) * 100.0
+                    return {
+                        "eps_actual": act_val,
+                        "eps_estimate": est_val,
+                        "surprise_pct": calc_surp if pd.isna(surp) else float(surp),
+                    }
+    except Exception as e:
+        logger.debug(f"yfinance cross-check unavailable for {symbol} ({date_str}): {e}")
+    return None
+
+
 def fetch_recent_earnings_surprises(watchlist: List[str], lookback_days: int = PEAD_LOOKBACK_DAYS) -> List[Dict[str, Any]]:
     """
-    Real earnings surprises from Finnhub's /calendar/earnings, restricted to
-    `watchlist` and to events already reported within the lookback window.
+    Real earnings surprises from Finnhub's /calendar/earnings with yfinance consensus
+    cross-validation, restricted to `watchlist` and events within lookback window.
     """
     if not FINNHUB_API_KEY:
         logger.warning("PEAD: FINNHUB_API_KEY not set — skipping earnings scan")
@@ -265,9 +297,23 @@ def fetch_recent_earnings_surprises(watchlist: List[str], lookback_days: int = P
         if eps_actual is None or not eps_estimate:
             continue  # not yet reported, or no estimate to compare against
         surprise_pct = (eps_actual - eps_estimate) / abs(eps_estimate) * 100.0
+
+        # Cross-validate against yfinance consensus to resolve Finnhub data anomalies
+        event_date = event.get("date", "")
+        if event_date:
+            yf_check = _cross_check_yf_earnings_surprise(symbol, event_date)
+            if yf_check and abs(yf_check["surprise_pct"] - surprise_pct) > 10.0:
+                logger.info(
+                    f"PEAD: Finnhub/yfinance surprise discrepancy detected for {symbol} on {event_date}: "
+                    f"Finnhub={surprise_pct:+.1f}%, yfinance={yf_check['surprise_pct']:+.1f}%. Correcting to yfinance."
+                )
+                eps_actual = yf_check["eps_actual"]
+                eps_estimate = yf_check["eps_estimate"]
+                surprise_pct = yf_check["surprise_pct"]
+
         results.append({
             "ticker": symbol,
-            "date": event.get("date"),
+            "date": event_date,
             "hour": (event.get("hour") or "").strip().lower(),
             "eps_actual": eps_actual,
             "eps_estimate": eps_estimate,
@@ -293,14 +339,11 @@ def fetch_daily_bars(ticker: str, start_date: str, end_date: str) -> List[Dict[s
     return data.get("bars", []) or []
 
 
-def evaluate_reaction(bar_by_date: Dict[str, float], announcement_date: str, hour: str,
+def evaluate_reaction(bar_by_date: Dict[str, Dict[str, float]], announcement_date: str, hour: str,
                        surprise_pct: float, ticker: str = "") -> Optional[Dict[str, Any]]:
     """
-    Pure reaction-confirmation logic, shared between the live scanner
-    (fed real Alpaca bars via confirm_earnings_reaction below) and
-    research/pead_backtest.py (fed real ThetaData historical bars) — one
-    decision function, not two copies that could silently drift apart
-    (RULE-D6). `bar_by_date` maps "YYYY-MM-DD" -> close price.
+    Pure reaction-confirmation logic with Volume Accumulation filter.
+    `bar_by_date` maps "YYYY-MM-DD" -> {"close": float, "volume": float}.
     """
     dates_sorted = sorted(bar_by_date.keys())
     if len(dates_sorted) < 3:
@@ -322,10 +365,20 @@ def evaluate_reaction(bar_by_date: Dict[str, float], announcement_date: str, hou
     idx = dates_sorted.index(reaction_date)
     if idx == 0:
         return None
-    prev_close = bar_by_date[dates_sorted[idx - 1]]
-    reaction_close = bar_by_date[reaction_date]
+    prev_close = bar_by_date[dates_sorted[idx - 1]]["close"]
+    reaction_close = bar_by_date[reaction_date]["close"]
+    reaction_volume = bar_by_date[reaction_date]["volume"]
     if not prev_close:
         return None
+
+    # Institutional Volume Confirmation
+    ma_vol_days = dates_sorted[max(0, idx - 20) : idx]
+    if len(ma_vol_days) >= 5:
+        avg_vol = sum(bar_by_date[d]["volume"] for d in ma_vol_days) / len(ma_vol_days)
+        if avg_vol > 0 and reaction_volume < 1.5 * avg_vol:
+            logger.info(f"PEAD: {ticker} reaction volume ({reaction_volume}) < 1.5x MA20 ({avg_vol:.0f}) — missing institutional accumulation, skipping")
+            return None
+
     reaction_return_pct = (reaction_close - prev_close) / prev_close * 100.0
 
     expected_direction = 1 if surprise_pct > 0 else -1
@@ -341,7 +394,7 @@ def evaluate_reaction(bar_by_date: Dict[str, float], announcement_date: str, hou
     return {
         "reaction_date": reaction_date,
         "reaction_return_pct": reaction_return_pct,
-        "current_price": bar_by_date[latest_date],
+        "current_price": bar_by_date[latest_date]["close"],
     }
 
 
@@ -357,8 +410,8 @@ def confirm_earnings_reaction(ticker: str, announcement_date: str, hour: str, su
     except (ValueError, TypeError):
         return None
 
-    bars = fetch_daily_bars(ticker, (ann_date - timedelta(days=5)).isoformat(), (ann_date + timedelta(days=10)).isoformat())
-    bar_by_date = {b["t"][:10]: b["c"] for b in bars}
+    bars = fetch_daily_bars(ticker, (ann_date - timedelta(days=35)).isoformat(), (ann_date + timedelta(days=10)).isoformat())
+    bar_by_date = {b["t"][:10]: {"close": b["c"], "volume": b.get("v", 0)} for b in bars}
     return evaluate_reaction(bar_by_date, announcement_date, hour, surprise_pct, ticker)
 
 
@@ -381,12 +434,13 @@ _OCC_RE = re.compile(r"^[A-Z]+(\d{6})([CP])(\d{8})$")
 
 def find_option_contract(ticker: str, spot_price: float, option_type: str,
                           dte_min: int = PEAD_DTE_MIN, dte_max: int = PEAD_DTE_MAX,
-                          min_delta: float = PEAD_MIN_DELTA) -> Optional[Dict[str, Any]]:
+                          min_delta: float = PEAD_MIN_DELTA,
+                          max_delta: float = 1.0,
+                          strike_lo_pct: Optional[float] = None,
+                          strike_hi_pct: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """
-    Finds a real, currently-quoted contract meeting the delta/DTE/spread
-    guardrails. Delta/IV are solved from the real bid-ask mid price via
-    Black-Scholes inversion (see module docstring — Alpaca's indicative
-    feed carries no greeks/IV fields).
+    Finds a real, currently-quoted contract meeting the delta/DTE/spread guardrails.
+    Allows passing target strike percentages for building debit spreads.
     """
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         logger.warning("PEAD: Alpaca credentials not set — skipping contract search")
@@ -396,10 +450,14 @@ def find_option_contract(ticker: str, spot_price: float, option_type: str,
     exp_gte = (today + timedelta(days=dte_min)).isoformat()
     exp_lte = (today + timedelta(days=dte_max)).isoformat()
     is_call = option_type.lower() == "call"
-    # Delta >= min_delta calls/puts are meaningfully ITM: calls trade below
-    # spot, puts trade above spot.
-    strike_lo = round(spot_price * (0.75 if is_call else 1.01), 2)
-    strike_hi = round(spot_price * (0.99 if is_call else 1.25), 2)
+    
+    if strike_lo_pct is None:
+        strike_lo_pct = 0.75 if is_call else 1.01
+    if strike_hi_pct is None:
+        strike_hi_pct = 0.99 if is_call else 1.25
+
+    strike_lo = round(spot_price * strike_lo_pct, 2)
+    strike_hi = round(spot_price * strike_hi_pct, 2)
 
     headers = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
     data = _http_get_json(
@@ -444,7 +502,7 @@ def find_option_contract(ticker: str, spot_price: float, option_type: str,
         if iv is None:
             continue
         delta = black_scholes_delta(spot_price, strike, T, RISK_FREE_RATE, iv, option_type)
-        if abs(delta) < min_delta:
+        if abs(delta) < min_delta or abs(delta) > max_delta:
             continue
 
         candidates.append({
@@ -492,85 +550,68 @@ def build_pead_candidate(earnings_event: Dict[str, Any], engine_source: str = "P
 
     is_bullish = surprise_pct > 0
     option_type = "call" if is_bullish else "put"
-    contract = find_option_contract(ticker, spot_price, option_type)
-    if contract is None:
+    
+    # Long leg (ITM/ATM)
+    long_leg = find_option_contract(ticker, spot_price, option_type, 
+                                    strike_lo_pct=0.75 if is_bullish else 1.01,
+                                    strike_hi_pct=0.99 if is_bullish else 1.25)
+    if not long_leg:
         return None
 
-    net_debit = contract["ask"]  # what you'd actually pay to buy, right now
+    # Short leg (same expiration, lower delta, OTM)
+    short_leg = find_option_contract(ticker, spot_price, option_type,
+                                     dte_min=long_leg["dte"], dte_max=long_leg["dte"],
+                                     min_delta=0.10, max_delta=0.35,
+                                     strike_lo_pct=1.01 if is_bullish else 0.75,
+                                     strike_hi_pct=1.25 if is_bullish else 0.99)
+    if not short_leg:
+        logger.info(f"PEAD: could not find suitable short leg for {ticker} debit spread")
+        return None
+
+    # Debit spread calculation
+    net_debit = long_leg["ask"] - short_leg["bid"]
+    if net_debit <= 0:
+        logger.info(f"PEAD: {ticker} spread debit <= 0, inverted market")
+        return None
+    
+    max_gain = abs(short_leg["strike"] - long_leg["strike"]) - net_debit
+    if max_gain <= 0:
+        logger.info(f"PEAD: {ticker} spread max gain <= 0, bad pricing")
+        return None
+
     max_loss = net_debit * 100.0
-    max_gain = net_debit * 150.0  # profit TARGET (+50%), not a theoretical max — a long option's upside is uncapped
-    prob_win = min(0.65, max(0.40, abs(contract["delta"]) - 0.05))  # heuristic, display-only
-    ev = (prob_win * max_gain) - ((1.0 - prob_win) * max_loss)      # heuristic, display-only — not a gate
+    max_gain_dollars = max_gain * 100.0
+    prob_win = min(0.65, max(0.40, abs(long_leg["delta"]) - 0.05))
+    ev = (prob_win * max_gain_dollars) - ((1.0 - prob_win) * max_loss)
 
     return OptionSignalCandidate(
         ticker=ticker,
-        strategy="LONG_CALL" if is_bullish else "LONG_PUT",
+        strategy="BULL_CALL_SPREAD" if is_bullish else "BEAR_PUT_SPREAD",
         direction="BULLISH" if is_bullish else "BEARISH",
         spot_price=spot_price,
-        strike=contract["strike"],
-        strike2=None,
-        dte=contract["dte"],
-        delta=contract["delta"],
+        strike=long_leg["strike"],
+        strike2=short_leg["strike"],
+        dte=long_leg["dte"],
+        delta=long_leg["delta"],  # track long delta
         net_debit=net_debit,
-        max_gain=max_gain,
+        max_gain=max_gain_dollars,
         max_loss=max_loss,
         prob_win=prob_win,
         expected_value=ev,
         engine_source=engine_source,
-        iv_rank=contract["iv"],
+        iv_rank=long_leg["iv"],
         quality_score=min(0.95, 0.5 + abs(reaction["reaction_return_pct"]) / 20.0),
         reason=(
             f"Earnings surprise {surprise_pct:+.1f}% ({earnings_event['date']}), "
-            f"confirmed reaction {reaction['reaction_return_pct']:+.1f}% on {reaction['reaction_date']}"
+            f"reaction {reaction['reaction_return_pct']:+.1f}% on {reaction['reaction_date']}"
         ),
-        bid=contract.get("bid", 0.0),
-        ask=contract.get("ask", 0.0),
-        spread_pct=contract.get("spread_pct", 0.0),
-        contract_symbol=contract.get("symbol", ""),
+        bid=long_leg.get("bid", 0.0),
+        ask=long_leg.get("ask", 0.0),
+        spread_pct=long_leg.get("spread_pct", 0.0),
+        contract_symbol=long_leg.get("symbol", ""),
         announcement_date=earnings_event["date"],
     )
 
-
-# ── Volatility Squeeze (Engine A) — NOT ACTIVE, deferred pending real data ──
-
-def generate_squeeze_candidate(ticker: str, spot_price: float, atr_pct: float, iv_rank: float) -> Optional[OptionSignalCandidate]:
-    """
-    Finds a real Alpaca contract for a Volatility Squeeze (Long Call) and builds the candidate.
-    """
-    contract = find_option_contract(ticker, spot_price, "call", dte_min=30, dte_max=60, min_delta=0.45)
-    if not contract:
-        logger.warning(f"SQUEEZE: {ticker} has no suitable Alpaca options contract.")
-        return None
-
-    # Determine risk/reward (heuristic)
-    max_loss = contract["mid_price"]
-    max_gain = max_loss * 2.0  # arbitrary, but standard
-    prob_win = min(0.65, max(0.40, abs(contract["delta"]) - 0.05))
-    ev = (prob_win * max_gain) - ((1.0 - prob_win) * max_loss)
-
-    return OptionSignalCandidate(
-        ticker=ticker,
-        strategy="LONG_CALL",
-        direction="BULLISH",
-        spot_price=spot_price,
-        strike=contract["strike"],
-        strike2=None,
-        dte=contract["dte"],
-        delta=contract["delta"],
-        net_debit=contract["mid_price"],
-        max_gain=max_gain * 100.0,
-        max_loss=max_loss * 100.0,
-        prob_win=prob_win,
-        expected_value=ev * 100.0,
-        engine_source="SQUEEZE_BREAKOUT",
-        iv_rank=iv_rank,
-        quality_score=0.88,
-        reason=f"ATR/IV compression low (IV rank {iv_rank*100:.0f}%, ATR {atr_pct*100:.1f}%)",
-        bid=contract.get("bid", 0.0),
-        ask=contract.get("ask", 0.0),
-        spread_pct=contract.get("spread_pct", 0.0),
-        contract_symbol=contract.get("symbol", "")
-    )
 
 
 # ── SQLite Database Storage ──────────────────────────────────────────────────
@@ -635,6 +676,10 @@ def save_signal_to_db(candidate: OptionSignalCandidate, suggested_qty: int) -> i
 
 def dispatch_telegram_advisory(candidate: OptionSignalCandidate, signal_id: int, suggested_qty: int, total_risk: float) -> bool:
     """Formats and sends a Telegram Signal Advisory message."""
+    if not is_signal_dispatch_allowed(is_open_execution=True):
+        logger.info(f"[TELEGRAM_DISPATCH] Signal s:{signal_id} saved to DB, but Telegram alert suppressed (outside market/pre-open dispatch hours).")
+        return True
+
     msg_text = format_telegram_message(candidate, signal_id, suggested_qty, total_risk)
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.info("[TELEGRAM_DISPATCH] Telegram credentials not set. Signal advisory layout below:")
@@ -767,15 +812,13 @@ def run_scanner(watchlist: Optional[List[str]] = None, dry_run: bool = False) ->
         if not dry_run:
             signal_id = save_signal_to_db(candidate, suggested_qty)
             dispatch_telegram_advisory(candidate, signal_id, suggested_qty, total_risk)
-            if candidate.contract_symbol:
-                execute_alpaca_option_order(
-                    contract_symbol=candidate.contract_symbol,
-                    action="BUY",
-                    qty=suggested_qty,
-                    limit_price=candidate.ask,
-                    strategy_name="PEAD_DRIFT",
-                    take_profit_mult=1.3
-                )
+            # 2026-07-30: gating/sizing above prices this as a defined-risk debit
+            # spread (long+short leg, net debit, capped max_gain). There is no
+            # 2-leg Alpaca order support in alpaca_options_executor.py, so a
+            # single-leg BUY on candidate.contract_symbol would open a naked
+            # long option whose real risk doesn't match what was just gated/
+            # sized — advisory-only until real spread execution exists
+            # (RULE-D5: debit-spread backtest also only has 2 trades so far).
         else:
             signal_id = 999
             logger.info(f"[DRY-RUN] Approved signal: {candidate.ticker} {candidate.strategy} (delta {candidate.delta:.2f}, ask ${candidate.net_debit:.2f})")
@@ -785,39 +828,6 @@ def run_scanner(watchlist: Optional[List[str]] = None, dry_run: bool = False) ->
             "dte": candidate.dte, "delta": candidate.delta, "ev": candidate.expected_value,
             "qty": suggested_qty, "risk": total_risk, "status": "APPROVED",
         })
-
-    logger.info(f"Starting Squeeze scanner for watchlist: {watchlist}")
-    for ticker in watchlist:
-        metrics = fetch_squeeze_metrics(ticker)
-        if metrics:
-            spot, atr_pct, iv_rank = metrics
-            if iv_rank < 0.30 and atr_pct < 0.05:
-                logger.info(f"SQUEEZE DETECTED: {ticker} (IV Rank: {iv_rank:.2f}, ATR: {atr_pct:.2f})")
-                candidate = generate_squeeze_candidate(ticker, spot, atr_pct, iv_rank)
-                if candidate:
-                    candidate.reason = f"ATR/IV compression low (IV rank {iv_rank*100:.0f}%, ATR {atr_pct*100:.1f}%)"
-                    is_valid, reason, suggested_qty, total_risk = validate_and_gate_signal(candidate, SANDBOX_BALANCE)
-                    if is_valid:
-                        if not dry_run:
-                            signal_id = save_signal_to_db(candidate, suggested_qty)
-                            dispatch_telegram_advisory(candidate, signal_id, suggested_qty, total_risk)
-                            if candidate.contract_symbol:
-                                execute_alpaca_option_order(
-                                    contract_symbol=candidate.contract_symbol,
-                                    action="BUY",
-                                    qty=suggested_qty,
-                                    limit_price=candidate.ask,
-                                    strategy_name="SQUEEZE_BREAKOUT",
-                                    take_profit_mult=1.3
-                                )
-                        else:
-                            signal_id = 999
-                            logger.info(f"[DRY-RUN] Approved signal: {candidate.ticker} SQUEEZE")
-                        results.append({
-                            "signal_id": signal_id, "ticker": candidate.ticker, "strategy": candidate.strategy,
-                            "dte": candidate.dte, "delta": candidate.delta, "ev": candidate.expected_value,
-                            "qty": suggested_qty, "risk": total_risk, "status": "APPROVED",
-                        })
 
     logger.info(f"Scan completed. Approved signals: {len(results)}")
     return results
